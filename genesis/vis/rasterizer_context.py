@@ -10,6 +10,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
 import genesis.utils.particle as pu
+import genesis.utils.rod as ru
 from genesis.engine.state_change import StateChange, Subscriber
 from genesis.ext import pyrender
 from genesis.ext.pyrender.jit_render import JITRenderer
@@ -267,6 +268,7 @@ class RasterizerContext:
         self.on_sph()
         self.on_pbd()
         self.on_fem()
+        self.on_rod()
         self.on_sensors()
 
         # The update of the nodes of each solver, so that a change of the state of some solvers updates theirs alone
@@ -278,6 +280,7 @@ class RasterizerContext:
             (self.update_sph, (self.sim.sph_solver,)),
             (self.update_pbd, (self.sim.pbd_solver,)),
             (self.update_fem, (self.sim.fem_solver,)),
+            (self.update_rod, (self.sim.rod_solver,)),
         )
 
         # segmentation mapping
@@ -1082,6 +1085,45 @@ class RasterizerContext:
                         normal_data = self.jit.update_normal(node, update_data)
                         if normal_data is not None:
                             self.jit.update_buffer(node, "normal", normal_data)
+
+    def on_rod(self):
+        if self.sim.rod_solver.is_active and any(
+            rod_entity.surface.vis_mode == "visual" for rod_entity in self.sim.rod_solver.entities
+        ):
+            self.tracked_nodes[self.sim.rod_solver] = TrackedNodeList(self, self.draw_rod)
+
+    def update_rod(self):
+        if self.sim.rod_solver in self.tracked_nodes:
+            self.tracked_nodes[self.sim.rod_solver].update()
+
+    def draw_rod(self, envs_idx):
+        """Make the tube meshes of the rods, in environments 'envs_idx'.
+
+        Returns one (env_idx, mesh, seg_key) triple per mesh (see TrackedNodeList).
+        """
+        rod_solver = self.sim.rod_solver
+        verts_all = qd_to_numpy(rod_solver.rod_state.verts.pos, self.rendered_envs_idx, transpose=True)
+        d1_all = qd_to_numpy(rod_solver.rod_state.edges.d1_ref, self.rendered_envs_idx, transpose=True)
+        radii_all = qd_to_numpy(rod_solver.rod_info.verts.radius)
+        meshes = []
+        for rod_entity in rod_solver.entities:
+            if rod_entity.surface.vis_mode != "visual":
+                continue
+            verts_slice = slice(rod_entity.v_start, rod_entity.v_start + rod_entity.n_verts)
+            edges_slice = slice(rod_entity.e_start, rod_entity.e_start + rod_entity.n_edges)
+            for env_i in envs_idx:
+                mesh = ru.mesh_from_centerline(
+                    verts_all[env_i, verts_slice],
+                    radii_all[verts_slice],
+                    d1_all[env_i, edges_slice],
+                    rod_entity.is_loop,
+                )
+                mesh.visual = mu.surface_uvs_to_trimesh_visual(
+                    rod_entity.surface, uvs=mesh.visual.uv, n_verts=len(mesh.vertices)
+                )
+                mesh = pyrender.Mesh.from_trimesh(mesh, smooth=rod_entity.surface.smooth, envs=env_i)
+                meshes.append((env_i, mesh, rod_entity.idx))
+        return meshes
 
     def on_sensors(self):
         solvers = tuple(solver for solver in (self.sim.rigid_solver, self.sim.kinematic_solver) if solver.is_active)
