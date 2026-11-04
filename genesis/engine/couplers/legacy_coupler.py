@@ -361,9 +361,8 @@ class LegacyCoupler(RBC):
         from the velocity the previous ones left. The rod accumulates its change of velocity apart, applied once every
         node computed it (see 'rod_apply_mpm_dv'), so that autodiff reverses the coupling.
         """
-        # FIXME: quadrants - the autodiff of the loops below over a runtime number of rod elements gets wrong gradients
-        # from a short-circuit 'and' in an 'if' (outside of debug mode) and from a local computed before the loop that
-        # it reads, so the conditions are nested ifs and the mass of the node is read from the grid where it is used.
+        # FIXME: quadrants - autodiff of a loop of runtime length gets a wrong adjoint for a local computed before the
+        # loop and read in it, so the mass of the node is read from the grid where it is used.
         dx = self.mpm_solver.dx
         # The bounding box of the rods spares the nodes far from every rod (see 'rod_mpm_prepare')
         is_near = ((pos - rod_state.aabb_min[i_b]).min() >= 0.0) * ((rod_state.aabb_max[i_b] - pos).min() >= 0.0)
