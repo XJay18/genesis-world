@@ -6,7 +6,6 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.sdf as sdf
-from genesis.grad.bridge import no_grad
 from genesis.options.solvers import LegacyCouplerOptions
 from genesis.repr_base import RBC
 from genesis.utils.array_class import (
