@@ -250,8 +250,11 @@ class FEMSolverState:
 
 class RodSolverState(NamedTuple):
     """
-    Dynamic state queried from a RodSolver: the positions and velocities of the vertices, the twist angles, twist rates
-    and reference frames of the edges, and the rest curvatures of the hinges.
+    Dynamic state queried from a RodSolver: the positions, velocities and constraints of the vertices, the twist
+    angles, twist rates and reference frames of the edges, and the rest curvatures of the hinges.
+
+    The constraints of a vertex are whether it is fixed, whether it is constrained, the rigid link it follows (-1 for
+    none) and its target position in the frame of that link (see 'RodSolver.set_vertex_constraints').
     """
 
     scene: "Scene"
@@ -262,3 +265,7 @@ class RodSolverState(NamedTuple):
     d1_ref: torch.Tensor
     d2_ref: torch.Tensor
     kappa_rest: torch.Tensor
+    is_fixed: torch.Tensor
+    is_constrained: torch.Tensor
+    link_idx: torch.Tensor
+    target_pos: torch.Tensor

@@ -20,6 +20,7 @@ from genesis.utils.array_class import ErrorCode, LinksState, RodData, RodInfo, R
 from genesis.utils.data import ConfigItem, DataItem, DataKind, iter_data
 from genesis.utils.geom import qd_transform_by_trans_quat
 from genesis.utils.misc import broadcast_tensor, qd_from_torch, qd_isfinite, qd_to_torch, qd_zero_grad, tensor_to_array
+from genesis.utils.rod import func_inverse_mass, func_is_free
 
 from .base_solver import GravityMixin, Solver, TimeBasedMixin
 
@@ -92,22 +93,6 @@ def func_signed_angle(axis: qd.types.vector(3), v_from: qd.types.vector(3), v_to
 
 
 @qd.func
-def func_is_free(i_v: int, i_b: int, rod_info: RodInfo) -> bool:
-    """Whether a vertex moves under the dynamics, neither fixed nor constrained to a target."""
-    return not rod_info.verts.is_fixed[i_v, i_b] and not rod_info.verts.is_constrained[i_v, i_b]
-
-
-@qd.func
-def func_inverse_mass(i_v: int, i_b: int, rod_info: RodInfo) -> float:
-    mass = rod_info.verts.mass[i_v]
-    inv_mass = gs.qd_float(0.0)
-    # A fixed or constrained vertex keeps its position through every projection
-    if func_is_free(i_v, i_b, rod_info) and mass > 0.0:
-        inv_mass = 1.0 / mass
-    return inv_mass
-
-
-@qd.func
 def func_closest_points_of_edges(
     p_a1: qd.types.vector(3), p_a2: qd.types.vector(3), p_b1: qd.types.vector(3), p_b2: qd.types.vector(3), eps: float
 ):
@@ -143,14 +128,14 @@ def func_closest_points_of_edges(
 
 
 @qd.func
-def func_constraint_target(i_v: int, i_b: int, links_state: LinksState, rod_info: RodInfo) -> qd.types.vector(3):
+def func_constraint_target(i_v: int, i_b: int, rod_state: RodState, links_state: LinksState) -> qd.types.vector(3):
     """Return the target position of a constrained vertex, placed by the pose of its link where it follows one.
 
     The target is computed from the pose of the link where it is used, so that the gradient flows from the link to the
     vertex.
     """
-    target_pos = rod_info.verts.target_pos[i_v, i_b]
-    i_l = rod_info.verts.link_idx[i_v, i_b]
+    target_pos = rod_state.verts.target_pos[i_v, i_b]
+    i_l = rod_state.verts.link_idx[i_v, i_b]
     if i_l >= 0:
         target_pos = qd_transform_by_trans_quat(target_pos, links_state.pos[i_l, i_b], links_state.quat[i_l, i_b])
     return target_pos
@@ -258,7 +243,7 @@ def kernel_update_rod_velocities(rod_state: RodState, rod_info: RodInfo):
     keeps the sums deterministic.
     """
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
-        if func_is_free(i_v, i_b, rod_info):
+        if func_is_free(i_v, i_b, rod_state):
             energy_grad = qd.Vector.zero(gs.qd_float, 3)
             for i_slot in qd.static(range(2)):
                 i_e = rod_info.verts.edges_idx[i_v][i_slot]
@@ -273,13 +258,11 @@ def kernel_update_rod_velocities(rod_state: RodState, rod_info: RodInfo):
             dt = rod_info.substep_dt[None]
             vel = rod_state.verts.vel[i_v, i_b] - energy_grad / rod_info.verts.mass[i_v] * dt
             # Gravity is added after the damping, which would otherwise slow down the free fall
-            rod_state.verts.vel[i_v, i_b] = (
-                vel * qd.exp(-dt * rod_info.damping[None]) + dt * rod_info.gravity[i_b]
-            )
+            rod_state.verts.vel[i_v, i_b] = vel * qd.exp(-dt * rod_info.damping[None]) + dt * rod_info.gravity[i_b]
 
     for i_e, i_b in qd.ndrange(rod_state.edges.theta.shape[0], rod_state.edges.theta.shape[1]):
         i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
-        if func_is_free(i_v_s, i_b, rod_info) or func_is_free(i_v_e, i_b, rod_info):
+        if func_is_free(i_v_s, i_b, rod_state) or func_is_free(i_v_e, i_b, rod_state):
             energy_grad = gs.qd_float(0.0)
             for i_slot in qd.static(range(2)):
                 i_h = rod_info.edges.hinges_idx[i_e][i_slot]
@@ -305,8 +288,8 @@ def func_gather_inextensibility(i_v: int, i_b: int, rod_state: RodState, rod_inf
             i_r = rod_info.edges.rod_idx[i_e]
             if rod_info.rods.is_inextensible[i_r]:
                 i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
-                inv_mass_s = func_inverse_mass(i_v_s, i_b, rod_info)
-                inv_mass_e = func_inverse_mass(i_v_e, i_b, rod_info)
+                inv_mass_s = func_inverse_mass(i_v_s, i_b, rod_state, rod_info)
+                inv_mass_e = func_inverse_mass(i_v_e, i_b, rod_state, rod_info)
                 inv_mass_sum = inv_mass_s + inv_mass_e
                 edge = rod_state.verts.pos[i_v_e, i_b] - rod_state.verts.pos[i_v_s, i_b]
                 length = edge.norm()
@@ -326,14 +309,14 @@ def kernel_integrate_rod_positions(rod_state: RodState, rod_info: RodInfo):
     the inextensibility constraints (see 'kernel_project_rod_inextensibility')."""
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         rod_state.verts.pos_prev[i_v, i_b] = rod_state.verts.pos[i_v, i_b]
-        if func_is_free(i_v, i_b, rod_info):
+        if func_is_free(i_v, i_b, rod_state):
             rod_state.verts.pos[i_v, i_b] = (
                 rod_state.verts.pos[i_v, i_b] + rod_info.substep_dt[None] * rod_state.verts.vel[i_v, i_b]
             )
 
     for i_e, i_b in qd.ndrange(rod_state.edges.theta.shape[0], rod_state.edges.theta.shape[1]):
         i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
-        if func_is_free(i_v_s, i_b, rod_info) or func_is_free(i_v_e, i_b, rod_info):
+        if func_is_free(i_v_s, i_b, rod_state) or func_is_free(i_v_e, i_b, rod_state):
             rod_state.edges.theta[i_e, i_b] = (
                 rod_state.edges.theta[i_e, i_b] + rod_info.substep_dt[None] * rod_state.edges.omega[i_e, i_b]
             )
@@ -354,9 +337,7 @@ def kernel_project_rod_inextensibility(rod_state: RodState, rod_info: RodInfo, h
         if qd.static(has_edge_pairs):
             rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + rod_state.verts.dp_contact[i_v, i_b]
         else:
-            rod_state.verts.pos[i_v, i_b] = (
-                rod_state.verts.pos[i_v, i_b] + rod_state.verts.dp_inextensibility[i_v, i_b]
-            )
+            rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + rod_state.verts.dp_inextensibility[i_v, i_b]
 
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         rod_state.verts.dp_inextensibility[i_v, i_b] = func_gather_inextensibility(i_v, i_b, rod_state, rod_info)
@@ -404,10 +385,10 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
             weights = qd.Vector([1.0 - t, t, 1.0 - u, u], dt=gs.qd_float)
             inv_masses = qd.Vector(
                 [
-                    func_inverse_mass(i_v_a1, i_b, rod_info),
-                    func_inverse_mass(i_v_a2, i_b, rod_info),
-                    func_inverse_mass(i_v_b1, i_b, rod_info),
-                    func_inverse_mass(i_v_b2, i_b, rod_info),
+                    func_inverse_mass(i_v_a1, i_b, rod_state, rod_info),
+                    func_inverse_mass(i_v_a2, i_b, rod_state, rod_info),
+                    func_inverse_mass(i_v_b1, i_b, rod_state, rod_info),
+                    func_inverse_mass(i_v_b2, i_b, rod_state, rod_info),
                 ],
                 dt=gs.qd_float,
             )
@@ -430,11 +411,9 @@ def kernel_finalize_rod_positions(
         if qd.static(has_edge_pairs):
             rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + rod_state.verts.dp_contact[i_v, i_b]
         else:
-            rod_state.verts.pos[i_v, i_b] = (
-                rod_state.verts.pos[i_v, i_b] + rod_state.verts.dp_inextensibility[i_v, i_b]
-            )
-        if rod_info.verts.is_constrained[i_v, i_b]:
-            rod_state.verts.pos[i_v, i_b] = func_constraint_target(i_v, i_b, links_state, rod_info)
+            rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + rod_state.verts.dp_inextensibility[i_v, i_b]
+        if rod_state.verts.is_constrained[i_v, i_b]:
+            rod_state.verts.pos[i_v, i_b] = func_constraint_target(i_v, i_b, rod_state, links_state)
 
     # The reference frames follow the tangents of the edges by parallel transport
     for i_e, i_b in qd.ndrange(rod_state.edges.theta.shape[0], rod_state.edges.theta.shape[1]):
@@ -446,7 +425,7 @@ def kernel_finalize_rod_positions(
         rod_state.edges.d2_ref_next[i_e, i_b] = func_parallel_transport(t_prev, t_next, d2_ref, rod_info.EPS[None])
 
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
-        if func_is_free(i_v, i_b, rod_info):
+        if func_is_free(i_v, i_b, rod_state):
             rod_state.verts.vel[i_v, i_b] = (
                 rod_state.verts.pos[i_v, i_b] - rod_state.verts.pos_prev[i_v, i_b]
             ) / rod_info.substep_dt[None]
@@ -482,10 +461,10 @@ def kernel_finalize_rod_positions(
                 weights = qd.Vector([1.0 - t, t, 1.0 - u, u], dt=gs.qd_float)
                 inv_masses = qd.Vector(
                     [
-                        func_inverse_mass(i_v_a1, i_b, rod_info),
-                        func_inverse_mass(i_v_a2, i_b, rod_info),
-                        func_inverse_mass(i_v_b1, i_b, rod_info),
-                        func_inverse_mass(i_v_b2, i_b, rod_info),
+                        func_inverse_mass(i_v_a1, i_b, rod_state, rod_info),
+                        func_inverse_mass(i_v_a2, i_b, rod_state, rod_info),
+                        func_inverse_mass(i_v_b1, i_b, rod_state, rod_info),
+                        func_inverse_mass(i_v_b2, i_b, rod_state, rod_info),
                     ],
                     dt=gs.qd_float,
                 )
@@ -521,7 +500,7 @@ def kernel_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, has_e
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         if qd.static(has_edge_pairs):
             rod_state.verts.vel[i_v, i_b] = rod_state.verts.vel[i_v, i_b] + rod_state.verts.dv_friction[i_v, i_b]
-        if rod_info.verts.is_constrained[i_v, i_b]:
+        if rod_state.verts.is_constrained[i_v, i_b]:
             rod_state.verts.vel[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
     for i_e, i_b in qd.ndrange(rod_state.edges.theta.shape[0], rod_state.edges.theta.shape[1]):
@@ -550,13 +529,21 @@ def kernel_set_rod_state(
     d1_ref: qd.types.ndarray(),
     d2_ref: qd.types.ndarray(),
     kappa_rest: qd.types.ndarray(),
+    is_fixed: qd.types.ndarray(),
+    is_constrained: qd.types.ndarray(),
+    link_idx: qd.types.ndarray(),
+    target_pos: qd.types.ndarray(),
     rod_state: RodState,
 ):
     for i_v, i_b_ in qd.ndrange(rod_state.verts.pos.shape[0], envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
+        rod_state.verts.is_fixed[i_v, i_b] = is_fixed[i_b_, i_v]
+        rod_state.verts.is_constrained[i_v, i_b] = is_constrained[i_b_, i_v]
+        rod_state.verts.link_idx[i_v, i_b] = link_idx[i_b_, i_v]
         for j in qd.static(range(3)):
             rod_state.verts.pos[i_v, i_b][j] = pos[i_b_, i_v, j]
             rod_state.verts.vel[i_v, i_b][j] = vel[i_b_, i_v, j]
+            rod_state.verts.target_pos[i_v, i_b][j] = target_pos[i_b_, i_v, j]
 
     for i_e, i_b_ in qd.ndrange(rod_state.edges.theta.shape[0], envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
@@ -647,23 +634,23 @@ def kernel_set_rods_stiffness(
 
 @qd.kernel(fastcache=True)
 def kernel_set_rod_verts_fixed(
-    verts_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), is_fixed: qd.types.ndarray(), rod_info: RodInfo
+    verts_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), is_fixed: qd.types.ndarray(), rod_state: RodState
 ):
     for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
         i_v = verts_idx[i_b_, i_v_]
         # See 'kernel_set_rod_verts_vector'
         if i_v >= 0:
-            rod_info.verts.is_fixed[i_v, envs_idx[i_b_]] = is_fixed[i_b_, i_v_]
+            rod_state.verts.is_fixed[i_v, envs_idx[i_b_]] = is_fixed[i_b_, i_v_]
 
 
 @qd.kernel(fastcache=True)
 def kernel_get_rod_verts_kinematic(
-    verts_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), is_kinematic: qd.types.ndarray(), rod_info: RodInfo
+    verts_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), is_kinematic: qd.types.ndarray(), rod_state: RodState
 ):
     for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
         i_v = verts_idx[i_b_, i_v_]
         i_b = envs_idx[i_b_]
-        is_kinematic[i_b_, i_v_] = not func_is_free(i_v, i_b, rod_info)
+        is_kinematic[i_b_, i_v_] = not func_is_free(i_v, i_b, rod_state)
 
 
 @qd.kernel(fastcache=True)
@@ -672,7 +659,7 @@ def kernel_set_rod_verts_constraints(
     envs_idx: qd.types.ndarray(),
     link_idx: int,
     target_pos: qd.types.ndarray(),
-    rod_info: RodInfo,
+    rod_state: RodState,
     is_constrained: bool,
 ):
     for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
@@ -680,10 +667,10 @@ def kernel_set_rod_verts_constraints(
         i_b = envs_idx[i_b_]
         # See 'kernel_set_rod_verts_vector'
         if i_v >= 0:
-            rod_info.verts.is_constrained[i_v, i_b] = is_constrained
-            rod_info.verts.link_idx[i_v, i_b] = link_idx
+            rod_state.verts.is_constrained[i_v, i_b] = is_constrained
+            rod_state.verts.link_idx[i_v, i_b] = link_idx
             for j in qd.static(range(3)):
-                rod_info.verts.target_pos[i_v, i_b][j] = target_pos[i_b_, i_v_, j]
+                rod_state.verts.target_pos[i_v, i_b][j] = target_pos[i_b_, i_v_, j]
 
 
 class RodSolver(GravityMixin, TimeBasedMixin, Solver):
@@ -865,8 +852,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             (info.verts.radius, np.repeat([m.segment_radius for m in materials], rods_n_verts), gs.tc_float),
             (info.verts.mu_s, np.repeat([m.static_friction for m in materials], rods_n_verts), gs.tc_float),
             (info.verts.mu_k, np.repeat([m.kinetic_friction for m in materials], rods_n_verts), gs.tc_float),
-            (info.verts.is_fixed, np.repeat([e.morph.fixed for e in self._entities], rods_n_verts), gs.tc_bool),
-            (info.verts.link_idx, np.full(self.n_verts, -1), gs.tc_int),
+            (info.verts.restitution, np.repeat([m.restitution for m in materials], rods_n_verts), gs.tc_float),
             (info.edges.rod_idx, edges_rod_idx, gs.tc_int),
             (info.edges.verts_idx, edges_verts_idx, gs.tc_int),
             (info.edges.hinges_idx, edges_hinges_idx, gs.tc_int),
@@ -875,6 +861,8 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             (info.hinges.edges_idx, hinges_edges_idx, gs.tc_int),
             (info.hinges.rest_length, edges_rest_length[hinges_edges_idx].mean(axis=-1), gs.tc_float),
             (state.verts.pos, verts_pos, gs.tc_float),
+            (state.verts.is_fixed, np.repeat([e.morph.fixed for e in self._entities], rods_n_verts), gs.tc_bool),
+            (state.verts.link_idx, np.full(self.n_verts, -1), gs.tc_int),
             (state.edges.d1_ref, edges_d1, gs.tc_float),
             (state.edges.d2_ref, np.cross(edges_tangent, edges_d1), gs.tc_float),
             (state.hinges.kappa_rest, np.concatenate(hinges_kappa_rest), gs.tc_float),
@@ -943,31 +931,27 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         if not self.is_active:
             return None
         state = self.rod_state
-        pos, vel, theta, omega, d1_ref, d2_ref, kappa_rest = self._read_data(
-            (
-                state.verts.pos,
-                state.verts.vel,
-                state.edges.theta,
-                state.edges.omega,
-                state.edges.d1_ref,
-                state.edges.d2_ref,
-                state.hinges.kappa_rest,
-            ),
-            None,
-            None,
-            copy=True,
+        arrays = (
+            state.verts.pos,
+            state.verts.vel,
+            state.edges.theta,
+            state.edges.omega,
+            state.edges.d1_ref,
+            state.edges.d2_ref,
+            state.hinges.kappa_rest,
+            state.verts.is_fixed,
+            state.verts.is_constrained,
+            state.verts.link_idx,
+            state.verts.target_pos,
         )
-        return RodSolverState(self._scene, pos, vel, theta, omega, d1_ref, d2_ref, kappa_rest)
+        return RodSolverState(self._scene, *self._read_data(arrays, None, None, copy=True))
 
     @mutates(StateChange.GEOMETRY, StateChange.DYNAMICS)
     def set_state(self, f, state, envs_idx=None):
         if not self.is_active:
             return
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
-        values = [
-            tensor[envs_idx].contiguous()
-            for tensor in (state.pos, state.vel, state.theta, state.omega, state.d1_ref, state.d2_ref, state.kappa_rest)
-        ]
+        values = [tensor[envs_idx].contiguous() for tensor in state[1:]]
         kernel_set_rod_state(envs_idx, *values, self.rod_state)
         self.clear_errno(envs_idx)
 
@@ -1058,17 +1042,18 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         return tensor[0] if self.n_envs == 0 else tensor
 
     @gs.assert_built
-    @mutates(StateChange.MODEL)
+    @mutates()
     def set_verts_fixed(self, fixed, verts_idx=None, envs_idx=None):
         """
         Set whether some vertices of the rods are fixed, keeping their position and velocity.
 
-        This is part of the model, which a reset of the scene leaves as set.
+        This is part of the state, which a differentiable rollout may change between two steps, and which a reset of the
+        scene restores as it was initially (the vertices the morphs fix).
         """
         fixed, verts_idx, envs_idx = self._sanitize_io_variables(
             fixed, verts_idx, self.n_verts, "verts_idx", envs_idx, dtype=gs.tc_bool, batched_idx=True
         )
-        kernel_set_rod_verts_fixed(verts_idx, envs_idx, fixed, self.rod_info)
+        kernel_set_rod_verts_fixed(verts_idx, envs_idx, fixed, self.rod_state)
 
     def get_verts_kinematic(self, verts_idx=None, envs_idx=None):
         """
@@ -1089,17 +1074,19 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         is_kinematic, verts_idx, envs_idx = self._sanitize_io_variables(
             None, verts_idx, self.n_verts, "verts_idx", envs_idx, dtype=gs.tc_bool, batched_idx=True
         )
-        kernel_get_rod_verts_kinematic(verts_idx, envs_idx, is_kinematic, self.rod_info)
+        kernel_get_rod_verts_kinematic(verts_idx, envs_idx, is_kinematic, self.rod_state)
         return is_kinematic[0] if self.n_envs == 0 else is_kinematic
 
     @gs.assert_built
-    @mutates(StateChange.MODEL)
+    @mutates()
     def set_vertex_constraints(self, verts_idx=None, target_poss=None, link_idx=-1, envs_idx=None):
         """
         Constrain some vertices of the rods to target positions, or to follow a rigid link.
 
-        A constrained vertex is placed at its target at the end of every substep, with zero velocity. This is part of
-        the model, which a reset of the scene leaves as set.
+        A constrained vertex is placed at its target at the end of every substep, with zero velocity. The constraints
+        are part of the state: a differentiable rollout may attach or release vertices between two steps, its gradient
+        flowing back to the targets, the vertex positions and the link pose they are computed from, and a reset of the
+        scene restores the constraints of its initial state.
 
         Parameters
         ----------
@@ -1116,31 +1103,55 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         target_poss, verts_idx, envs_idx = self._sanitize_io_variables(
             target_poss, verts_idx, self.n_verts, "verts_idx", envs_idx, (3,), batched_idx=True
         )
-        # The constraint is a configuration of the model, which carries no gradient
-        with torch.no_grad():
-            if is_target_current:
-                verts_pos = qd_to_torch(self.rod_state.verts.pos, envs_idx, transpose=True)
-                target_poss = torch.gather(verts_pos, 1, verts_idx.clamp(min=0)[..., None].expand(-1, -1, 3))
-            if link_idx >= 0:
-                rigid_solver = self._sim.rigid_solver
-                links_envs_idx = envs_idx if self._scene.n_envs > 0 else None
-                link_pos = rigid_solver.get_links_pos(links_idx=link_idx, envs_idx=links_envs_idx)
-                link_quat = rigid_solver.get_links_quat(links_idx=link_idx, envs_idx=links_envs_idx)
-                link_pos = broadcast_tensor(link_pos, gs.tc_float, (len(envs_idx), 1, 3))
-                link_quat = broadcast_tensor(link_quat, gs.tc_float, (len(envs_idx), 1, 4))
-                target_poss = gu.inv_transform_by_trans_quat(target_poss, link_pos, link_quat)
+        if is_target_current:
+            verts_pos = self._read_data(self.rod_state.verts.pos, envs_idx, None)
+            target_poss = torch.gather(verts_pos, 1, verts_idx.clamp(min=0)[..., None].expand(-1, -1, 3))
+        if link_idx >= 0:
+            rigid_solver = self._sim.rigid_solver
+            links_envs_idx = envs_idx if self._scene.n_envs > 0 else None
+            link_pos = rigid_solver.get_links_pos(links_idx=link_idx, envs_idx=links_envs_idx)
+            link_quat = rigid_solver.get_links_quat(links_idx=link_idx, envs_idx=links_envs_idx)
+            link_pos = broadcast_tensor(link_pos, gs.tc_float, (len(envs_idx), 1, 3))
+            link_quat = broadcast_tensor(link_quat, gs.tc_float, (len(envs_idx), 1, 4))
+            target_poss = gu.inv_transform_by_trans_quat(target_poss, link_pos, link_quat)
         kernel_set_rod_verts_constraints(
-            verts_idx, envs_idx, link_idx, target_poss.contiguous(), self.rod_info, is_constrained=True
+            verts_idx, envs_idx, link_idx, target_poss.contiguous(), self.rod_state, is_constrained=True
         )
 
     @gs.assert_built
-    @mutates(StateChange.MODEL)
+    @mutates()
     def remove_vertex_constraints(self, verts_idx=None, envs_idx=None):
         """Remove the constraints of some vertices of the rods (see 'set_vertex_constraints')."""
         target_poss, verts_idx, envs_idx = self._sanitize_io_variables(
             0.0, verts_idx, self.n_verts, "verts_idx", envs_idx, (3,), batched_idx=True
         )
-        kernel_set_rod_verts_constraints(verts_idx, envs_idx, -1, target_poss, self.rod_info, is_constrained=False)
+        kernel_set_rod_verts_constraints(verts_idx, envs_idx, -1, target_poss, self.rod_state, is_constrained=False)
+
+    def get_verts_contact_geom_idx(self, verts_idx=None, envs_idx=None):
+        """
+        Get the rigid geom each vertex of the rods penetrates deepest at the last substep, -1 for none.
+
+        A vertex penetrates a geom where its capsule overlaps it. Fixed and constrained vertices, which do not collide
+        with the rigid geoms, never penetrate any. Only the geoms that need coupling are considered.
+
+        Parameters
+        ----------
+        verts_idx : None | int | array_like, shape (N,), optional
+            Global index of the vertices. If None, all vertices will be considered. Defaults to None.
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to read. If None, all environments will be considered. Defaults to None.
+
+        Returns
+        -------
+        geom_idx : torch.Tensor, shape ([M,] N)
+            The global index of the geom, in each environment.
+        """
+        array = self.rod_state.verts.contact_geom_idx
+        # The array is a placeholder without the coupling of the rods with the rigid geoms (see 'unused' in Data)
+        if not array.shape:
+            gs.raise_exception("The contacts of the rods need the coupling of the rods with the rigid geoms.")
+        tensor = self._read_data(array, envs_idx, verts_idx, copy=True)
+        return tensor[0] if self.n_envs == 0 else tensor
 
     def get_rods_energy(self, envs_idx=None):
         """

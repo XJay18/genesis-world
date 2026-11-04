@@ -1,6 +1,27 @@
 import numpy as np
 import trimesh
 
+import quadrants as qd
+
+import genesis as gs
+from genesis.utils.array_class import RodInfo, RodState
+
+
+@qd.func
+def func_is_free(i_v: int, i_b: int, rod_state: RodState) -> bool:
+    """Whether a vertex of the rods moves under the dynamics, neither fixed nor constrained to a target."""
+    return not rod_state.verts.is_fixed[i_v, i_b] and not rod_state.verts.is_constrained[i_v, i_b]
+
+
+@qd.func
+def func_inverse_mass(i_v: int, i_b: int, rod_state: RodState, rod_info: RodInfo) -> float:
+    """Return the inverse mass of a vertex of the rods, zero for a fixed or constrained vertex, which keeps its position
+    through every projection and every collision."""
+    inv_mass = gs.qd_float(0.0)
+    if func_is_free(i_v, i_b, rod_state):
+        inv_mass = 1.0 / rod_info.verts.mass[i_v]
+    return inv_mass
+
 
 def mesh_from_centerline(verts, radii, d1, is_loop, n_radial=16, n_cap=8):
     """
