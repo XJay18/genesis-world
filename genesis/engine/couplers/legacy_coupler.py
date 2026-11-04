@@ -1269,12 +1269,16 @@ class LegacyCoupler(RBC):
 
                                     slip_tangent = slip + dp_normal
                                     slip_tangent = slip_tangent - slip_tangent.dot(normal) * normal
-                                    slip_max = geoms_info.coup_friction[i_g] * impulse_normal * inv_mass_sum
-                                    impulse_friction = -slip_tangent / inv_mass_sum
+                                    # The rod cancels its whole slip within the bound, the link taking the impulse of two
+                                    # free bodies: a held or driven link, whose inverse mass the bound overestimates,
+                                    # moves less than its share, which the rod would otherwise keep as a creep
+                                    slip_max = geoms_info.coup_friction[i_g] * impulse_normal * inv_mass_rod
+                                    impulse_friction = -slip_tangent / inv_mass_rod
                                     if slip_tangent.norm_sqr() > slip_max * slip_max:
                                         impulse_friction = impulse_friction * slip_max / slip_tangent.norm()
                                     inv_mass_v = func_inverse_mass(i_v, i_b, rod_state, rod_info)
                                     dp += weight * inv_mass_v * impulse_friction
+                                    impulse_friction = impulse_friction * inv_mass_rod / inv_mass_sum
                                     n_contacts += 1
 
                                     if inv_mass_link > 0.0:
