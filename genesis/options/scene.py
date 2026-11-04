@@ -15,6 +15,7 @@ from .solvers import (
     MPMOptions,
     PBDOptions,
     RigidOptions,
+    RodOptions,
     SFOptions,
     SimOptions,
     SPHOptions,
@@ -42,6 +43,7 @@ class SceneOptions(Options):
     fem: FEMOptions = Field(default_factory=FEMOptions)
     sf: SFOptions = Field(default_factory=SFOptions)
     pbd: PBDOptions = Field(default_factory=PBDOptions)
+    rod: RodOptions = Field(default_factory=RodOptions)
     coupler: BaseCouplerOptions = Field(default_factory=LegacyCouplerOptions)
     vis: VisOptions = Field(default_factory=VisOptions)
     viewer: ViewerOptions = Field(default_factory=ViewerOptions)

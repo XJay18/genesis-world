@@ -1,4 +1,5 @@
 import dataclasses
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -6,6 +7,9 @@ import torch
 import genesis as gs
 from genesis.repr_base import RBC
 from genesis.utils.data import DataKind
+
+if TYPE_CHECKING:
+    from genesis.engine.scene import Scene
 
 
 @dataclasses.dataclass
@@ -242,3 +246,19 @@ class FEMSolverState:
     @property
     def vel(self):
         return self._vel
+
+
+class RodSolverState(NamedTuple):
+    """
+    Dynamic state queried from a RodSolver: the positions and velocities of the vertices, the twist angles, twist rates
+    and reference frames of the edges, and the rest curvatures of the hinges.
+    """
+
+    scene: "Scene"
+    pos: torch.Tensor
+    vel: torch.Tensor
+    theta: torch.Tensor
+    omega: torch.Tensor
+    d1_ref: torch.Tensor
+    d2_ref: torch.Tensor
+    kappa_rest: torch.Tensor

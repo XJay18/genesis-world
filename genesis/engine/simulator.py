@@ -24,6 +24,7 @@ from .solvers import (
     MPMSolver,
     PBDSolver,
     RigidSolver,
+    RodSolver,
     SFSolver,
     SPHSolver,
 )
@@ -109,6 +110,7 @@ class Simulator(RBC):
         self.pbd_solver = PBDSolver(self.scene, self, options.pbd)
         self.fem_solver = FEMSolver(self.scene, self, options.fem)
         self.sf_solver = SFSolver(self.scene, self, options.sf)
+        self.rod_solver = RodSolver(self.scene, self, options.rod)
 
         self._solvers: list["Solver"] = gs.List(
             [
@@ -119,6 +121,7 @@ class Simulator(RBC):
                 self.pbd_solver,
                 self.fem_solver,
                 self.sf_solver,
+                self.rod_solver,
             ]
         )
 

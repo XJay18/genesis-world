@@ -35,6 +35,7 @@ from genesis.options import (
     PBDOptions,
     ProfilingOptions,
     RigidOptions,
+    RodOptions,
     SFOptions,
     SimOptions,
     SPHOptions,
@@ -159,6 +160,8 @@ class Scene(RBC):
         The options configuring the sf_solver (``scene.sim.SFSolver``).
     pbd_options : gs.options.PBDOptions
         The options configuring the pbd_solver (``scene.sim.PBDSolver``).
+    rod_options : gs.options.RodOptions
+        The options configuring the rod_solver (``scene.sim.RodSolver``).
     coupler_options : gs.options.CouplerOptions
         The options configuring the `coupler` between different solvers.
     vis_options : gs.options.VisOptions
@@ -186,6 +189,7 @@ class Scene(RBC):
         fem_options: FEMOptions | None = None,
         sf_options: SFOptions | None = None,
         pbd_options: PBDOptions | None = None,
+        rod_options: RodOptions | None = None,
         coupler_options: BaseCouplerOptions | None = None,
         vis_options: VisOptions | None = None,
         viewer_options: ViewerOptions | None = None,
@@ -207,6 +211,7 @@ class Scene(RBC):
             fem_options,
             sf_options,
             pbd_options,
+            rod_options,
             coupler_options,
             vis_options,
             viewer_options,
@@ -227,6 +232,7 @@ class Scene(RBC):
                 fem=fem_options,
                 sf=sf_options,
                 pbd=pbd_options,
+                rod=rod_options,
                 coupler=coupler_options,
                 vis=vis_options,
                 viewer=viewer_options,
@@ -442,6 +448,15 @@ class Scene(RBC):
                 )
 
         elif isinstance(material, gs.materials.FEM.Base):
+            if surface.vis_mode is None:
+                surface.vis_mode = "visual"
+
+            if surface.vis_mode not in ("visual",):
+                gs.raise_exception(
+                    f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['visual']."
+                )
+
+        elif isinstance(material, gs.materials.Rod.Base):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 
@@ -2072,6 +2087,11 @@ class Scene(RBC):
     def fem_solver(self):
         """The scene's `fem_solver`, managing all the `FEMEntity` in the scene."""
         return self._sim.fem_solver
+
+    @property
+    def rod_solver(self):
+        """The scene's `rod_solver`, managing all the `RodEntity` in the scene."""
+        return self._sim.rod_solver
 
     @property
     def pbd_solver(self):

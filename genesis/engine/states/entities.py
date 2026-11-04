@@ -1,4 +1,11 @@
+from typing import TYPE_CHECKING, NamedTuple
+
+import torch
+
 from genesis.repr_base import RBC
+
+if TYPE_CHECKING:
+    from genesis.engine.entities.rod_entity import RodEntity
 
 
 class MPMEntityState(RBC):
@@ -132,3 +139,17 @@ class RigidEntityState(RBC):
     @property
     def quat(self):
         return self._quat
+
+
+class RodEntityState(NamedTuple):
+    """
+    Dynamic state queried from a genesis RodEntity: the positions and velocities of its vertices, and the twist angles
+    and twist rates of its edges.
+    """
+
+    entity: "RodEntity"
+    s_global: int
+    pos: torch.Tensor
+    vel: torch.Tensor
+    theta: torch.Tensor
+    omega: torch.Tensor

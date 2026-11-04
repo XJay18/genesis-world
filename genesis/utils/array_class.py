@@ -1630,6 +1630,206 @@ class RigidData(Data):
         )
 
 
+# =========================================== Rod ===========================================
+
+
+# The rods, their vertices and edges, their hinges (the internal vertices joining two consecutive edges of a rod) and
+# the pairs of edges tested for rod-rod contact
+RODS = Size("rods")
+ROD_VERTS = Size("rod_verts")
+ROD_EDGES = Size("rod_edges")
+ROD_HINGES = Size("rod_hinges")
+ROD_EDGE_PAIRS = Size("rod_edge_pairs")
+
+# The arrays of the rod-rod contacts, which a scene without any pair of edges to test never reads
+ROD_CONTACTS = "rod_contacts"
+
+
+class RodsInfo(Data, kind=DataKind.INFO, shape=(RODS,)):
+    """The material of each rod: inextensibility, bending plasticity and twist inertia."""
+
+    is_inextensible: qd.Tensor = field(bool)
+    plastic_yield: qd.Tensor = field(float)
+    plastic_creep: qd.Tensor = field(float)
+    twist_inertia: qd.Tensor = field(float)
+
+
+class RodVertsInfo(Data, kind=DataKind.INFO, shape=(ROD_VERTS,)):
+    """The topology, mass, radius and friction of each vertex of the rods, and the constraints on its motion."""
+
+    rod_idx: qd.Tensor = field(int, kind=DataKind.CONSTANT)
+    # The edges ending and starting at the vertex, -1 for none
+    edges_idx: qd.Tensor = field((int, 2), kind=DataKind.CONSTANT)
+    # The hinges centered on the previous vertex, on the vertex itself and on the next vertex, -1 for none, the vertex
+    # being the last, middle and first vertex of each of them respectively
+    hinges_idx: qd.Tensor = field((int, 3), kind=DataKind.CONSTANT)
+    mass: qd.Tensor = field(float)
+    radius: qd.Tensor = field(float)
+    mu_s: qd.Tensor = field(float)
+    mu_k: qd.Tensor = field(float)
+    # A fixed vertex keeps its position and velocity, and its inverse mass is zero in every projection
+    is_fixed: qd.Tensor = field(bool, shape=(ROD_VERTS, ENVS))
+    # A constrained vertex is placed at its target at the end of every substep with zero velocity. The target is given
+    # in the frame of the rigid link 'link_idx', or in the world frame for -1.
+    is_constrained: qd.Tensor = field(bool, shape=(ROD_VERTS, ENVS))
+    link_idx: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))
+    target_pos: qd.Tensor = field((float, 3), shape=(ROD_VERTS, ENVS))
+
+
+class RodEdgesInfo(Data, kind=DataKind.CONSTANT, shape=(ROD_EDGES,)):
+    """The topology and rest length of each edge of the rods."""
+
+    rod_idx: qd.Tensor = field(int)
+    # The first and second vertex of the edge
+    verts_idx: qd.Tensor = field((int, 2))
+    # The hinges centered on the first and on the second vertex of the edge, -1 for none, the edge being the second and
+    # first edge of each of them respectively
+    hinges_idx: qd.Tensor = field((int, 2))
+    rest_length: qd.Tensor = field(float)
+
+
+class RodHingesInfo(Data, kind=DataKind.CONSTANT, shape=(ROD_HINGES,)):
+    """The topology and the rest Voronoi length (mean rest length of its two edges) of each hinge of the rods."""
+
+    verts_idx: qd.Tensor = field((int, 3))
+    edges_idx: qd.Tensor = field((int, 2))
+    rest_length: qd.Tensor = field(float)
+
+
+class RodInfo(Data):
+    """The model of the rods, one struct per element type, and the constants of their integration."""
+
+    rods: RodsInfo
+    verts: RodVertsInfo
+    edges: RodEdgesInfo
+    hinges: RodHingesInfo
+    # The pairs of edges tested for rod-rod contact, the adjacent edges of a rod left out
+    edge_pairs_idx: qd.Tensor = field((int, 2), shape=(ROD_EDGE_PAIRS,), kind=DataKind.CONSTANT, labels=ROD_CONTACTS)
+    gravity: qd.Tensor = field((float, 3), shape=(ENVS,), kind=DataKind.INFO)
+    substep_dt: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
+    damping: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
+    angular_damping: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
+    EPS: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
+
+
+class RodsState(Data, kind=DataKind.STATE, shape=(RODS, ENVS)):
+    """The stretching, bending and twisting stiffness of each rod in each environment.
+
+    They are state rather than model parameters so that a rollout carries their gradient (see 'mutates').
+    """
+
+    stretching_stiffness: qd.Tensor = field(float, grad=True)
+    bending_stiffness: qd.Tensor = field(float, grad=True)
+    twisting_stiffness: qd.Tensor = field(float, grad=True)
+
+
+class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
+    """The position and velocity of each vertex of the rods in each environment, and the scratch of the projections.
+
+    The projections of a substep each compute a correction per vertex from the positions they start from, applied
+    once they are all computed, so that the result is independent of the order of the constraints.
+    """
+
+    pos: qd.Tensor = field((float, 3), grad=True)
+    vel: qd.Tensor = field((float, 3), grad=True)
+    # The position at the start of the substep, from which the velocity and the reference frames are updated
+    pos_prev: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True)
+    dp_inextensibility: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True)
+    dp_contact: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, labels=ROD_CONTACTS)
+    dv_friction: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, labels=ROD_CONTACTS)
+    # The velocity once the coupling with the rigid geoms acted on it, before it is written back
+    vel_coupled: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+
+
+class RodEdgesState(Data, kind=DataKind.STATE, shape=(ROD_EDGES, ENVS)):
+    """The twist angle, twist rate and reference frame of each edge of the rods in each environment, and their geometry.
+
+    The reference frame (d1_ref, d2_ref) is orthonormal to the tangent of the edge and follows it by parallel transport.
+    The material frame (d1, d2) is the reference frame rotated by the twist angle about the tangent.
+    """
+
+    theta: qd.Tensor = field(float, grad=True)
+    omega: qd.Tensor = field(float, grad=True)
+    d1_ref: qd.Tensor = field((float, 3), grad=True)
+    d2_ref: qd.Tensor = field((float, 3), grad=True)
+    length: qd.Tensor = field(float, kind=DataKind.DERIVED, grad=True)
+    tangent: qd.Tensor = field((float, 3), kind=DataKind.DERIVED, grad=True)
+    d1: qd.Tensor = field((float, 3), kind=DataKind.DERIVED, grad=True)
+    d2: qd.Tensor = field((float, 3), kind=DataKind.DERIVED, grad=True)
+    # The gradient of the stretching energy of the edge with respect to the position of its second vertex, the opposite
+    # of the one with respect to its first vertex
+    stretching_force: qd.Tensor = field((float, 3), kind=DataKind.DERIVED, grad=True)
+    stretching_energy: qd.Tensor = field(float, kind=DataKind.DERIVED)
+    d1_ref_next: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True)
+    d2_ref_next: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True)
+
+
+class RodHingesState(Data, kind=DataKind.STATE, shape=(ROD_HINGES, ENVS)):
+    """The rest curvature of each hinge of the rods in each environment, which bending plasticity moves, and the
+    curvature, twist, energies and forces of the hinge."""
+
+    kappa_rest: qd.Tensor = field((float, 2), grad=True)
+    kappa_rest_next: qd.Tensor = field((float, 2), kind=DataKind.SCRATCH, grad=True)
+    # The curvature binormal and the twist of the hinge
+    kb: qd.Tensor = field((float, 3), kind=DataKind.DERIVED, grad=True)
+    twist: qd.Tensor = field(float, kind=DataKind.DERIVED, grad=True)
+    # The gradient of the bending and twisting energies of the hinge with respect to the positions of its three
+    # vertices, and to the twist angles of its two edges
+    verts_force: qd.Tensor = field((float, 3), shape=(ROD_HINGES, 3, ENVS), kind=DataKind.DERIVED, grad=True)
+    edges_torque: qd.Tensor = field(float, shape=(ROD_HINGES, 2, ENVS), kind=DataKind.DERIVED, grad=True)
+    bending_energy: qd.Tensor = field(float, kind=DataKind.DERIVED)
+    twisting_energy: qd.Tensor = field(float, kind=DataKind.DERIVED)
+
+
+class RodEdgePairsState(Data, kind=DataKind.SCRATCH, shape=(ROD_EDGE_PAIRS, ENVS)):
+    """The contact normal and penetration of each pair of edges at the first projection of the substep, from which the
+    friction of the substep follows."""
+
+    normal: qd.Tensor = field((float, 3), grad=True, labels=ROD_CONTACTS)
+    penetration: qd.Tensor = field(float, grad=True, labels=ROD_CONTACTS)
+
+
+class RodState(Data):
+    """The state of the rods, one struct per element type."""
+
+    rods: RodsState
+    verts: RodVertsState
+    edges: RodEdgesState
+    hinges: RodHingesState
+    edge_pairs: RodEdgePairsState
+
+
+class RodData(Data):
+    """Every array of the rod solver, allocated from the solver once its scene is built."""
+
+    rod_info: RodInfo
+    rod_state: RodState
+    errno: qd.Tensor = field(int, shape=(ENVS,), kind=DataKind.STATE)
+
+    def __init__(self, solver):
+        options = solver._options
+        super().__init__(
+            sizes=dict(
+                envs=solver._B,
+                rods=solver.n_rods,
+                rod_verts=solver.n_verts,
+                rod_edges=solver.n_edges,
+                rod_hinges=solver.n_hinges,
+                rod_edge_pairs=solver.n_edge_pairs,
+            ),
+            values=dict(
+                rod_info=dict(
+                    substep_dt=solver._substep_dt,
+                    damping=options.damping,
+                    angular_damping=options.angular_damping,
+                    EPS=gs.EPS,
+                )
+            ),
+            unused={ROD_CONTACTS: solver.n_edge_pairs == 0},
+            requires_grad=solver._requires_grad,
+        )
+
+
 # =========================================== RaycastResult ===========================================
 
 

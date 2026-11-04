@@ -83,6 +83,9 @@ class LegacyCouplerOptions(BaseCouplerOptions):
         Whether to enable coupling between FEM and MPM solvers. Defaults to True.
     fem_sph : bool, optional
         Whether to enable coupling between FEM and SPH solvers. Defaults to True.
+    rigid_rod : bool, optional
+        Whether to enable coupling between rigid and rod solvers: the rod vertices collide with the rigid geoms that
+        need coupling, and push them back. Defaults to True.
     """
 
     rigid_mpm: StrictBool = True
@@ -93,6 +96,7 @@ class LegacyCouplerOptions(BaseCouplerOptions):
     mpm_pbd: StrictBool = True
     fem_mpm: StrictBool = True
     fem_sph: StrictBool = True
+    rigid_rod: StrictBool = True
 
 
 class SAPCouplerOptions(BaseCouplerOptions):
@@ -895,6 +899,33 @@ class FEMOptions(GravityMixin, TimeBasedMixin):
     damping_alpha: NonNegativeFloat = 0.5
     damping_beta: NonNegativeFloat = 5e-4
     enable_vertex_constraints: StrictBool = False
+
+
+class RodOptions(GravityMixin, TimeBasedMixin):
+    """
+    Options configuring the RodSolver.
+
+    Parameters
+    ----------
+    damping : float, optional
+        Damping rate of the velocities of the rod vertices, in 1/s, which gravity escapes. A larger value settles a rod
+        faster and steadies stiff rods, at the cost of slowing every motion. Defaults to 0.0.
+    angular_damping : float, optional
+        Damping rate of the twist rates of the rod edges, in 1/s. Defaults to 0.0.
+    adjacent_gap : int, optional
+        Number of edges on each side of an edge of a rod that it does not collide with, which would otherwise always
+        touch it at their shared vertex. A larger value lets a rod fold more tightly onto itself before it collides.
+        Defaults to 2.
+    n_pbd_iters : int, optional
+        Number of projections of the inextensibility and contact constraints per substep. More projections hold the
+        length and resolve the contacts more accurately, at a runtime cost growing linearly with their number.
+        Defaults to 10.
+    """
+
+    damping: NonNegativeFloat = 0.0
+    angular_damping: NonNegativeFloat = 0.0
+    adjacent_gap: NonNegativeInt = 2
+    n_pbd_iters: PositiveInt = 10
 
 
 class SFOptions(TimeBasedMixin):

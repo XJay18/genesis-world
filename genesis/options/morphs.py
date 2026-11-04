@@ -1734,6 +1734,114 @@ class USD(FileMorph):
         return f"{super().__repr_name__()[:-1]}, prim_path='{self.prim_path}')>"
 
 
+
+############################ Rods ############################
+
+
+class RodMixin(Options):
+    """
+    A mixin introducing the options shared by the rod morphs.
+
+    Parameters
+    ----------
+    rest_state : str, optional
+        The shape the rod relaxes to: "default" for the initial shape, "straight" for a straight rod with the same edge
+        lengths. A loop has no straight rest shape. Defaults to "default".
+    fixed : bool, optional
+        Whether every vertex of the rod is fixed. Defaults to False.
+    """
+
+    rest_state: Literal["default", "straight"] = "default"
+    fixed: StrictBool = False
+
+
+class Rod(FileMorph, RodMixin):
+    """
+    Morph of a rod whose vertices are loaded from a `.npy` file, an array of shape (n_vertices, 3) in meters.
+
+    The vertices are scaled, then rotated about their center and translated by the pose of the morph.
+
+    Parameters
+    ----------
+    file : str
+        The path to the file.
+    scale : float or tuple, optional
+        The scaling factor of the vertices, uniform if a float, per axis if a 3-tuple. Defaults to 1.0.
+    pos : tuple, shape (3,), optional
+        The position of the entity in meters. Defaults to (0.0, 0.0, 0.0).
+    euler : tuple, shape (3,), optional
+        The euler angle of the entity in degrees. This follows scipy's extrinsic x-y-z rotation convention.
+        Defaults to (0.0, 0.0, 0.0).
+    quat : tuple, shape (4,), optional
+        The quaternion (w-x-y-z convention) of the entity. If specified, `euler` will be ignored. Defaults to None.
+    is_loop : bool, optional
+        Whether the last vertex connects back to the first one. Defaults to False.
+    rest_state : str, optional
+        See RodMixin. Defaults to "default".
+    fixed : bool, optional
+        See RodMixin. Defaults to False.
+    """
+
+    is_loop: StrictBool = False
+
+    def model_post_init(self, context: Any) -> None:
+        super().model_post_init(context)
+        if not self.is_format(".npy"):
+            gs.raise_exception(f"Expected a `.npy` file for morph Rod: {self.file}")
+        if self.is_loop and self.rest_state == "straight":
+            gs.raise_exception("A loop rod cannot have a straight rest state.")
+
+
+class ParameterizedRod(Morph, RodMixin):
+    """
+    Morph of a rod sampled from a parametric shape: a straight rod, a circle or a half circle.
+
+    Parameters
+    ----------
+    type : str, optional
+        The shape: "rod" for a straight rod along `axis`, "circle" for a circle in the plane of `axis` and the next
+        axis, "half_circle" for half of it. A full circle (`gap` 0) is a loop. Defaults to "rod".
+    n_vertices : int, optional
+        The number of vertices, at least 3. Defaults to 10.
+    interval : float, optional
+        The distance between consecutive vertices of a straight rod, in meters. Defaults to 0.1.
+    radius : float, optional
+        The radius of a circle or half circle, in meters. Defaults to 1.0.
+    axis : str, optional
+        The axis "x", "y" or "z" the shape is laid along. Defaults to "x".
+    gap : int, optional
+        The number of vertex slots left empty at the ends of a circle or half circle, opening it. Defaults to 0.
+    pos : tuple, shape (3,), optional
+        The position of the entity in meters. Defaults to (0.0, 0.0, 0.0).
+    euler : tuple, shape (3,), optional
+        The euler angle of the entity in degrees. This follows scipy's extrinsic x-y-z rotation convention.
+        Defaults to (0.0, 0.0, 0.0).
+    quat : tuple, shape (4,), optional
+        The quaternion (w-x-y-z convention) of the entity. If specified, `euler` will be ignored. Defaults to None.
+    rest_state : str, optional
+        See RodMixin. Defaults to "default".
+    fixed : bool, optional
+        See RodMixin. Defaults to False.
+    """
+
+    type: Literal["rod", "circle", "half_circle"] = "rod"
+    n_vertices: StrictInt = Field(default=10, ge=3)
+    interval: PositiveFloat = 0.1
+    radius: PositiveFloat = 1.0
+    axis: Literal["x", "y", "z"] = "x"
+    gap: NonNegativeInt = 0
+
+    def model_post_init(self, context: Any) -> None:
+        super().model_post_init(context)
+        if self.is_loop and self.rest_state == "straight":
+            gs.raise_exception("A loop rod cannot have a straight rest state.")
+
+    @property
+    def is_loop(self) -> bool:
+        """Whether the last vertex connects back to the first one, which holds for a full circle."""
+        return self.type == "circle" and self.gap == 0
+
+
 def _exported_urdf(robot: urdfpy.URDF, exporting: serialization.Exporting) -> str:
     """Export a URDF model built in memory as the document it stands for.
 
