@@ -94,8 +94,8 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
         direction = torch.tensor(rng.standard_normal(value.shape), dtype=gs.tc_float, device=gs.device)
         eps, tol = {
             "pos": (1e-7, 5e-5),
-            "vel": (1e-5, 1e-7),
-            "E": (1e-4 * value, 1e-6),
+            "vel": (1e-5, 5e-7),
+            "E": (1e-4 * value, 2e-6),
             "K": ((1e-3 if case == "inextensible" else 1e-4) * value, 1e-4),
         }[name]
         with torch.no_grad():

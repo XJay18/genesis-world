@@ -386,18 +386,25 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
         i_v_b1, i_v_b2 = rod_info.edges.verts_idx[i_e_b]
         p_a1, p_a2 = rod_state.verts.pos[i_v_a1, i_b], rod_state.verts.pos[i_v_a2, i_b]
         p_b1, p_b2 = rod_state.verts.pos[i_v_b1, i_b], rod_state.verts.pos[i_v_b2, i_b]
-        t, u = func_closest_points_of_edges(p_a1, p_a2, p_b1, p_b2, rod_info.EPS[None])
-        dist_vec = (p_a1 + t * (p_a2 - p_a1)) - (p_b1 + u * (p_b2 - p_b1))
-        dist = dist_vec.norm()
         radius_a = 0.5 * (rod_info.verts.radius[i_v_a1] + rod_info.verts.radius[i_v_a2])
         radius_b = 0.5 * (rod_info.verts.radius[i_v_b1] + rod_info.verts.radius[i_v_b2])
-        penetration = radius_a + radius_b - dist
+        # The capsules overlap only if the spheres bounding them do, which spares the closest points of most pairs
+        reach = 0.5 * ((p_a2 - p_a1).norm() + (p_b2 - p_b1).norm()) + radius_a + radius_b
+        t, u = gs.qd_float(0.0), gs.qd_float(0.0)
+        penetration = gs.qd_float(-1.0)
         normal = qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float)
-        if dist > rod_info.EPS[None]:
-            normal = dist_vec / dist
+        if (0.5 * (p_a1 + p_a2 - p_b1 - p_b2)).norm() < reach:
+            t, u = func_closest_points_of_edges(p_a1, p_a2, p_b1, p_b2, rod_info.EPS[None])
+            dist_vec = (p_a1 + t * (p_a2 - p_a1)) - (p_b1 + u * (p_b2 - p_b1))
+            dist = dist_vec.norm()
+            penetration = radius_a + radius_b - dist
+            if dist > rod_info.EPS[None]:
+                normal = dist_vec / dist
+        # The normal of a pair is read by the friction only where it penetrates (see 'kernel_finalize_rod_positions')
         if i_iter == 0:
-            rod_state.edge_pairs.normal[i_p, i_b] = normal
             rod_state.edge_pairs.penetration[i_p, i_b] = penetration
+            if penetration > 0.0:
+                rod_state.edge_pairs.normal[i_p, i_b] = normal
         if penetration > 0.0:
             weights = qd.Vector([1.0 - t, t, 1.0 - u, u], dt=gs.qd_float)
             inv_masses = qd.Vector(
@@ -593,7 +600,7 @@ def kernel_rod_apply_coupled_vel(rod_state: RodState):
 
 @no_grad
 @qd.kernel(fastcache=True)
-def kernel_check_rod_finite(rod_state: RodState, errno: qd.types.ndarray()):
+def kernel_check_rod_finite(rod_state: RodState, errno: qd.Tensor):
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         if not (qd_isfinite(rod_state.verts.pos[i_v, i_b]) and qd_isfinite(rod_state.verts.vel[i_v, i_b])):
             errno[i_b] = errno[i_b] | ErrorCode.INVALID_VERTEX_NAN
@@ -859,7 +866,9 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
 
             # The rest curvature follows from the frames of the rest shape, carried along it by parallel transport. The
             # initial frames carry no holonomy correction, so that the closing hinge of a loop starts with its twist.
-            pos = tensor_to_array(entity.init_positions)
+            # The rest geometry is computed in double precision whatever the precision of the simulation, the frames
+            # being carried edge to edge by a compiled loop typed for one precision
+            pos = tensor_to_array(entity.init_positions, dtype=np.float64)
             edges = pos[edges_verts[:, 1]] - pos[edges_verts[:, 0]]
             edges_length = np.linalg.norm(edges, axis=-1)
             tangents = edges / edges_length[:, None]

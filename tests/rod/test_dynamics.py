@@ -149,7 +149,7 @@ def test_elastic_energy_decays_with_damping(show_viewer):
 
 
 @pytest.mark.required
-def test_inextensible_edge_lengths_identical_across_envs(show_viewer):
+def test_inextensible_edge_lengths_and_checkpoint(show_viewer):
     n_verts, interval = 50, 0.01
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -195,6 +195,16 @@ def test_inextensible_edge_lengths_identical_across_envs(show_viewer):
     assert max(length_errors) < 1e-3
     # Every projection is gathered per vertex in a fixed order, so identical environments stay bitwise identical
     assert_equal(pos, pos[:1].expand_as(pos))
+
+    # A checkpoint of the simulation resumes it exactly
+    checkpoint = scene.sim.__getstate__()
+    for _ in range(10):
+        scene.step()
+    pos = rod.get_state().pos
+    scene.sim.__setstate__(checkpoint)
+    for _ in range(10):
+        scene.step()
+    assert_equal(rod.get_state().pos, pos)
 
 
 @pytest.mark.required
