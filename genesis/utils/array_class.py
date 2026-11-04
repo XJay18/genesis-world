@@ -1655,7 +1655,7 @@ class RodsInfo(Data, kind=DataKind.INFO, shape=(RODS,)):
 
 
 class RodVertsInfo(Data, kind=DataKind.INFO, shape=(ROD_VERTS,)):
-    """The topology, mass, radius and friction of each vertex of the rods, and the constraints on its motion."""
+    """The topology, mass, radius, friction and restitution of each vertex of the rods."""
 
     rod_idx: qd.Tensor = field(int, kind=DataKind.CONSTANT)
     # The edges ending and starting at the vertex, -1 for none
@@ -1667,13 +1667,7 @@ class RodVertsInfo(Data, kind=DataKind.INFO, shape=(ROD_VERTS,)):
     radius: qd.Tensor = field(float)
     mu_s: qd.Tensor = field(float)
     mu_k: qd.Tensor = field(float)
-    # A fixed vertex keeps its position and velocity, and its inverse mass is zero in every projection
-    is_fixed: qd.Tensor = field(bool, shape=(ROD_VERTS, ENVS))
-    # A constrained vertex is placed at its target at the end of every substep with zero velocity. The target is given
-    # in the frame of the rigid link 'link_idx', or in the world frame for -1.
-    is_constrained: qd.Tensor = field(bool, shape=(ROD_VERTS, ENVS))
-    link_idx: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))
-    target_pos: qd.Tensor = field((float, 3), shape=(ROD_VERTS, ENVS))
+    restitution: qd.Tensor = field(float)
 
 
 class RodEdgesInfo(Data, kind=DataKind.CONSTANT, shape=(ROD_EDGES,)):
@@ -1724,14 +1718,23 @@ class RodsState(Data, kind=DataKind.STATE, shape=(RODS, ENVS)):
 
 
 class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
-    """The position and velocity of each vertex of the rods in each environment, and the scratch of the projections.
+    """The position, velocity and constraints of each vertex of the rods in each environment, and the scratch of the
+    projections and of the couplings.
 
     The projections of a substep each compute a correction per vertex from the positions they start from, applied
-    once they are all computed, so that the result is independent of the order of the constraints.
+    once they are all computed, so that the result is independent of the order of the constraints. The constraints are
+    state, so that a rollout attaching or releasing vertices midway stays differentiable (see 'mutates').
     """
 
     pos: qd.Tensor = field((float, 3), grad=True)
     vel: qd.Tensor = field((float, 3), grad=True)
+    # A fixed vertex keeps its position and velocity, and its inverse mass is zero in every projection
+    is_fixed: qd.Tensor = field(bool)
+    # A constrained vertex is placed at its target at the end of every substep with zero velocity. The target is given
+    # in the frame of the rigid link 'link_idx', or in the world frame for -1.
+    is_constrained: qd.Tensor = field(bool)
+    link_idx: qd.Tensor = field(int)
+    target_pos: qd.Tensor = field((float, 3), grad=True)
     # The position at the start of the substep, from which the velocity and the reference frames are updated
     pos_prev: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True)
     dp_inextensibility: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True)
@@ -1739,6 +1742,10 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
     dv_friction: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, labels=ROD_CONTACTS)
     # The velocity once the coupling with the rigid geoms acted on it, before it is written back
     vel_coupled: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    # The change of velocity the MPM grid nodes impart, summed over the nodes before it is applied
+    dv_mpm: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    # The rigid geom the vertex penetrated deepest at the latest substep of the step with a penetration, -1 for none
+    contact_geom_idx: qd.Tensor = field(int, kind=DataKind.DERIVED, opt_in=True)
 
 
 class RodEdgesState(Data, kind=DataKind.STATE, shape=(ROD_EDGES, ENVS)):
@@ -1797,6 +1804,10 @@ class RodState(Data):
     edges: RodEdgesState
     hinges: RodHingesState
     edge_pairs: RodEdgePairsState
+    # The bounding box of the vertices of all the rods in each environment, which bounds the MPM grid nodes that can
+    # collide with them
+    aabb_min: qd.Tensor = field((float, 3), shape=(ENVS,), kind=DataKind.SCRATCH, opt_in=True)
+    aabb_max: qd.Tensor = field((float, 3), shape=(ENVS,), kind=DataKind.SCRATCH, opt_in=True)
 
 
 class RodData(Data):

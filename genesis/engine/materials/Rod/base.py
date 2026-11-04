@@ -32,6 +32,9 @@ class Base(Material["RodEntity"]):
         Static friction coefficient of the contacts between rods. Default is 0.3.
     kinetic_friction : float, optional
         Kinetic friction coefficient of the contacts between rods. Default is 0.25.
+    restitution : float, optional
+        Coefficient of restitution of the collisions of the rod with MPM materials, from 0 (the normal velocities
+        equalize) to 1 (they bounce back elastically). Default is 0.
     inextensible : bool, optional
         Whether the edges keep their rest length through a projection every substep. It allows a much larger time step
         than a stiff stretching energy, at the cost of a small drift of the length the projection leaves. Default is
@@ -52,6 +55,7 @@ class Base(Material["RodEntity"]):
     plastic_creep: NonNegativeFloat = 1.0
     static_friction: NonNegativeFloat = 0.3
     kinetic_friction: NonNegativeFloat = 0.25
+    restitution: float = Field(default=0.0, ge=0.0, le=1.0)
     inextensible: StrictBool = True
     segment_mass: PositiveFloat = 0.02
     segment_radius: PositiveFloat = 0.01

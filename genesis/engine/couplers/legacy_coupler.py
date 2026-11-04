@@ -1,11 +1,11 @@
 from typing import TYPE_CHECKING
 
 import numpy as np
+
 import quadrants as qd
 
 import genesis as gs
 import genesis.utils.sdf as sdf
-
 from genesis.options.solvers import LegacyCouplerOptions
 from genesis.repr_base import RBC
 from genesis.utils.array_class import (
@@ -21,6 +21,7 @@ from genesis.utils.array_class import (
 )
 from genesis.utils.data import opt_in
 from genesis.utils.geom import qd_inv_transform_by_trans_quat, qd_transform_by_trans_quat
+from genesis.utils.rod import func_inverse_mass, func_is_free
 
 if TYPE_CHECKING:
     from genesis.engine.simulator import Simulator
@@ -52,7 +53,10 @@ class LegacyCoupler(RBC):
 
         # The particles, the FEM vertices and the rod vertices collide with the rigid geoms through their SDF
         opt_in(SDFInfo, cond=lambda: any(self.rigid_couplings))
-        opt_in(RodData.rod_state.verts.vel_coupled, cond=lambda: self.rigid_couplings[4])
+        for field_ref in (RodData.rod_state.verts.vel_coupled, RodData.rod_state.verts.contact_geom_idx):
+            opt_in(field_ref, cond=lambda: self.rigid_couplings[4])
+        for field_ref in (RodData.rod_state.verts.dv_mpm, RodData.rod_state.aabb_min, RodData.rod_state.aabb_max):
+            opt_in(field_ref, cond=lambda: self.has_rod_mpm_coupling)
 
     @property
     def rigid_couplings(self) -> tuple[bool, bool, bool, bool, bool]:
@@ -70,8 +74,14 @@ class LegacyCoupler(RBC):
             ]
         )
 
+    @property
+    def has_rod_mpm_coupling(self) -> bool:
+        """Whether the rods couple with the MPM solver."""
+        return self.rod_solver.is_active and self.mpm_solver.is_active and self.options.rod_mpm
+
     def build(self) -> None:
         self._rigid_mpm, self._rigid_sph, self._rigid_pbd, self._rigid_fem, self._rigid_rod = self.rigid_couplings
+        self._rod_mpm = self.has_rod_mpm_coupling
         self._mpm_sph = self.mpm_solver.is_active and self.sph_solver.is_active and self.options.mpm_sph
         self._mpm_pbd = self.mpm_solver.is_active and self.pbd_solver.is_active and self.options.mpm_pbd
         self._fem_mpm = self.fem_solver.is_active and self.mpm_solver.is_active and self.options.fem_mpm
@@ -331,14 +341,103 @@ class LegacyCoupler(RBC):
 
         return vel
 
+    @qd.func
+    def _func_mpm_collide_with_rods(
+        self,
+        f: int,
+        I,
+        i_b: int,
+        pos: qd.types.vector(3),
+        vel: qd.types.vector(3),
+        rod_state: RodState,
+        rod_info: RodInfo,
+    ):
+        """Collide an MPM grid node with the vertices and the edges of the rods within reach, at the velocity level.
+
+        A node within the grid spacing of the capsule of a vertex or an edge that approaches it gets an impulse along the
+        line joining them, which cancels their relative normal velocity, scaled by one plus the restitution of the rod.
+        The rod takes the opposite impulse, split between the two vertices of an edge by their weights in the contact
+        point, a fixed or constrained vertex taking none. The node meets the rod elements one after the other, each
+        from the velocity the previous ones left. The rod accumulates its change of velocity apart, applied once every
+        node computed it (see 'rod_apply_mpm_dv'), so that autodiff reverses the coupling.
+        """
+        # FIXME: quadrants - autodiff of a loop of runtime length gets a wrong adjoint for a local computed before the
+        # loop and read in it, so the mass of the node is read from the grid where it is used.
+        dx = self.mpm_solver.dx
+        # The bounding box of the rods spares the nodes far from every rod (see 'rod_mpm_prepare')
+        is_near = ((pos - rod_state.aabb_min[i_b]).min() >= 0.0) * ((rod_state.aabb_max[i_b] - pos).min() >= 0.0)
+        if is_near:
+            for i_v in range(rod_state.verts.pos.shape[0]):
+                dist_vec = pos - rod_state.verts.pos[i_v, i_b]
+                dist = dist_vec.norm()
+                if dist < dx + rod_info.verts.radius[i_v]:
+                    if dist > rod_info.EPS[None]:
+                        normal = dist_vec / dist
+                        vel_normal = (vel - rod_state.verts.vel[i_v, i_b]).dot(normal)
+                        if vel_normal < 0.0:
+                            inv_mass_rod = func_inverse_mass(i_v, i_b, rod_state, rod_info)
+                            mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
+                            # The impulse is written without the inverse mass of the node, whose derivative cancels out
+                            # analytically but not in floating point for the nodes of a tiny mass
+                            impulse_scale = (
+                                -(1.0 + rod_info.verts.restitution[i_v]) * vel_normal / (1.0 + inv_mass_rod * mass)
+                            )
+                            vel = vel + impulse_scale * normal
+                            rod_state.verts.dv_mpm[i_v, i_b] -= impulse_scale * mass * inv_mass_rod * normal
+
+            for i_e in range(rod_info.edges.verts_idx.shape[0]):
+                i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
+                pos_s, pos_e = rod_state.verts.pos[i_v_s, i_b], rod_state.verts.pos[i_v_e, i_b]
+                edge = pos_e - pos_s
+                t = qd.math.clamp((pos - pos_s).dot(edge) / qd.max(edge.dot(edge), rod_info.EPS[None]), 0.0, 1.0)
+                dist_vec = pos - (pos_s + t * edge)
+                dist = dist_vec.norm()
+                if dist < dx + 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e]):
+                    if dist > rod_info.EPS[None]:
+                        normal = dist_vec / dist
+                        vel_rod = (1.0 - t) * rod_state.verts.vel[i_v_s, i_b] + t * rod_state.verts.vel[i_v_e, i_b]
+                        vel_normal = (vel - vel_rod).dot(normal)
+                        if vel_normal < 0.0:
+                            inv_mass_s = func_inverse_mass(i_v_s, i_b, rod_state, rod_info)
+                            inv_mass_e = func_inverse_mass(i_v_e, i_b, rod_state, rod_info)
+                            restitution = 0.5 * (rod_info.verts.restitution[i_v_s] + rod_info.verts.restitution[i_v_e])
+                            inv_mass_rod = 0.5 * (inv_mass_s + inv_mass_e)
+                            mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
+                            impulse_scale = -(1.0 + restitution) * vel_normal / (1.0 + inv_mass_rod * mass)
+                            vel = vel + impulse_scale * normal
+                            rod_state.verts.dv_mpm[i_v_s, i_b] -= impulse_scale * mass * (1.0 - t) * inv_mass_s * normal
+                            rod_state.verts.dv_mpm[i_v_e, i_b] -= impulse_scale * mass * t * inv_mass_e * normal
+        return vel
+
+    @qd.kernel
+    def rod_mpm_prepare(self, rod_state: RodState, rod_info: RodInfo):
+        """Clear the change of velocity the MPM grid nodes impart to the rods, and compute the bounding box of the rods in
+        each environment, grown by the reach of their collisions with the nodes, the radius of a vertex plus the grid
+        spacing."""
+        for i_b in range(rod_state.aabb_min.shape[0]):
+            rod_state.aabb_min[i_b] = qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
+            rod_state.aabb_max[i_b] = -qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
+        for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
+            rod_state.verts.dv_mpm[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            reach = rod_info.verts.radius[i_v] + self.mpm_solver.dx
+            qd.atomic_min(rod_state.aabb_min[i_b], rod_state.verts.pos[i_v, i_b] - reach)
+            qd.atomic_max(rod_state.aabb_max[i_b], rod_state.verts.pos[i_v, i_b] + reach)
+
+    @qd.kernel
+    def rod_apply_mpm_dv(self, rod_state: RodState):
+        for i_v, i_b in qd.ndrange(rod_state.verts.vel.shape[0], rod_state.verts.vel.shape[1]):
+            rod_state.verts.vel[i_v, i_b] = rod_state.verts.vel[i_v, i_b] + rod_state.verts.dv_mpm[i_v, i_b]
+
     @qd.kernel
     def mpm_grid_op(
         self,
         f: qd.i32,
         t: qd.f32,
+        rod_state: RodState,
         geoms_state: GeomsState,
-        geoms_info: GeomsInfo,
         links_state: LinksState,
+        rod_info: RodInfo,
+        geoms_info: GeomsInfo,
         rigid_info: RigidInfo,
         sdf_info: SDFInfo,
         collider_config: qd.template(),
@@ -375,6 +474,10 @@ class LegacyCoupler(RBC):
                         sdf_info=sdf_info,
                         collider_config=collider_config,
                     )
+
+                #################### MPM <-> Rod ####################
+                if qd.static(self._rod_mpm):
+                    vel_mpm = self._func_mpm_collide_with_rods(f, I, i_b, pos, vel_mpm, rod_state, rod_info)
 
                 #################### MPM <-> SPH ####################
                 if qd.static(self._mpm_sph):
@@ -721,21 +824,29 @@ class LegacyCoupler(RBC):
         rigid_info: RigidInfo,
         sdf_info: SDFInfo,
         collider_config: qd.template(),
+        is_step_start: bool,
     ):
         """Collide the free rod vertices with the rigid geoms that need coupling, at the velocity level.
 
         The capsule of a vertex collides like a particle (see '_func_collide_in_rigid_geom'), its signed distance to a
         geom reduced by the radius of the rod. The velocity is written apart, to be applied once every vertex computed
-        it (see 'rod_apply_coupled_vel'), so that autodiff reverses the coupling.
+        it (see 'rod_apply_coupled_vel'), so that autodiff reverses the coupling. The geom each free vertex penetrates
+        deepest is recorded where it penetrates one, the record being cleared at the first substep of a step
+        ('is_step_start'), so that it holds the contacts of the whole step.
         """
         for i_v, i_b in qd.ndrange(rod_state.verts.vel.shape[0], rod_state.verts.vel.shape[1]):
             vel = rod_state.verts.vel[i_v, i_b]
-            if not rod_info.verts.is_fixed[i_v, i_b] and not rod_info.verts.is_constrained[i_v, i_b]:
+            contact_geom_idx = -1
+            if func_is_free(i_v, i_b, rod_state):
                 pos = rod_state.verts.pos[i_v, i_b]
                 radius = rod_info.verts.radius[i_v]
+                penetration_max = gs.qd_float(0.0)
                 for i_g in range(geoms_info.needs_coup.shape[0]):
                     if geoms_info.needs_coup[i_g]:
                         signed_dist = sdf.sdf_func_world(i_g, i_b, pos, geoms_state, geoms_info, sdf_info) - radius
+                        if -signed_dist > penetration_max:
+                            penetration_max = -signed_dist
+                            contact_geom_idx = i_g
                         # See '_func_collide_with_rigid_geom'
                         influence = qd.min(qd.exp(-signed_dist / qd.max(1e-10, geoms_info.coup_softness[i_g])), 1.0)
                         if influence > 0.1:
@@ -755,6 +866,10 @@ class LegacyCoupler(RBC):
                                 rigid_info,
                             )
             rod_state.verts.vel_coupled[i_v, i_b] = vel
+            if contact_geom_idx >= 0:
+                rod_state.verts.contact_geom_idx[i_v, i_b] = contact_geom_idx
+            elif is_step_start:
+                rod_state.verts.contact_geom_idx[i_v, i_b] = -1
 
     @qd.kernel
     def rod_apply_coupled_vel(self, rod_state: RodState):
@@ -949,16 +1064,22 @@ class LegacyCoupler(RBC):
     def couple(self, f):
         # MPM <-> all others
         if self.mpm_solver.is_active:
+            if self._rod_mpm:
+                self.rod_mpm_prepare(self.rod_solver.rod_state, self.rod_solver.rod_info)
             self.mpm_grid_op(
                 f,
                 self.sim.cur_t,
-                geoms_state=self.rigid_solver.dyn_state.geoms,
-                geoms_info=self.rigid_solver.dyn_info.geoms,
-                links_state=self.rigid_solver.dyn_state.links,
-                rigid_info=self.rigid_solver.rigid_info,
-                sdf_info=self.rigid_solver.collider.collider_info.sdf,
-                collider_config=self.rigid_solver.collider.collider_config,
+                self.rod_solver.rod_state,
+                self.rigid_solver.dyn_state.geoms,
+                self.rigid_solver.dyn_state.links,
+                self.rod_solver.rod_info,
+                self.rigid_solver.dyn_info.geoms,
+                self.rigid_solver.rigid_info,
+                self.rigid_solver.collider.collider_info.sdf,
+                self.rigid_solver.collider.collider_config,
             )
+            if self._rod_mpm:
+                self.rod_apply_mpm_dv(self.rod_solver.rod_state)
 
         # SPH <-> Rigid
         if self._rigid_sph:
@@ -1011,6 +1132,7 @@ class LegacyCoupler(RBC):
                 self.rigid_solver.rigid_info,
                 self.rigid_solver.collider.collider_info.sdf,
                 self.rigid_solver.collider.collider_config,
+                self.sim.cur_substep_global % self.sim.substeps == 0,
             )
             self.rod_apply_coupled_vel(self.rod_solver.rod_state)
 
@@ -1021,7 +1143,8 @@ class LegacyCoupler(RBC):
 
         The couplings of the FEM solver with the rigid, MPM and SPH solvers carry no gradient: each surface triangle of
         an FEM entity overwrites the velocity of the vertices it shares with its neighbours, which the reverse pass
-        cannot undo without a race.
+        cannot undo without a race. The coupling of the rods with the MPM solver carries it, the rods gathering the
+        impulses of the grid nodes apart (see '_func_mpm_collide_with_rods').
         """
         return not (self._rigid_fem or self._fem_mpm or self._fem_sph)
 

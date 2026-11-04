@@ -209,7 +209,7 @@ class RodEntity(Entity):
         """
         Set whether some vertices are fixed, keeping their position and velocity.
 
-        This is part of the model, which a reset of the scene leaves as set.
+        This is part of the state (see 'RodSolver.set_verts_fixed').
 
         Parameters
         ----------
@@ -243,7 +243,7 @@ class RodEntity(Entity):
         Constrain some vertices to target positions, or to follow a rigid link.
 
         A constrained vertex is placed at its target at the end of every substep, with zero velocity. This is part of
-        the model, which a reset of the scene leaves as set.
+        the state, which a differentiable rollout may change between two steps (see 'RodSolver.set_vertex_constraints').
 
         Parameters
         ----------
@@ -266,6 +266,62 @@ class RodEntity(Entity):
         """Remove the constraints of some vertices (see 'set_vertex_constraints'), of all of them if None."""
         verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True, batched_idx=True)
         self._solver.remove_vertex_constraints(verts_idx, envs_idx)
+
+    def get_verts_contact_geom_idx(self, verts_idx_local=None, envs_idx=None):
+        """
+        Get a rigid geom each vertex penetrated during the last step, -1 for none (see
+        'RodSolver.get_verts_contact_geom_idx').
+
+        Parameters
+        ----------
+        verts_idx_local : None | int | array_like, shape (N,)
+            Index of the vertices relative to this entity. If None, all vertices will be considered.
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to read. If None, all environments will be considered. Defaults to None.
+        """
+        verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True)
+        return self._solver.get_verts_contact_geom_idx(verts_idx, envs_idx)
+
+    def get_geodesic_distance(self, verts_idx_start, verts_idx_end, envs_idx=None):
+        """
+        Get the length of the rod between two of its vertices, the sum of the current lengths of the edges joining them.
+
+        The path runs along the vertices of increasing index. The length follows the positions of a differentiable
+        rollout, so that a loss reading it carries its gradient.
+
+        Parameters
+        ----------
+        verts_idx_start : int
+            Index of the first vertex, relative to this entity.
+        verts_idx_end : int
+            Index of the last vertex, relative to this entity, greater than the first. The number of vertices of a
+            loop reaches the first vertex again.
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to read. If None, all environments will be considered. Defaults to None.
+
+        Returns
+        -------
+        distance : torch.Tensor, shape ([M,])
+            The length of the rod between the two vertices, in m, in each environment.
+        """
+        if not 0 <= verts_idx_start < verts_idx_end <= self.n_edges:
+            gs.raise_exception(
+                f"Expected vertex indices 0 <= start < end <= {self.n_edges}, got {verts_idx_start} and {verts_idx_end}."
+            )
+        verts_idx = [self._v_start + i_v % self.n_verts for i_v in range(verts_idx_start, verts_idx_end + 1)]
+        verts_pos = self._solver.get_verts_pos(verts_idx, envs_idx)
+        return torch.linalg.norm(verts_pos[..., 1:, :] - verts_pos[..., :-1, :], dim=-1).sum(dim=-1)
+
+    def get_total_length(self, envs_idx=None):
+        """
+        Get the current length of the rod, the sum of the current lengths of its edges, closing edge of a loop included.
+
+        Returns
+        -------
+        length : torch.Tensor, shape ([M,])
+            The length of the rod, in m, in each environment (see 'get_geodesic_distance').
+        """
+        return self.get_geodesic_distance(0, self.n_edges, envs_idx)
 
     def get_energy(self, envs_idx=None):
         """

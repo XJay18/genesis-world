@@ -70,11 +70,6 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
         material=material,
     )
     scene.build()
-    # One end of the rod is held, by constraints to world targets or by fixed vertices
-    if case == "constrained":
-        rod.set_vertex_constraints([0, 1])
-    if case == "inextensible":
-        rod.set_verts_fixed(True, [0, 1])
 
     rng = np.random.default_rng(0)
     weights = torch.tensor(rng.standard_normal((n_verts, 3)), dtype=gs.tc_float, device=gs.device)
@@ -91,6 +86,11 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
 
     def rollout(pos, vel, theta, E, K, G):
         scene.reset()
+        # One end of the rod is held, by constraints to world targets or by fixed vertices, which the reset releases
+        if case == "constrained":
+            rod.set_vertex_constraints([0, 1], target_poss=rod.init_positions[:2])
+        if case == "inextensible":
+            rod.set_verts_fixed(True, [0, 1])
         rod.set_position(pos)
         rod.set_velocity(vel)
         rod.set_edges_theta(theta)
@@ -124,6 +124,203 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
         direction = torch.tensor(rng.standard_normal(value.shape), dtype=gs.tc_float, device=gs.device)
         step, tol = steps_and_tols[name]
         eps = step * value if name in ("E", "K", "G") else step
+        with torch.no_grad():
+            loss_plus = rollout(**{**inputs, name: value + eps * direction})
+            loss_minus = rollout(**{**inputs, name: value - eps * direction})
+        grad_fd = (loss_plus - loss_minus) / (2.0 * eps)
+        grad_ad = (inputs_ad[name].grad * direction).sum()
+        assert abs(grad_ad - grad_fd) <= tol * abs(grad_fd), name
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+def test_mpm_coupling_grad_matches_fd(backend, show_viewer):
+    n_verts, n_steps = 6, 10
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            requires_grad=True,
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=10.0,
+            angular_damping=5.0,
+        ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.1, -0.1, -0.05),
+            upper_bound=(0.1, 0.1, 0.15),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.2, -0.3, 0.2),
+            camera_lookat=(0.0, 0.0, 0.07),
+        ),
+        show_viewer=show_viewer,
+    )
+    block = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.05),
+            size=(0.04, 0.04, 0.04),
+        ),
+        material=gs.materials.MPM.Elastic(
+            E=1e4,
+            rho=500.0,
+        ),
+    )
+    # A rod falling onto the block from within the reach of its grid nodes, which bounce it back
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=n_verts,
+            interval=0.01,
+            pos=(-0.025, 0.003, 0.084),
+        ),
+        material=gs.materials.Rod.Base(
+            E=1e5,
+            G=1e4,
+            restitution=0.3,
+            segment_mass=0.002,
+            segment_radius=0.005,
+        ),
+    )
+    scene.build()
+
+    rng = np.random.default_rng(0)
+    rod_weights = torch.tensor(rng.standard_normal((n_verts, 3)), dtype=gs.tc_float, device=gs.device)
+    block_weights = torch.tensor(rng.standard_normal((block.n_particles, 3)), dtype=gs.tc_float, device=gs.device)
+    inputs = dict(
+        rod_vel=torch.tensor(
+            [0.1, 0.05, -1.0] + 0.1 * rng.standard_normal((n_verts, 3)), dtype=gs.tc_float, device=gs.device
+        ),
+        block_vel=torch.tensor([0.0, 0.0, 0.5], dtype=gs.tc_float, device=gs.device),
+    )
+
+    def rollout(rod_vel, block_vel):
+        scene.reset()
+        rod.set_velocity(rod_vel)
+        block.set_velocity(block_vel)
+        for _ in range(n_steps):
+            scene.step()
+        return (rod.get_state().pos[0] * rod_weights).sum() + (block.get_state().pos[0] * block_weights).sum()
+
+    inputs_ad = {name: value.clone().requires_grad_() for name, value in inputs.items()}
+    rollout(**inputs_ad).backward()
+
+    # Directional derivatives along a random direction, with the step and the tolerance their measured floors set
+    steps_and_tols = {"rod_vel": (1e-5, 1e-6), "block_vel": (1e-4, 2e-9)}
+    for name, value in inputs.items():
+        direction = torch.tensor(rng.standard_normal(value.shape), dtype=gs.tc_float, device=gs.device)
+        step, tol = steps_and_tols[name]
+        with torch.no_grad():
+            loss_plus = rollout(**{**inputs, name: value + step * direction})
+            loss_minus = rollout(**{**inputs, name: value - step * direction})
+        grad_fd = (loss_plus - loss_minus) / (2.0 * step)
+        grad_ad = (inputs_ad[name].grad * direction).sum()
+        assert abs(grad_ad - grad_fd) <= tol * abs(grad_fd), name
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+def test_mid_rollout_attachment_grad_matches_fd(backend, show_viewer):
+    n_verts, n_steps, i_step_attach = 8, 10, 4
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=2,
+            requires_grad=True,
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=10.0,
+            angular_damping=5.0,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.25, -0.8, 0.7),
+            camera_lookat=(0.25, 0.0, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    # A box whose velocity the rollout drives, which no rod collides with
+    link_box = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.5),
+            size=(0.04, 0.04, 0.04),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=False,
+            gravity_compensation=1.0,
+        ),
+    )
+    # A free box rising into a rod, which pushes it back
+    free_box = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.5, 0.0, 0.48),
+            size=(0.1, 0.1, 0.04),
+        ),
+        material=gs.materials.Rigid(
+            rho=200.0,
+            coup_friction=0.2,
+        ),
+    )
+    rods = [
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=n_verts,
+                interval=0.01,
+                pos=pos,
+            ),
+            material=gs.materials.Rod.Base(
+                K=1e4,
+                E=1e4,
+                G=1e3,
+                inextensible=False,
+                segment_mass=0.002,
+                segment_radius=0.005,
+            ),
+        )
+        for pos in ((0.02, 0.0, 0.5), (0.465, 0.0, 0.5057))
+    ]
+    scene.build()
+
+    rng = np.random.default_rng(1)
+    rods_weights = torch.tensor(rng.standard_normal((2, n_verts, 3)), dtype=gs.tc_float, device=gs.device)
+    box_weights = torch.tensor(rng.standard_normal(3), dtype=gs.tc_float, device=gs.device)
+    inputs = dict(
+        rod_vel=torch.tensor(
+            [0.0, 0.0, 0.3] + 0.1 * rng.standard_normal((n_verts, 3)), dtype=gs.tc_float, device=gs.device
+        ),
+        link_vel=torch.tensor(0.2 * rng.standard_normal((n_steps, 3)), dtype=gs.tc_float, device=gs.device),
+        box_vel=torch.tensor([0.05, -0.02, 0.3], dtype=gs.tc_float, device=gs.device),
+        E=torch.tensor(1e4, dtype=gs.tc_float, device=gs.device),
+    )
+
+    def rollout(rod_vel, link_vel, box_vel, E):
+        scene.reset()
+        rods[0].set_velocity(rod_vel)
+        rods[1].set_velocity((0.0, 0.0, -0.4))
+        rods[0].set_bending_stiffness(E)
+        free_box.set_dofs_velocity(box_vel, dofs_idx_local=slice(0, 3))
+        for i_step in range(n_steps):
+            link_box.set_dofs_velocity(link_vel[i_step], dofs_idx_local=slice(0, 3))
+            # The rods are grasped midway, by the driven box and by the free box
+            if i_step == i_step_attach:
+                rods[0].set_vertex_constraints([0, 1], link=link_box.base_link)
+                rods[1].set_vertex_constraints(0, link=free_box.base_link)
+            scene.step()
+        loss = (torch.stack([rod.get_state().pos[0] for rod in rods]) * rods_weights).sum()
+        return loss + (free_box.get_pos() * box_weights).sum() + rods[0].get_geodesic_distance(2, 7)
+
+    inputs_ad = {name: value.clone().requires_grad_() for name, value in inputs.items()}
+    rollout(**inputs_ad).backward()
+
+    # Directional derivatives along a random direction, with the step and the tolerance their measured floors set
+    steps_and_tols = {
+        "rod_vel": (1e-5, 5e-8),
+        "link_vel": (1e-4, 2e-9),
+        "box_vel": (1e-5, 2e-9),
+        "E": (1e-4, 5e-8),
+    }
+    for name, value in inputs.items():
+        direction = torch.tensor(rng.standard_normal(value.shape), dtype=gs.tc_float, device=gs.device)
+        step, tol = steps_and_tols[name]
+        eps = step * value if name == "E" else step
         with torch.no_grad():
             loss_plus = rollout(**{**inputs, name: value + eps * direction})
             loss_minus = rollout(**{**inputs, name: value - eps * direction})

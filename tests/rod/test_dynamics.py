@@ -262,7 +262,7 @@ def test_straight_rest_state(show_viewer):
 @pytest.mark.required
 @pytest.mark.debug(True)
 @pytest.mark.parametrize("backend", [gs.cpu])
-def test_vertex_constraints_persist_through_reset(show_viewer):
+def test_vertex_constraints_reset_with_state(show_viewer):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1e-3,
@@ -293,24 +293,30 @@ def test_vertex_constraints_persist_through_reset(show_viewer):
     rods = [
         scene.add_entity(
             morph=gs.morphs.ParameterizedRod(
-                n_vertices=20,
+                n_vertices=n_verts,
                 interval=0.01,
                 pos=pos,
+                fixed=is_fixed,
             ),
             material=gs.materials.Rod.Base(
                 segment_radius=0.005,
             ),
         )
-        for pos in ((0.0, 0.3, 0.3), (0.36, 0.0, 0.2))
+        for n_verts, pos, is_fixed in (
+            (20, (0.0, 0.3, 0.3), False),
+            (20, (0.36, 0.0, 0.2), False),
+            (3, (0.0, -0.3, 0.3), True),
+        )
     ]
     scene.build(n_envs=2)
     rods[0].set_verts_fixed(True, [0, 1])
     rods[1].set_verts_fixed(True, 2, envs_idx=1)
     rods[1].set_vertex_constraints(19, link=box.base_link)
 
-    is_kinematic = np.zeros((2, 2, 20), dtype=np.bool_)
-    is_kinematic[0, :, :2] = True
-    is_kinematic[1, 1, 2] = is_kinematic[1, :, 19] = True
+    is_kinematic = [np.zeros((2, rod.n_verts), dtype=np.bool_) for rod in rods]
+    is_kinematic[0][:, :2] = True
+    is_kinematic[1][1, 2] = is_kinematic[1][:, 19] = True
+    is_kinematic[2][:] = True
     for rod, rod_is_kinematic in zip(rods, is_kinematic):
         assert_equal(rod.get_verts_kinematic(), rod_is_kinematic)
 
@@ -320,18 +326,27 @@ def test_vertex_constraints_persist_through_reset(show_viewer):
     for _ in range(20):
         scene.step()
     pos_env_0 = [rod.get_state().pos[0] for rod in rods]
+    # The constraints are part of the state, which a reset restores as built, the vertices the morphs fix included
     scene.reset(envs_idx=[1])
-    for rod, pos, pos_0 in zip(rods, pos_init, pos_env_0):
+    for rod, pos, pos_0, rod_is_kinematic in zip(rods, pos_init, pos_env_0, is_kinematic):
         assert_allclose(rod.get_state().pos[1], pos[1], tol=gs.EPS)
         assert_allclose(rod.get_state().pos[0], pos_0, tol=gs.EPS)
+        assert_equal(rod.get_verts_kinematic()[0], rod_is_kinematic[0])
+        assert_equal(rod.get_verts_kinematic()[1], rod is rods[2])
 
     scene.reset()
+    for rod in rods:
+        assert_equal(rod.get_verts_kinematic(), rod is rods[2])
+    rods[0].set_verts_fixed(True, [0, 1])
+    rods[1].set_verts_fixed(True, 2, envs_idx=1)
+    rods[1].set_vertex_constraints(19, link=box.base_link)
     shift = torch.tensor((0.0, 0.0, 0.05), dtype=gs.tc_float, device=gs.device)
     rods[1].set_verts_pos(pos_init[1] + shift)
     for _ in range(20):
         scene.step()
     assert_allclose(rods[0].get_state().pos[:, :2], pos_init[0][:, :2], tol=gs.EPS)
     assert_allclose(rods[1].get_state().pos[1, 2], pos_init[1][1, 2] + shift, tol=gs.EPS)
+    assert_allclose(rods[2].get_state().pos, pos_init[2], tol=gs.EPS)
     # The constrained vertex follows the box as it falls
     assert (box.get_pos()[:, 2] < box_pos_init[:, 2] - 1e-3).all()
     verts_pos = gu.transform_by_trans_quat(verts_offset, box.get_pos(), box.get_quat())
@@ -452,3 +467,154 @@ def test_rod_contacts_resolve_at_any_precision(precision, show_viewer):
     # FIXME: the lift is the one measured in double precision, the projections overshooting the overlap. Replace with
     # a bound derived from the projection, once it converges to the overlap.
     assert_allclose(lift[4], 3.18822e-3, atol=2e-7)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("rod_mpm", [True, False])
+def test_rod_mpm_coupling(rod_mpm, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=10.0,
+            angular_damping=5.0,
+        ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.3, -0.3, -0.05),
+            upper_bound=(0.3, 0.3, 0.45),
+        ),
+        coupler_options=gs.options.LegacyCouplerOptions(
+            rod_mpm=rod_mpm,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.4, -0.6, 0.4),
+            camera_lookat=(0.0, 0.0, 0.08),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.1,
+        ),
+    )
+    block = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.05),
+            size=(0.2, 0.2, 0.1),
+        ),
+        material=gs.materials.MPM.Elastic(),
+    )
+    # A rod lying just above the block, within the reach of its grid nodes
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=30,
+            interval=0.005,
+            pos=(-0.0725, 0.0, 0.115),
+        ),
+        material=gs.materials.Rod.Base(
+            E=1e5,
+            G=1e4,
+            segment_radius=0.005,
+        ),
+    )
+    scene.build(n_envs=2)
+
+    for _ in range(100):
+        scene.step()
+        block_top = block.get_particles_pos()[..., 2].max(dim=-1).values
+        rod_bottom = rod.get_state().pos[..., 2].min(dim=-1).values
+        # The coupled rod rests on the block, while the uncoupled one falls through it
+        if rod_mpm:
+            assert (rod_bottom > block_top).all()
+    if not rod_mpm:
+        assert (rod_bottom < block_top - 0.01).all()
+    # The impulses of the grid nodes on a vertex add up through atomics, whose order varies
+    assert_allclose(rod.get_state().pos[0], rod.get_state().pos[1], tol=1e-9)
+
+
+@pytest.mark.required
+def test_rod_length_and_rigid_contacts(show_viewer):
+    n_verts, interval, n_loop_verts, loop_radius = 20, 0.01, 16, 0.05
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=10.0,
+            angular_damping=5.0,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.6, 0.4),
+            camera_lookat=(0.2, 0.0, 0.1),
+        ),
+        show_viewer=show_viewer,
+    )
+    box = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.05),
+            size=(0.1, 0.1, 0.1),
+            fixed=True,
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.5,
+        ),
+    )
+    # A rod lying on the box, its capsule overlapping it, half of it overhanging
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=n_verts,
+            interval=interval,
+            pos=(-0.035, 0.0, 0.104),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=0.005,
+        ),
+    )
+    # A rod leaving the box upward, which penetrates it at the first substep alone
+    rod_leaving = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=3,
+            interval=interval,
+            pos=(-0.02, 0.03, 0.104),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=0.005,
+        ),
+    )
+    loop = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            type="circle",
+            n_vertices=n_loop_verts,
+            radius=loop_radius,
+            pos=(0.5, 0.0, 0.3),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=0.005,
+        ),
+    )
+    scene.build(n_envs=2)
+    rod_leaving.set_velocity((0.0, 0.0, 10.0))
+
+    assert_allclose(rod.get_total_length(), (n_verts - 1) * interval, tol=gs.EPS)
+    assert_allclose(rod.get_geodesic_distance(2, 7), 5 * interval, tol=gs.EPS)
+    chord = 2.0 * loop_radius * math.sin(math.pi / n_loop_verts)
+    assert_allclose(loop.get_total_length(), n_loop_verts * chord, tol=gs.EPS)
+    assert_allclose(loop.get_geodesic_distance(10, n_loop_verts), 6 * chord, tol=gs.EPS)
+    for i_step in range(10):
+        scene.step()
+        # The vertices over the box penetrate it, the overhanging ones hang in the air
+        contact_geom_idx = np.full((2, n_verts), -1)
+        contact_geom_idx[:, :9] = box.geoms[0].idx
+        assert_equal(rod.get_verts_contact_geom_idx(), contact_geom_idx)
+        assert_equal(loop.get_verts_contact_geom_idx(), -1)
+        # A contact is reported over the whole step it happens in, and cleared by the next step
+        assert_equal(rod_leaving.get_verts_contact_geom_idx(), box.geoms[0].idx if i_step == 0 else -1)
+    verts_pos = rod.get_state().pos
+    edges_length = torch.linalg.norm(verts_pos[:, 1:] - verts_pos[:, :-1], dim=-1)
+    assert_allclose(rod.get_total_length(), edges_length.sum(dim=-1), tol=gs.EPS)
