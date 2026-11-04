@@ -143,6 +143,8 @@ def test_elastic_energy_decays_with_damping(show_viewer):
     assert (energies[0] > 0.0).all()
     assert (np.diff(energies[:, 0]) < 0.0).all()
     assert energies[-1, 0] < 0.85 * energies[0, 0]
+    assert (np.diff(energies[120:, 1]) < 0.0).all()
+    assert energies[-1, 1] < 0.75 * energies[:, 1].max()
     # The projection of the stretched edges onto their rest length moves energy into bending, which stays of the order
     # of the initial energy
     assert energies[:, 1].max() < 2.0 * energies[0, 1]
@@ -190,9 +192,8 @@ def test_inextensible_edge_lengths_and_checkpoint(show_viewer):
     pos = rod.get_state().pos
     # The rod swings down from its fixed end
     assert (pos[:, -1, 2] < 0.5 - 0.05).all()
-    # FIXME: the projection leaves an edge length error growing with time, bounded here by the one measured before
-    # the projections became order independent. Replace with a bound on the projection residual.
-    assert max(length_errors) < 1e-3
+    # FIXME: the bound on the edge length error is measured. Replace with a bound derived from the projection residual.
+    assert max(length_errors) < 5e-4
     # Every projection is gathered per vertex in a fixed order, so identical environments stay bitwise identical
     assert_equal(pos, pos[:1].expand_as(pos))
 
@@ -339,8 +340,8 @@ def test_vertex_constraints_persist_through_reset(show_viewer):
 
 @pytest.mark.required
 def test_rod_contacts_match_reference(show_viewer):
-    # FIXME: the reference trajectory comes from the solver before its projections became order independent, run on
-    # GPU. Replace with physics-informed assertions on the contacts between the rods.
+    # FIXME: the reference trajectory is a recorded GPU run of this scene. Replace with physics-informed assertions on
+    # the contacts between the rods.
     ref = np.load(os.path.join(os.path.dirname(__file__), "data", "s1_hanging_gpu_200steps.npz"))
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -397,3 +398,57 @@ def test_rod_contacts_match_reference(show_viewer):
             scene.step()
         pos.append(torch.cat([rod.get_state().pos for rod in rods], dim=1))
     assert_allclose(torch.stack(pos), ref["pos"], atol=1e-3)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["32", "64"])
+def test_rod_contacts_resolve_at_any_precision(precision, show_viewer):
+    radius, penetration = 0.005, 2e-3
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=1,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.2, -0.2, 0.4),
+            camera_lookat=(0.0, 0.0, 0.3),
+        ),
+        show_viewer=show_viewer,
+    )
+    material = gs.materials.Rod.Base(
+        E=0.0,
+        G=0.0,
+        static_friction=0.0,
+        kinetic_friction=0.0,
+        segment_radius=radius,
+    )
+    # A free rod crossing a fixed one at the middle of an edge of each, their capsules overlapping
+    scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=10,
+            interval=0.01,
+            axis="y",
+            pos=(0.0, -0.045, 0.3),
+            fixed=True,
+        ),
+        material=material,
+    )
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=10,
+            interval=0.01,
+            pos=(-0.045, 0.0, 0.3 + 2.0 * radius - penetration),
+        ),
+        material=material,
+    )
+    scene.build()
+    pos_init = rod.get_state().pos
+    scene.step()
+    lift = (rod.get_state().pos - pos_init)[0, :, 2]
+    # The two vertices of the crossing edge share the correction equally, and the overlap is resolved
+    assert_allclose(lift[4], lift[5], atol=1e-7)
+    assert (lift[4] > penetration).all()
+    # FIXME: the lift is the one measured in double precision, the projections overshooting the overlap. Replace with
+    # a bound derived from the projection, once it converges to the overlap.
+    assert_allclose(lift[4], 3.18822e-3, atol=2e-7)
