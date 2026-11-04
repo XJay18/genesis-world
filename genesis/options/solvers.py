@@ -84,8 +84,9 @@ class LegacyCouplerOptions(BaseCouplerOptions):
     fem_sph : bool, optional
         Whether to enable coupling between FEM and SPH solvers. Defaults to True.
     rigid_rod : bool, optional
-        Whether to enable coupling between rigid and rod solvers: the rod vertices collide with the rigid geoms that
-        need coupling, and push them back. Defaults to True.
+        Whether to enable coupling between rigid and rod solvers: the rods, their whole length between the vertices
+        included, collide with the rigid geoms that need coupling, with the friction of the geom ('coup_friction' of
+        its material), and push them back, so that a gripper can hold a rod by squeezing it. Defaults to True.
     rod_mpm : bool, optional
         Whether to enable coupling between rod and MPM solvers: the MPM material and the rods push each other apart
         where they meet. It costs time only in scenes holding both rods and MPM materials, growing with the number of rod

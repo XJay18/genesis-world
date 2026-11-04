@@ -23,6 +23,24 @@ def func_inverse_mass(i_v: int, i_b: int, rod_state: RodState, rod_info: RodInfo
     return inv_mass
 
 
+@qd.func
+def func_last_projection_correction(
+    i_v: int, i_b: int, rod_state: RodState, has_edge_pairs: qd.template()
+) -> qd.types.vector(3):
+    """Return the correction of the position of a vertex the last projection of the rods computed and left to apply:
+    the one of the rod-rod contacts where pairs of edges are tested, the one of the inextensibility otherwise.
+
+    The projections of a substep chain their kernels, each applying the correction of the previous one before computing
+    its own (see 'kernel_project_rod_inextensibility').
+    """
+    dp = qd.Vector.zero(gs.qd_float, 3)
+    if qd.static(has_edge_pairs):
+        dp = rod_state.verts.dp_contact[i_v, i_b]
+    else:
+        dp = rod_state.verts.dp_inextensibility[i_v, i_b]
+    return dp
+
+
 def mesh_from_centerline(verts, radii, d1, is_loop, n_radial=16, n_cap=8):
     """
     Build the tube mesh of a rod around its centerline, closed by hemispherical caps at the ends of an open rod.

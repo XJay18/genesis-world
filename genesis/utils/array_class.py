@@ -1740,8 +1740,12 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
     dp_inextensibility: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True)
     dp_contact: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, labels=ROD_CONTACTS)
     dv_friction: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, labels=ROD_CONTACTS)
-    # The velocity once the coupling with the rigid geoms acted on it, before it is written back
-    vel_coupled: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    # The corrections of the contacts with the rigid geoms, each averaged over the contacts of the vertex (see
+    # 'LegacyCoupler.project_rod_rigid_contacts'): along the normals, the part the approach of the substep made and the
+    # part the vertex started the substep with, which moves it without changing its velocity, then along the surfaces
+    dp_rigid_normal: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    dp_rigid_overlap: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    dp_rigid_friction: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     # The change of velocity the MPM grid nodes impart, summed over the nodes before it is applied
     dv_mpm: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     # The rigid geom the vertex penetrated deepest at the latest substep of the step with a penetration, -1 for none

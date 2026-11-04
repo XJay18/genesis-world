@@ -284,10 +284,14 @@ def test_vertex_constraints_reset_with_state(show_viewer):
             needs_coup=True,
         ),
     )
+    # The rod attached to the box whips back once shifted, and the box only carries the attachment
     box = scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.6, 0.0, 0.2),
             size=(0.1, 0.1, 0.1),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=False,
         ),
     )
     rods = [
@@ -565,7 +569,7 @@ def test_rod_length_and_rigid_contacts(show_viewer):
             coup_friction=0.5,
         ),
     )
-    # A rod lying on the box, its capsule overlapping it, half of it overhanging
+    # A rod lying on the box, its capsule overlapping it, half of it overhanging, soft enough not to lever itself up
     rod = scene.add_entity(
         morph=gs.morphs.ParameterizedRod(
             n_vertices=n_verts,
@@ -573,6 +577,7 @@ def test_rod_length_and_rigid_contacts(show_viewer):
             pos=(-0.035, 0.0, 0.104),
         ),
         material=gs.materials.Rod.Base(
+            E=1e3,
             segment_radius=0.005,
         ),
     )
@@ -599,7 +604,7 @@ def test_rod_length_and_rigid_contacts(show_viewer):
         ),
     )
     scene.build(n_envs=2)
-    rod_leaving.set_velocity((0.0, 0.0, 10.0))
+    rod_leaving.set_velocity((0.0, 0.0, 2.5))
 
     assert_allclose(rod.get_total_length(), (n_verts - 1) * interval, tol=gs.EPS)
     assert_allclose(rod.get_geodesic_distance(2, 7), 5 * interval, tol=gs.EPS)
@@ -608,10 +613,11 @@ def test_rod_length_and_rigid_contacts(show_viewer):
     assert_allclose(loop.get_geodesic_distance(10, n_loop_verts), 6 * chord, tol=gs.EPS)
     for i_step in range(10):
         scene.step()
-        # The vertices over the box penetrate it, the overhanging ones hang in the air
-        contact_geom_idx = np.full((2, n_verts), -1)
-        contact_geom_idx[:, :9] = box.geoms[0].idx
-        assert_equal(rod.get_verts_contact_geom_idx(), contact_geom_idx)
+        # The vertices over the box rest on it, the overhanging ones hang in the air, while the two vertices on both
+        # sides of its edge touch it or not as the rod pivots there
+        rod_contact_geom_idx = rod.get_verts_contact_geom_idx()
+        assert_equal(rod_contact_geom_idx[:, :8], box.geoms[0].idx)
+        assert_equal(rod_contact_geom_idx[:, 10:], -1)
         assert_equal(loop.get_verts_contact_geom_idx(), -1)
         # A contact is reported over the whole step it happens in, and cleared by the next step
         assert_equal(rod_leaving.get_verts_contact_geom_idx(), box.geoms[0].idx if i_step == 0 else -1)
