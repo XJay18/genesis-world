@@ -1734,7 +1734,6 @@ class USD(FileMorph):
         return f"{super().__repr_name__()[:-1]}, prim_path='{self.prim_path}')>"
 
 
-
 ############################ Rods ############################
 
 

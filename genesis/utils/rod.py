@@ -43,9 +43,12 @@ def mesh_from_centerline(verts, radii, d1, is_loop, n_radial=16, n_cap=8):
         tangents_prev = np.concatenate([tangents[:1], tangents])
         tangents_next = np.concatenate([tangents, tangents[-1:]])
         d1_prev, d1_next = np.concatenate([d1[:1], d1]), np.concatenate([d1, d1[-1:]])
+    # The mean of two nearly opposite directions is undefined, in which case the one of the next edge stands for it
     verts_tangent = tangents_prev + tangents_next
+    verts_tangent = np.where((verts_tangent**2).sum(axis=-1, keepdims=True) < 1.0, tangents_next, verts_tangent)
     verts_tangent /= np.linalg.norm(verts_tangent, axis=-1, keepdims=True)
     verts_normal = d1_prev + d1_next
+    verts_normal = np.where((verts_normal**2).sum(axis=-1, keepdims=True) < 1.0, d1_next, verts_normal)
     verts_normal -= (verts_normal * verts_tangent).sum(axis=-1, keepdims=True) * verts_tangent
     verts_normal /= np.linalg.norm(verts_normal, axis=-1, keepdims=True)
     verts_binormal = np.cross(verts_tangent, verts_normal)

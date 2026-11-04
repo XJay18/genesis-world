@@ -8,7 +8,17 @@ import genesis.utils.sdf as sdf
 
 from genesis.options.solvers import LegacyCouplerOptions
 from genesis.repr_base import RBC
-from genesis.utils.array_class import GeomsInfo, GeomsState, LinksInfo, LinksState, RigidInfo, RodData, SDFInfo
+from genesis.utils.array_class import (
+    GeomsInfo,
+    GeomsState,
+    LinksInfo,
+    LinksState,
+    RigidInfo,
+    RodData,
+    RodInfo,
+    RodState,
+    SDFInfo,
+)
 from genesis.utils.data import opt_in
 from genesis.utils.geom import qd_inv_transform_by_trans_quat, qd_transform_by_trans_quat
 
@@ -701,6 +711,57 @@ class LegacyCoupler(RBC):
                         )
 
     @qd.kernel
+    def rod_rigid_collide(
+        self,
+        rod_state: RodState,
+        geoms_state: GeomsState,
+        links_state: LinksState,
+        rod_info: RodInfo,
+        geoms_info: GeomsInfo,
+        rigid_info: RigidInfo,
+        sdf_info: SDFInfo,
+        collider_config: qd.template(),
+    ):
+        """Collide the free rod vertices with the rigid geoms that need coupling, at the velocity level.
+
+        The capsule of a vertex collides like a particle (see '_func_collide_in_rigid_geom'), its signed distance to a
+        geom reduced by the radius of the rod. The velocity is written apart, to be applied once every vertex computed
+        it (see 'rod_apply_coupled_vel'), so that autodiff reverses the coupling.
+        """
+        for i_v, i_b in qd.ndrange(rod_state.verts.vel.shape[0], rod_state.verts.vel.shape[1]):
+            vel = rod_state.verts.vel[i_v, i_b]
+            if not rod_info.verts.is_fixed[i_v, i_b] and not rod_info.verts.is_constrained[i_v, i_b]:
+                pos = rod_state.verts.pos[i_v, i_b]
+                radius = rod_info.verts.radius[i_v]
+                for i_g in range(geoms_info.needs_coup.shape[0]):
+                    if geoms_info.needs_coup[i_g]:
+                        signed_dist = sdf.sdf_func_world(i_g, i_b, pos, geoms_state, geoms_info, sdf_info) - radius
+                        # See '_func_collide_with_rigid_geom'
+                        influence = qd.min(qd.exp(-signed_dist / qd.max(1e-10, geoms_info.coup_softness[i_g])), 1.0)
+                        if influence > 0.1:
+                            normal = sdf.sdf_func_normal_world(
+                                i_g, i_b, pos, geoms_state, geoms_info, rigid_info, sdf_info, collider_config
+                            )
+                            vel = self._func_collide_in_rigid_geom(
+                                pos,
+                                vel,
+                                rod_info.verts.mass[i_v],
+                                normal,
+                                influence,
+                                i_g,
+                                i_b,
+                                geoms_info,
+                                links_state,
+                                rigid_info,
+                            )
+            rod_state.verts.vel_coupled[i_v, i_b] = vel
+
+    @qd.kernel
+    def rod_apply_coupled_vel(self, rod_state: RodState):
+        for i_v, i_b in qd.ndrange(rod_state.verts.vel.shape[0], rod_state.verts.vel.shape[1]):
+            rod_state.verts.vel[i_v, i_b] = rod_state.verts.vel_coupled[i_v, i_b]
+
+    @qd.kernel
     def kernel_pbd_rigid_collide(
         self,
         geoms_state: GeomsState,
@@ -941,10 +1002,7 @@ class LegacyCoupler(RBC):
 
         # Rod <-> Rigid
         if self._rigid_rod:
-            # Imported here to avoid a circular dependency, the solvers importing the couplers through their entities
-            from genesis.engine.solvers.rod_solver import kernel_rod_apply_coupled_vel, kernel_rod_rigid_collide
-
-            kernel_rod_rigid_collide(
+            self.rod_rigid_collide(
                 self.rod_solver.rod_state,
                 self.rigid_solver.dyn_state.geoms,
                 self.rigid_solver.dyn_state.links,
@@ -954,7 +1012,7 @@ class LegacyCoupler(RBC):
                 self.rigid_solver.collider.collider_info.sdf,
                 self.rigid_solver.collider.collider_config,
             )
-            kernel_rod_apply_coupled_vel(self.rod_solver.rod_state)
+            self.rod_apply_coupled_vel(self.rod_solver.rod_state)
 
     @property
     def is_differentiable(self) -> bool:

@@ -89,32 +89,45 @@ class RodEntity(Entity):
     # ----------------------------------- basic entity ops -------------------------------
     # ------------------------------------------------------------------------------------
 
-    def set_position(self, pos):
+    def set_position(self, pos, envs_idx=None):
         """
-        Set the position of the rod.
+        Set the position of every vertex of the rod, or of the center of its vertices, each keeping its initial offset.
+
+        A value whose next-to-last dimension has one entry per vertex, shape ([M,] n_verts, 3), sets every vertex, also
+        when the number of environments equals the number of vertices. Any other value, shape (3,), (M, 3) or (M, 1, 3),
+        places the center, (M, 1, 3) being unambiguous whatever the number of vertices.
 
         Parameters
         ----------
-        pos : array_like
-            The position of every vertex, shape ([n_envs,] n_verts, 3), or of the center of the vertices, each keeping
-            its initial offset to it, shape ([n_envs,] 3).
+        pos : array_like, shape ([M,] [n_verts | 1,] 3)
+            The positions of the vertices, or of their center.
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to set. If None, all environments will be considered. Defaults to None.
         """
         shape = np.shape(pos)
-        if len(shape) == 1 or (len(shape) == 2 and shape[0] != self.n_verts):
-            pos = self.init_positions_COM_offset + broadcast_tensor(pos, gs.tc_float, (*shape[:-1], 1, 3))
-        self.set_verts_pos(pos)
+        if len(shape) < 2 or shape[-2] != self.n_verts:
+            center_shape = (*shape[:-1], 1, 3) if len(shape) < 3 else shape
+            pos = self.init_positions_COM_offset + broadcast_tensor(pos, gs.tc_float, center_shape)
+        self.set_verts_pos(pos, envs_idx=envs_idx)
 
-    def set_velocity(self, vel):
+    def set_velocity(self, vel, envs_idx=None):
         """
-        Set the velocity of the rod.
+        Set the velocity of every vertex of the rod, or one velocity shared by all of them.
+
+        The shape of the value is read as in 'set_position': shape ([M,] n_verts, 3) sets every vertex, shape (3,),
+        (M, 3) or (M, 1, 3) is shared by the vertices.
 
         Parameters
         ----------
-        vel : array_like
-            The velocity of every vertex, shape ([n_envs,] n_verts, 3), or one shared by every vertex, shape
-            ([n_envs,] 3).
+        vel : array_like, shape ([M,] [n_verts | 1,] 3)
+            The velocities of the vertices, or the one they share.
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to set. If None, all environments will be considered. Defaults to None.
         """
-        self.set_verts_vel(vel)
+        shape = np.shape(vel)
+        if len(shape) < 2 or shape[-2] != self.n_verts:
+            vel = broadcast_tensor(vel, gs.tc_float, (*shape[:-1], 1, 3) if len(shape) < 3 else shape)
+        self.set_verts_vel(vel, envs_idx=envs_idx)
 
     def get_state(self):
         """Get the positions and velocities of the vertices of the rod, and the twist angles and rates of its edges."""
@@ -211,8 +224,17 @@ class RodEntity(Entity):
         self._solver.set_verts_fixed(fixed, verts_idx, envs_idx)
 
     def get_verts_kinematic(self, verts_idx_local=None, envs_idx=None):
-        """Get whether some vertices move kinematically, fixed or constrained (see 'RodSolver.get_verts_kinematic')."""
-        verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True)
+        """
+        Get whether some vertices move kinematically, fixed or constrained (see 'RodSolver.get_verts_kinematic').
+
+        Parameters
+        ----------
+        verts_idx_local : None | int | array_like, shape ([M,] N)
+            Index of the vertices relative to this entity (see 'set_verts_pos').
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to read. If None, all environments will be considered. Defaults to None.
+        """
+        verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True, batched_idx=True)
         return self._solver.get_verts_kinematic(verts_idx, envs_idx)
 
     @gs.assert_built

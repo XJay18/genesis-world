@@ -11,25 +11,12 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
-import genesis.utils.sdf as sdf
 from genesis.engine.entities.rod_entity import RodEntity
 from genesis.engine.materials import Rod
-from genesis.engine.solvers.rigid.abd.forward_dynamics import func_vel_at_point
-from genesis.engine.solvers.rigid.abd.misc import func_apply_coupling_force
 from genesis.engine.state_change import StateChange, mutates
 from genesis.engine.states.solvers import RodSolverState
 from genesis.grad.bridge import no_grad
-from genesis.utils.array_class import (
-    ErrorCode,
-    GeomsInfo,
-    GeomsState,
-    LinksState,
-    RigidInfo,
-    RodData,
-    RodInfo,
-    RodState,
-    SDFInfo,
-)
+from genesis.utils.array_class import ErrorCode, LinksState, RodData, RodInfo, RodState
 from genesis.utils.data import ConfigItem, DataItem, DataKind, iter_data
 from genesis.utils.geom import qd_transform_by_trans_quat
 from genesis.utils.misc import broadcast_tensor, qd_from_torch, qd_isfinite, qd_to_torch, qd_zero_grad, tensor_to_array
@@ -105,25 +92,30 @@ def func_signed_angle(axis: qd.types.vector(3), v_from: qd.types.vector(3), v_to
 
 
 @qd.func
-def func_inverse_mass(i_v: int, i_b: int, rod_info: RodInfo) -> float:
-    mass = rod_info.verts.mass[i_v]
-    inv_mass = gs.qd_float(0.0)
-    if not rod_info.verts.is_fixed[i_v, i_b] and mass > 0.0:
-        inv_mass = 1.0 / mass
-    return inv_mass
-
-
-@qd.func
 def func_is_free(i_v: int, i_b: int, rod_info: RodInfo) -> bool:
     """Whether a vertex moves under the dynamics, neither fixed nor constrained to a target."""
     return not rod_info.verts.is_fixed[i_v, i_b] and not rod_info.verts.is_constrained[i_v, i_b]
 
 
 @qd.func
+def func_inverse_mass(i_v: int, i_b: int, rod_info: RodInfo) -> float:
+    mass = rod_info.verts.mass[i_v]
+    inv_mass = gs.qd_float(0.0)
+    # A fixed or constrained vertex keeps its position through every projection
+    if func_is_free(i_v, i_b, rod_info) and mass > 0.0:
+        inv_mass = 1.0 / mass
+    return inv_mass
+
+
+@qd.func
 def func_closest_points_of_edges(
     p_a1: qd.types.vector(3), p_a2: qd.types.vector(3), p_b1: qd.types.vector(3), p_b2: qd.types.vector(3), eps: float
 ):
-    """Return the parameters along the segments (p_a1, p_a2) and (p_b1, p_b2) of their closest points, in [0, 1]."""
+    """Return the parameters along the segments (p_a1, p_a2) and (p_b1, p_b2) of their closest points, in [0, 1].
+
+    The degeneracy thresholds are relative to the lengths of the segments, 'eps' being the relative precision of the
+    simulation, so that short edges resolve their closest points at any precision.
+    """
     e_a, e_b = p_a2 - p_a1, p_b2 - p_b1
     e_ab = p_b1 - p_a1
     len_sq_a, len_sq_b = e_a.dot(e_a), e_b.dot(e_b)
@@ -131,17 +123,20 @@ def func_closest_points_of_edges(
     proj_a, proj_b = e_a.dot(e_ab), e_b.dot(e_ab)
     det = len_sq_a * len_sq_b - cross_ab * cross_ab
 
+    len_sq_sum = len_sq_a + len_sq_b
+
     t = gs.qd_float(0.0)
-    if det > eps:
+    # The squared sine of the angle between the segments compares to the precision, which tells parallel segments
+    if det > eps * len_sq_a * len_sq_b:
         t = (proj_a * len_sq_b - proj_b * cross_ab) / det
     t = qd.math.clamp(t, 0.0, 1.0)
     u_unclamped = gs.qd_float(0.0)
-    if len_sq_b > eps:
+    if len_sq_b > eps * len_sq_sum:
         u_unclamped = (t * cross_ab - proj_b) / len_sq_b
     u = qd.math.clamp(u_unclamped, 0.0, 1.0)
     # The closest point of the first segment moves once the one of the second is clamped to an end
     if qd.abs(u - u_unclamped) > eps:
-        if len_sq_a > eps:
+        if len_sq_a > eps * len_sq_sum:
             t = (u * cross_ab + proj_a) / len_sq_a
         t = qd.math.clamp(t, 0.0, 1.0)
     return t, u
@@ -446,10 +441,9 @@ def kernel_finalize_rod_positions(
         i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
         t_prev = (rod_state.verts.pos_prev[i_v_e, i_b] - rod_state.verts.pos_prev[i_v_s, i_b]).normalized()
         t_next = (rod_state.verts.pos[i_v_e, i_b] - rod_state.verts.pos[i_v_s, i_b]).normalized()
-        rod_state.edges.d1_ref_next[i_e, i_b] = func_parallel_transport(
-            t_prev, t_next, rod_state.edges.d1_ref[i_e, i_b], rod_info.EPS[None])
-        rod_state.edges.d2_ref_next[i_e, i_b] = func_parallel_transport(
-            t_prev, t_next, rod_state.edges.d2_ref[i_e, i_b], rod_info.EPS[None])
+        d1_ref, d2_ref = rod_state.edges.d1_ref[i_e, i_b], rod_state.edges.d2_ref[i_e, i_b]
+        rod_state.edges.d1_ref_next[i_e, i_b] = func_parallel_transport(t_prev, t_next, d1_ref, rod_info.EPS[None])
+        rod_state.edges.d2_ref_next[i_e, i_b] = func_parallel_transport(t_prev, t_next, d2_ref, rod_info.EPS[None])
 
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         if func_is_free(i_v, i_b, rod_info):
@@ -536,66 +530,6 @@ def kernel_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, has_e
 
     for i_h, i_b in qd.ndrange(rod_state.hinges.twist.shape[0], rod_state.hinges.twist.shape[1]):
         rod_state.hinges.kappa_rest[i_h, i_b] = rod_state.hinges.kappa_rest_next[i_h, i_b]
-
-
-@qd.kernel(fastcache=True)
-def kernel_rod_rigid_collide(
-    rod_state: RodState,
-    geoms_state: GeomsState,
-    links_state: LinksState,
-    rod_info: RodInfo,
-    geoms_info: GeomsInfo,
-    rigid_info: RigidInfo,
-    sdf_info: SDFInfo,
-    collider_config: qd.template(),
-):
-    """Collide the free rod vertices with the rigid geoms that need coupling, at the velocity level.
-
-    A vertex whose capsule penetrates a geom, or lies within its coupling softness, loses its velocity into the geom
-    relative to it, scaled by the restitution of the geom, and its tangential relative velocity is reduced by the
-    friction of the geom in proportion to the normal velocity lost. The momentum the vertex loses is applied to the link
-    of the geom. The velocity is written apart, to be applied once every vertex computed it (see
-    'kernel_rod_apply_coupled_vel').
-    """
-    for i_v, i_b in qd.ndrange(rod_state.verts.vel.shape[0], rod_state.verts.vel.shape[1]):
-        vel = rod_state.verts.vel[i_v, i_b]
-        if not rod_info.verts.is_constrained[i_v, i_b]:
-            pos = rod_state.verts.pos[i_v, i_b]
-            mass = rod_info.verts.mass[i_v]
-            radius = rod_info.verts.radius[i_v]
-            for i_g in range(geoms_info.needs_coup.shape[0]):
-                if geoms_info.needs_coup[i_g]:
-                    signed_dist = sdf.sdf_func_world(i_g, i_b, pos, geoms_state, geoms_info, sdf_info) - radius
-                    # A larger coupling softness makes the influence of the geom reach further from its surface
-                    influence = qd.min(qd.exp(-signed_dist / qd.max(1e-10, geoms_info.coup_softness[i_g])), 1.0)
-                    if influence > 0.1:
-                        normal = sdf.sdf_func_normal_world(
-                            i_g, i_b, pos, geoms_state, geoms_info, rigid_info, sdf_info, collider_config
-                        )
-                        i_l = geoms_info.link_idx[i_g]
-                        vel_rigid = func_vel_at_point(i_l, i_b, pos, links_state)
-                        vel_rel = vel - vel_rigid
-                        vel_rel_normal = vel_rel.dot(normal)
-                        if vel_rel_normal < 0.0:
-                            vel_rel_tangent = vel_rel - vel_rel_normal * normal
-                            vel_rel_tangent_norm = vel_rel_tangent.norm(rod_info.EPS[None])
-                            vel_rel_tangent = (
-                                vel_rel_tangent
-                                / vel_rel_tangent_norm
-                                * qd.max(0.0, vel_rel_tangent_norm + vel_rel_normal * geoms_info.coup_friction[i_g])
-                            )
-                            vel_rel_new = vel_rel_tangent - normal * vel_rel_normal * geoms_info.coup_restitution[i_g]
-                            vel_new = vel_rigid + vel_rel_new * influence + vel_rel * (1.0 - influence)
-                            force = -mass * (vel_new - vel) / rigid_info.substep_dt[None]
-                            func_apply_coupling_force(i_l, i_b, pos, force, links_state)
-                            vel = vel_new
-        rod_state.verts.vel_coupled[i_v, i_b] = vel
-
-
-@qd.kernel(fastcache=True)
-def kernel_rod_apply_coupled_vel(rod_state: RodState):
-    for i_v, i_b in qd.ndrange(rod_state.verts.vel.shape[0], rod_state.verts.vel.shape[1]):
-        rod_state.verts.vel[i_v, i_b] = rod_state.verts.vel_coupled[i_v, i_b]
 
 
 @no_grad
@@ -720,6 +654,16 @@ def kernel_set_rod_verts_fixed(
         # See 'kernel_set_rod_verts_vector'
         if i_v >= 0:
             rod_info.verts.is_fixed[i_v, envs_idx[i_b_]] = is_fixed[i_b_, i_v_]
+
+
+@qd.kernel(fastcache=True)
+def kernel_get_rod_verts_kinematic(
+    verts_idx: qd.types.ndarray(), envs_idx: qd.types.ndarray(), is_kinematic: qd.types.ndarray(), rod_info: RodInfo
+):
+    for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
+        i_v = verts_idx[i_b_, i_v_]
+        i_b = envs_idx[i_b_]
+        is_kinematic[i_b_, i_v_] = not func_is_free(i_v, i_b, rod_info)
 
 
 @qd.kernel(fastcache=True)
@@ -1095,7 +1039,8 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         Set the stretching (kind 0), bending (kind 1) or twisting (kind 2) stiffness of some rods, in Pa.
 
         The stiffness is part of the state rather than of the model, so that a differentiable rollout carries its
-        gradient back to the values given here.
+        gradient back to the values given here. A reset of the scene keeps it as set, since the state a reset restores
+        leaves it out, while restoring a checkpoint of the simulation restores it.
         """
         stiffness, rods_idx, envs_idx = self._sanitize_io_variables(
             stiffness, rods_idx, self.n_rods, "rods_idx", envs_idx, batched_idx=True
@@ -1129,15 +1074,22 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         """
         Get whether some vertices of the rods move kinematically, fixed or constrained to a target.
 
+        Parameters
+        ----------
+        verts_idx : None | int | array_like, shape ([M,] N), optional
+            Global index of the vertices, once for every environment or one row per environment (see 'set_verts_pos').
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to read. If None, all environments will be considered. Defaults to None.
+
         Returns
         -------
         is_kinematic : torch.Tensor, shape ([M,] N)
             Whether each vertex is fixed or constrained, in each environment.
         """
-        is_fixed, is_constrained = self._read_data(
-            (self.rod_info.verts.is_fixed, self.rod_info.verts.is_constrained), envs_idx, verts_idx, copy=True
+        is_kinematic, verts_idx, envs_idx = self._sanitize_io_variables(
+            None, verts_idx, self.n_verts, "verts_idx", envs_idx, dtype=gs.tc_bool, batched_idx=True
         )
-        is_kinematic = torch.logical_or(is_fixed, is_constrained)
+        kernel_get_rod_verts_kinematic(verts_idx, envs_idx, is_kinematic, self.rod_info)
         return is_kinematic[0] if self.n_envs == 0 else is_kinematic
 
     @gs.assert_built
