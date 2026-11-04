@@ -465,12 +465,9 @@ def test_rod_contacts_resolve_at_any_precision(precision, show_viewer):
     pos_init = rod.get_state().pos
     scene.step()
     lift = (rod.get_state().pos - pos_init)[0, :, 2]
-    # The two vertices of the crossing edge share the correction equally, and the overlap is resolved
+    # The two vertices of the crossing edge share the correction equally, and the overlap is resolved without overshoot
     assert_allclose(lift[4], lift[5], atol=1e-7)
-    assert (lift[4] > penetration).all()
-    # FIXME: the lift is the one measured in double precision, the projections overshooting the overlap. Replace with
-    # a bound derived from the projection, once it converges to the overlap.
-    assert_allclose(lift[4], 3.18822e-3, atol=2e-7)
+    assert_allclose(lift[4], penetration, atol=2e-6)
 
 
 @pytest.mark.required

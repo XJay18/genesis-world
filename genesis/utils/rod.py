@@ -28,14 +28,15 @@ def func_last_projection_correction(
     i_v: int, i_b: int, rod_state: RodState, has_edge_pairs: qd.template()
 ) -> qd.types.vector(3):
     """Return the correction of the position of a vertex the last projection of the rods computed and left to apply:
-    the one of the rod-rod contacts where pairs of edges are tested, the one of the inextensibility otherwise.
+    the one of the rod-rod contacts, averaged over the contacts moving the vertex, where pairs of edges are tested, the
+    one of the inextensibility otherwise.
 
     The projections of a substep chain their kernels, each applying the correction of the previous one before computing
     its own (see 'kernel_project_rod_inextensibility').
     """
     dp = qd.Vector.zero(gs.qd_float, 3)
     if qd.static(has_edge_pairs):
-        dp = rod_state.verts.dp_contact[i_v, i_b]
+        dp = rod_state.verts.dp_contact[i_v, i_b] / qd.max(rod_state.verts.n_contacts[i_v, i_b], 1)
     else:
         dp = rod_state.verts.dp_inextensibility[i_v, i_b]
     return dp

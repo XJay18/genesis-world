@@ -348,12 +348,14 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
     """Apply the corrections of the inextensibility constraints, then compute those of the rod-rod contacts.
 
     Two edges whose capsules overlap are pushed apart along the line joining their closest points, each of the four
-    vertices moving in proportion to its inverse mass and to its weight in its closest point. The first projection of
-    a substep records the contact normals and penetrations, from which the friction of the substep follows.
+    vertices moving in proportion to its inverse mass and to its weight in its closest point, and averaging the moves of
+    the contacts it takes part in. The first projection of a substep records the contact normals and penetrations, from
+    which the friction of the substep follows.
     """
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + rod_state.verts.dp_inextensibility[i_v, i_b]
         rod_state.verts.dp_contact[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+        rod_state.verts.n_contacts[i_v, i_b] = 0
 
     # The pairs sharing a vertex add their corrections up through atomics, whose order varies on GPU
     for i_p, i_b in qd.ndrange(rod_state.edge_pairs.penetration.shape[0], rod_state.edge_pairs.penetration.shape[1]):
@@ -382,6 +384,7 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
             if penetration > 0.0:
                 rod_state.edge_pairs.normal[i_p, i_b] = normal
         if penetration > 0.0:
+            verts_idx = qd.Vector([i_v_a1, i_v_a2, i_v_b1, i_v_b2], dt=gs.qd_int)
             weights = qd.Vector([1.0 - t, t, 1.0 - u, u], dt=gs.qd_float)
             inv_masses = qd.Vector(
                 [
@@ -399,6 +402,12 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
                 rod_state.verts.dp_contact[i_v_a2, i_b] += inv_masses[1] * weights[1] * impulse
                 rod_state.verts.dp_contact[i_v_b1, i_b] -= inv_masses[2] * weights[2] * impulse
                 rod_state.verts.dp_contact[i_v_b2, i_b] -= inv_masses[3] * weights[3] * impulse
+                # Each vertex averages the corrections of its contacts (see 'func_last_projection_correction'), so
+                # that the contacts sharing it do not push it further than each asks
+                for i_c in qd.static(range(4)):
+                    if inv_masses[i_c] * weights[i_c] > 0.0:
+                        i_v_c = verts_idx[i_c]
+                        qd.atomic_add(rod_state.verts.n_contacts[i_v_c, i_b], 1)
 
 
 @qd.kernel(fastcache=True)
