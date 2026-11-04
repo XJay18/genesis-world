@@ -624,3 +624,158 @@ def test_rod_length_and_rigid_contacts(show_viewer):
     verts_pos = rod.get_state().pos
     edges_length = torch.linalg.norm(verts_pos[:, 1:] - verts_pos[:, :-1], dim=-1)
     assert_allclose(rod.get_total_length(), edges_length.sum(dim=-1), tol=gs.EPS)
+
+
+@pytest.mark.required
+def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_viewer):
+    radius, interval, friction, post_radius, squeeze_force = 0.01, 0.02, 0.5, 0.0075, 5.0
+    n_close_steps, n_lift_steps = 50, 100
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, -9.81),
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=0.0,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -1.2, 0.6),
+            camera_lookat=(0.3, 0.4, 0.2),
+        ),
+        show_viewer=show_viewer,
+    )
+    material = gs.materials.Rigid(
+        needs_coup=True,
+        coup_friction=friction,
+    )
+    rod_material = gs.materials.Rod.Base(
+        segment_mass=0.005,
+        segment_radius=radius,
+    )
+    # A thin plate and a thin post across the middle of an edge of a rod, which the spheres of its vertices miss
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.1),
+            size=(0.004, 0.1, 0.2),
+            fixed=True,
+        ),
+        material=material,
+    )
+    rod_on_plate = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=4,
+            interval=interval,
+            pos=(-1.5 * interval, 0.0, 0.2 + radius + 1e-4),
+        ),
+        material=rod_material,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Cylinder(
+            radius=post_radius,
+            height=0.1,
+            pos=(0.3, 0.0, 0.1),
+            euler=(90.0, 0.0, 0.0),
+            fixed=True,
+        ),
+        material=material,
+    )
+    rod_on_post = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=4,
+            interval=interval,
+            pos=(0.3 - 1.5 * interval, 0.0, 0.1 + post_radius + radius + 1e-4),
+        ),
+        material=rod_material,
+    )
+    # Rods lying on slopes below and above the friction angle
+    slopes_angle = (0.6 * math.atan(friction), 1.4 * math.atan(friction))
+    rods_on_slope = []
+    for slope_angle, y in zip(slopes_angle, (0.5, 0.8)):
+        scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(0.0, y, 0.2),
+                size=(0.4, 0.1, 0.02),
+                euler=(0.0, math.degrees(slope_angle), 0.0),
+                fixed=True,
+            ),
+            material=material,
+        )
+        rods_on_slope.append(
+            scene.add_entity(
+                morph=gs.morphs.ParameterizedRod(
+                    n_vertices=6,
+                    interval=interval,
+                    pos=(0.0, y, 0.5),
+                ),
+                material=rod_material,
+            )
+        )
+    # A rod grasped in its middle by two pads squeezing it, then lifted
+    gripper = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=two_pad_gripper,
+            pos=(0.6, 0.0, 0.3),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=friction,
+            gravity_compensation=1.0,
+        ),
+    )
+    rod_grasped = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=5,
+            interval=interval,
+            pos=(0.6 - 2 * interval, 0.0, 0.3),
+        ),
+        material=rod_material,
+    )
+    scene.build(n_envs=2)
+
+    slopes_tangent = []
+    for rod, slope_angle, y in zip(rods_on_slope, slopes_angle, (0.5, 0.8)):
+        tangent = np.array([math.cos(slope_angle), 0.0, -math.sin(slope_angle)])
+        normal = np.array([math.sin(slope_angle), 0.0, math.cos(slope_angle)])
+        surface_pos = np.array([0.0, y, 0.2]) + (0.01 + radius) * normal
+        rod.set_position(surface_pos + (np.arange(6) - 2.5)[:, None] * interval * tangent)
+        slopes_tangent.append(tangent)
+    slopes_pos_init = [rod.get_state().pos for rod in rods_on_slope]
+    lift_dof = gripper.get_joint("lift").dofs_idx_local
+    pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
+    carriage = gripper.get_link("carriage")
+    gripper.control_dofs_force(squeeze_force, pads_dof)
+
+    for i_step in range(n_close_steps + n_lift_steps):
+        if i_step >= n_close_steps:
+            gripper.set_dofs_velocity(min(i_step - n_close_steps, 30) / 30 * 0.3, lift_dof)
+        scene.step()
+        # The capsules rest on the edge of the plate and on the post, the axis of the rods a radius away from them
+        for rod, center, clearance in (
+            (rod_on_plate, (0.0, 0.2), radius),
+            (rod_on_post, (0.3, 0.1), radius + post_radius),
+        ):
+            verts_pos = tensor_to_array(rod.get_state().pos)
+            t = np.linspace(0.0, 1.0, 101)[:, None]
+            axis_pos = verts_pos[:, :-1, None] + t * (verts_pos[:, 1:, None] - verts_pos[:, :-1, None])
+            axis_pos = axis_pos[..., ::2]
+            assert np.linalg.norm(axis_pos - center, axis=-1).min() > clearance - 1e-4
+        # The pads stop at the surface of the rod
+        assert (gripper.get_dofs_position(pads_dof).sum(dim=-1) < 0.03 - (2.0 * radius - 1e-3)).all()
+        if i_step == n_close_steps - 1:
+            grasp_offset = rod_grasped.get_state().pos[:, 2] - carriage.get_pos()
+    # The grasped rod follows the carriage
+    assert_allclose(rod_grasped.get_state().pos[:, 2] - carriage.get_pos(), grasp_offset, atol=5e-4)
+    assert (carriage.get_pos()[:, 2] > 0.3 + 0.02).all()
+
+    # A rod stays on a slope below the friction angle, and slides down the other with the acceleration of Coulomb
+    # friction, its positions integrated by symplectic Euler over the substeps
+    n_substeps, substep_dt = 5 * (n_close_steps + n_lift_steps), 2e-4
+    slope_acc = 9.81 * (math.sin(slopes_angle[1]) - friction * math.cos(slopes_angle[1]))
+    for rod, pos_init, tangent, slide in zip(
+        rods_on_slope,
+        slopes_pos_init,
+        slopes_tangent,
+        (0.0, 0.5 * slope_acc * substep_dt**2 * n_substeps * (n_substeps + 1)),
+    ):
+        assert_allclose(tensor_to_array(rod.get_state().pos - pos_init) @ tangent, slide, atol=1e-6)
