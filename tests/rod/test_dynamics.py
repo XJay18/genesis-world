@@ -576,6 +576,17 @@ def test_rod_length_and_rigid_contacts(show_viewer):
             segment_radius=0.005,
         ),
     )
+    # A rod leaving the box upward, which penetrates it at the first substep alone
+    rod_leaving = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=3,
+            interval=interval,
+            pos=(-0.02, 0.03, 0.104),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=0.005,
+        ),
+    )
     loop = scene.add_entity(
         morph=gs.morphs.ParameterizedRod(
             type="circle",
@@ -588,19 +599,22 @@ def test_rod_length_and_rigid_contacts(show_viewer):
         ),
     )
     scene.build(n_envs=2)
+    rod_leaving.set_velocity((0.0, 0.0, 10.0))
 
     assert_allclose(rod.get_total_length(), (n_verts - 1) * interval, tol=gs.EPS)
     assert_allclose(rod.get_geodesic_distance(2, 7), 5 * interval, tol=gs.EPS)
     chord = 2.0 * loop_radius * math.sin(math.pi / n_loop_verts)
     assert_allclose(loop.get_total_length(), n_loop_verts * chord, tol=gs.EPS)
     assert_allclose(loop.get_geodesic_distance(10, n_loop_verts), 6 * chord, tol=gs.EPS)
-    for _ in range(10):
+    for i_step in range(10):
         scene.step()
         # The vertices over the box penetrate it, the overhanging ones hang in the air
         contact_geom_idx = np.full((2, n_verts), -1)
         contact_geom_idx[:, :9] = box.geoms[0].idx
         assert_equal(rod.get_verts_contact_geom_idx(), contact_geom_idx)
         assert_equal(loop.get_verts_contact_geom_idx(), -1)
+        # A contact is reported over the whole step it happens in, and cleared by the next step
+        assert_equal(rod_leaving.get_verts_contact_geom_idx(), box.geoms[0].idx if i_step == 0 else -1)
     verts_pos = rod.get_state().pos
     edges_length = torch.linalg.norm(verts_pos[:, 1:] - verts_pos[:, :-1], dim=-1)
     assert_allclose(rod.get_total_length(), edges_length.sum(dim=-1), tol=gs.EPS)

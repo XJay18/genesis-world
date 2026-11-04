@@ -1744,7 +1744,7 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
     vel_coupled: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     # The change of velocity the MPM grid nodes impart, summed over the nodes before it is applied
     dv_mpm: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
-    # The rigid geom the vertex penetrates deepest at the last substep, -1 for none
+    # The rigid geom the vertex penetrated deepest at the latest substep of the step with a penetration, -1 for none
     contact_geom_idx: qd.Tensor = field(int, kind=DataKind.DERIVED, opt_in=True)
 
 

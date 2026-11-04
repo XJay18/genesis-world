@@ -88,8 +88,8 @@ class LegacyCouplerOptions(BaseCouplerOptions):
         need coupling, and push them back. Defaults to True.
     rod_mpm : bool, optional
         Whether to enable coupling between rod and MPM solvers: the MPM material and the rods push each other apart
-        where they meet. Its cost per step grows with the number of rod vertices times the number of grid cells of the
-        MPM domain around the rods. Enable it for scenes where rods touch MPM materials. Defaults to False.
+        where they meet. It costs time only in scenes holding both rods and MPM materials, growing with the number of rod
+        vertices times the number of grid cells of the MPM domain around the rods. Defaults to True.
     """
 
     rigid_mpm: StrictBool = True
@@ -101,7 +101,7 @@ class LegacyCouplerOptions(BaseCouplerOptions):
     fem_mpm: StrictBool = True
     fem_sph: StrictBool = True
     rigid_rod: StrictBool = True
-    rod_mpm: StrictBool = False
+    rod_mpm: StrictBool = True
 
 
 class SAPCouplerOptions(BaseCouplerOptions):

@@ -150,9 +150,6 @@ def test_mpm_coupling_grad_matches_fd(backend, show_viewer):
             lower_bound=(-0.1, -0.1, -0.05),
             upper_bound=(0.1, 0.1, 0.15),
         ),
-        coupler_options=gs.options.LegacyCouplerOptions(
-            rod_mpm=True,
-        ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(0.2, -0.3, 0.2),
             camera_lookat=(0.0, 0.0, 0.07),

@@ -1129,10 +1129,12 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
 
     def get_verts_contact_geom_idx(self, verts_idx=None, envs_idx=None):
         """
-        Get the rigid geom each vertex of the rods penetrates deepest at the last substep, -1 for none.
+        Get a rigid geom each vertex of the rods penetrated during the last step, -1 for none.
 
-        A vertex penetrates a geom where its capsule overlaps it. Fixed and constrained vertices, which do not collide
-        with the rigid geoms, never penetrate any. Only the geoms that need coupling are considered.
+        A vertex penetrates a geom where its capsule overlaps it. Each substep of the step in which a vertex penetrates
+        some geom records the geom it penetrates deepest, so that the geom of the latest such substep is reported, also
+        when the vertex left it before the end of the step. Fixed and constrained vertices, which do not collide with the
+        rigid geoms, never penetrate any. Only the geoms that need coupling are considered.
 
         Parameters
         ----------

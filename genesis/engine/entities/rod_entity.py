@@ -269,7 +269,7 @@ class RodEntity(Entity):
 
     def get_verts_contact_geom_idx(self, verts_idx_local=None, envs_idx=None):
         """
-        Get the rigid geom each vertex penetrates deepest at the last substep, -1 for none (see
+        Get a rigid geom each vertex penetrated during the last step, -1 for none (see
         'RodSolver.get_verts_contact_geom_idx').
 
         Parameters

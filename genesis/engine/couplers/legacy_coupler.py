@@ -825,13 +825,15 @@ class LegacyCoupler(RBC):
         rigid_info: RigidInfo,
         sdf_info: SDFInfo,
         collider_config: qd.template(),
+        is_step_start: bool,
     ):
         """Collide the free rod vertices with the rigid geoms that need coupling, at the velocity level.
 
         The capsule of a vertex collides like a particle (see '_func_collide_in_rigid_geom'), its signed distance to a
         geom reduced by the radius of the rod. The velocity is written apart, to be applied once every vertex computed
         it (see 'rod_apply_coupled_vel'), so that autodiff reverses the coupling. The geom each free vertex penetrates
-        deepest is recorded, -1 for none.
+        deepest is recorded where it penetrates one, the record being cleared at the first substep of a step
+        ('is_step_start'), so that it holds the contacts of the whole step.
         """
         for i_v, i_b in qd.ndrange(rod_state.verts.vel.shape[0], rod_state.verts.vel.shape[1]):
             vel = rod_state.verts.vel[i_v, i_b]
@@ -865,7 +867,10 @@ class LegacyCoupler(RBC):
                                 rigid_info,
                             )
             rod_state.verts.vel_coupled[i_v, i_b] = vel
-            rod_state.verts.contact_geom_idx[i_v, i_b] = contact_geom_idx
+            if contact_geom_idx >= 0:
+                rod_state.verts.contact_geom_idx[i_v, i_b] = contact_geom_idx
+            elif is_step_start:
+                rod_state.verts.contact_geom_idx[i_v, i_b] = -1
 
     @qd.kernel
     def rod_apply_coupled_vel(self, rod_state: RodState):
@@ -1128,6 +1133,7 @@ class LegacyCoupler(RBC):
                 self.rigid_solver.rigid_info,
                 self.rigid_solver.collider.collider_info.sdf,
                 self.rigid_solver.collider.collider_config,
+                self.sim.cur_substep_global % self.sim.substeps == 0,
             )
             self.rod_apply_coupled_vel(self.rod_solver.rod_state)
 
