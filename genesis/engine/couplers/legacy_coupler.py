@@ -8,7 +8,7 @@ import genesis.utils.sdf as sdf
 
 from genesis.options.solvers import LegacyCouplerOptions
 from genesis.repr_base import RBC
-from genesis.utils.array_class import GeomsInfo, GeomsState, LinksInfo, LinksState, RigidInfo, SDFInfo
+from genesis.utils.array_class import GeomsInfo, GeomsState, LinksInfo, LinksState, RigidInfo, RodData, SDFInfo
 from genesis.utils.data import opt_in
 from genesis.utils.geom import qd_inv_transform_by_trans_quat, qd_transform_by_trans_quat
 
@@ -38,13 +38,15 @@ class LegacyCoupler(RBC):
         self.pbd_solver = self.sim.pbd_solver
         self.fem_solver = self.sim.fem_solver
         self.sf_solver = self.sim.sf_solver
+        self.rod_solver = self.sim.rod_solver
 
-        # The particles and the FEM vertices collide with the rigid geoms through their SDF
+        # The particles, the FEM vertices and the rod vertices collide with the rigid geoms through their SDF
         opt_in(SDFInfo, cond=lambda: any(self.rigid_couplings))
+        opt_in(RodData.rod_state.verts.vel_coupled, cond=lambda: self.rigid_couplings[4])
 
     @property
-    def rigid_couplings(self) -> tuple[bool, bool, bool, bool]:
-        """Whether the rigid geoms couple with the MPM, SPH, PBD and FEM solvers, in this order."""
+    def rigid_couplings(self) -> tuple[bool, bool, bool, bool, bool]:
+        """Whether the rigid geoms couple with the MPM, SPH, PBD, FEM and rod solvers, in this order."""
         return tuple(
             [
                 self.rigid_solver.is_active and solver.is_active and is_enabled
@@ -53,12 +55,13 @@ class LegacyCoupler(RBC):
                     (self.sph_solver, self.options.rigid_sph),
                     (self.pbd_solver, self.options.rigid_pbd),
                     (self.fem_solver, self.options.rigid_fem),
+                    (self.rod_solver, self.options.rigid_rod),
                 )
             ]
         )
 
     def build(self) -> None:
-        self._rigid_mpm, self._rigid_sph, self._rigid_pbd, self._rigid_fem = self.rigid_couplings
+        self._rigid_mpm, self._rigid_sph, self._rigid_pbd, self._rigid_fem, self._rigid_rod = self.rigid_couplings
         self._mpm_sph = self.mpm_solver.is_active and self.sph_solver.is_active and self.options.mpm_sph
         self._mpm_pbd = self.mpm_solver.is_active and self.pbd_solver.is_active and self.options.mpm_pbd
         self._fem_mpm = self.fem_solver.is_active and self.mpm_solver.is_active and self.options.fem_mpm
@@ -935,6 +938,23 @@ class LegacyCoupler(RBC):
                 self.rigid_solver.collider.collider_info.sdf,
                 self.rigid_solver.collider.collider_config,
             )
+
+        # Rod <-> Rigid
+        if self._rigid_rod:
+            # Imported here to avoid a circular dependency, the solvers importing the couplers through their entities
+            from genesis.engine.solvers.rod_solver import kernel_rod_apply_coupled_vel, kernel_rod_rigid_collide
+
+            kernel_rod_rigid_collide(
+                self.rod_solver.rod_state,
+                self.rigid_solver.dyn_state.geoms,
+                self.rigid_solver.dyn_state.links,
+                self.rod_solver.rod_info,
+                self.rigid_solver.dyn_info.geoms,
+                self.rigid_solver.rigid_info,
+                self.rigid_solver.collider.collider_info.sdf,
+                self.rigid_solver.collider.collider_config,
+            )
+            kernel_rod_apply_coupled_vel(self.rod_solver.rod_state)
 
     @property
     def is_differentiable(self) -> bool:
