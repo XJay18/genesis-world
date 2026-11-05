@@ -52,6 +52,8 @@ ROD_RIGID_OVERLAP_RECOVERY = 0.1
 # overestimate (a link driven or held by its joints) then stays a little away from where it stuck, rather than creeping
 # (see 'LegacyCoupler.kernel_project_rod_rigid_friction')
 ROD_RIGID_ANCHOR_RECOVERY = 0.1
+# The relative regularization of the friction of the contacts of a vertex with geoms that do not move
+ROD_RIGID_FRICTION_REGULARIZATION = 1e-6
 # The largest rate of change of the signed distance of a rigid geom along a line: the gradient of the trilinear
 # interpolation of a signed distance grid reaches sqrt(3) at a corner of the geom
 ROD_SDF_MAX_SLOPE = math.sqrt(3.0)
@@ -1472,9 +1474,11 @@ class LegacyCoupler(RBC):
                             rod_state,
                             rod_info,
                         )
-                        system[i_c, i_c] = response + func_rod_rigid_contact_link_inverse_mass(
-                            i_v, i_c, i_b, rod_state, geoms_info
-                        )
+                        # The regularization keeps the impulses finite where several contacts of the vertex are with
+                        # geoms that do not move, their tangent planes being taken as one
+                        system[i_c, i_c] = (
+                            1.0 + ROD_RIGID_FRICTION_REGULARIZATION
+                        ) * response + func_rod_rigid_contact_link_inverse_mass(i_v, i_c, i_b, rod_state, geoms_info)
                         # The slip of the point of the edge sticking to the anchor, its normal correction included,
                         # from where it would be had it stuck to the geom over the substep
                         verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]

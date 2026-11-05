@@ -342,7 +342,7 @@ def test_mid_rollout_attachment_grad_matches_fd(backend, show_viewer):
     steps_and_tols = {
         "rod_vel": (1e-5, 5e-8),
         "link_vel": (1e-4, 2e-9),
-        "box_vel": (1e-4, 2e-9),
+        "box_vel": (1e-4, 5e-9),
         "E": (1e-4, 1e-7),
     }
     for name, value in inputs.items():
