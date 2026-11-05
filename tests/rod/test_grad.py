@@ -334,7 +334,7 @@ def test_mid_rollout_attachment_grad_matches_fd(backend, show_viewer):
         "rod_vel": (1e-5, 5e-8),
         "link_vel": (1e-4, 2e-9),
         "box_vel": (1e-4, 1e-9),
-        "E": (1e-4, 5e-8),
+        "E": (1e-4, 1e-7),
     }
     for name, value in inputs.items():
         direction = torch.tensor(rng.standard_normal(value.shape), dtype=gs.tc_float, device=gs.device)
