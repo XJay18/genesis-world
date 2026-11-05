@@ -1746,10 +1746,12 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
     n_contacts: qd.Tensor = field(int, kind=DataKind.SCRATCH, labels=ROD_CONTACTS)
     # The corrections of the contacts with the rigid geoms, summed over the contacts of the vertex (see
     # 'LegacyCoupler.project_rod_rigid_contacts'): the normal impulses, the correction of the overlap by the rod alone,
-    # which moves the vertex without changing its velocity, and the friction
+    # the friction impulses, and the move of the rod alone back to where its contacts stick (see 'RodRigidAnchors'),
+    # the moves of the rod alone changing no velocity
     dp_rigid_normal: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     dp_rigid_overlap: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     dp_rigid_friction: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    dp_rigid_stick: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     # The change of velocity the MPM grid nodes impart, summed over the nodes before it is applied
     dv_mpm: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     # The rigid geom the vertex penetrated deepest at the latest substep of the step with a penetration, -1 for none
@@ -1835,8 +1837,10 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     # the point of the edge sticking to it (see 'RodRigidAnchors')
     anchor: qd.Tensor = field((float, 3), grad=True)
     anchor_t: qd.Tensor = field(float, grad=True)
-    # The normal impulse of the contact over the substep (in kg m, the change of momentum times the substep)
+    # The normal impulse of the contact over the substep (in kg m, the change of momentum times the substep), and the
+    # one of its share of the move of the rod alone out of the geoms, which bound the friction of the contact
     impulse_normal: qd.Tensor = field(float, grad=True)
+    impulse_overlap: qd.Tensor = field(float, grad=True)
 
 
 class RodRigidAnchors(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ROD_RIGID_CONTACTS_PER_VERT, ENVS)):

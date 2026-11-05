@@ -842,8 +842,8 @@ def test_rod_rigid_squeeze_conserves_momentum(two_pad_gripper, show_viewer):
         assert gripper.get_dofs_velocity(lift_dof)[0] < 1e-6
     # The weight of the rod is the only vertical force on the rod and the gripper
     assert_allclose(momentum_z() - momentum_init, -verts_mass.sum() * 9.81 * n_hold_steps * 1e-3, rtol=2e-2)
-    # The rod is held, moving with the carriage
-    assert_allclose(rod.get_state().vel[0, :, 2].mean(), gripper.get_dofs_velocity(lift_dof)[0], atol=2e-3)
+    # The rod is held, its vertices between the pads moving with the carriage (its ends bend freely)
+    assert_allclose(rod.get_state().vel[0, 1:4, 2], gripper.get_dofs_velocity(lift_dof)[0], atol=2e-3)
 
 
 @pytest.mark.required
@@ -1001,3 +1001,137 @@ def test_rod_rests_on_supported_rigid_link(show_viewer):
     # The rod rests, the velocity of the vertices zero to the share of the substep its contacts leave to the link
     assert_allclose(rod.get_state().vel, 0.0, atol=5e-4)
     assert_allclose(rod.get_state().pos[..., 2], beam.get_pos()[..., 2] + 0.005 + radius, atol=1e-5)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("two_pad_gripper", [5.0, 9.0], indirect=True)
+def test_rod_rigid_friction_holds_rod_between_tilted_pads(two_pad_gripper, request, show_viewer):
+    radius, squeeze_force, n_settle_steps, n_steps = 0.01, 5.0, 100, 1000
+    tilt = math.radians(request.node.callspec.params["two_pad_gripper"])
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, -9.81),
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=0.0,
+        ),
+        show_viewer=show_viewer,
+    )
+    # Pads tilted so that their squeeze pushes the rod down, with friction above and below the tangent of the tilt
+    frictions = (0.9, 0.5 * math.tan(tilt))
+    grippers = [
+        scene.add_entity(
+            morph=gs.morphs.MJCF(
+                file=two_pad_gripper,
+                pos=(0.0, 0.3 * i, 0.3),
+            ),
+            material=gs.materials.Rigid(
+                needs_coup=True,
+                coup_friction=friction,
+                gravity_compensation=1.0,
+            ),
+        )
+        for i, friction in enumerate(frictions)
+    ]
+    rods = [
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=5,
+                interval=0.01,
+                pos=(-0.02, 0.3 * i, 0.3),
+            ),
+            material=gs.materials.Rod.Base(
+                segment_mass=0.005,
+                segment_radius=radius,
+            ),
+        )
+        for i in range(2)
+    ]
+    scene.build()
+    for gripper in grippers:
+        lift_dof = gripper.get_joint("lift").dofs_idx_local
+        pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
+        gripper.set_dofs_kp([1e4], lift_dof)
+        gripper.control_dofs_position([0.0], lift_dof)
+        gripper.control_dofs_force([squeeze_force, squeeze_force], pads_dof)
+    for _ in range(n_settle_steps):
+        scene.step()
+    z_start = [float(rod.get_state().pos[0, :, 2].mean()) for rod in rods]
+    for _ in range(n_steps):
+        scene.step()
+    drift = [float(rod.get_state().pos[0, :, 2].mean()) - z for rod, z in zip(rods, z_start)]
+    # Friction above the tangent of the tilt holds the rod, below it the rod slides down out of the pads
+    assert abs(drift[0]) < 5e-4
+    assert drift[1] < -1e-2
+
+
+@pytest.mark.required
+def test_rod_rigid_slow_grip_lifts_rod_from_ground(two_pad_gripper, show_viewer):
+    radius, close_speed, lift_speed, max_force = 0.01, 0.05, 0.2, 20.0
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, -9.81),
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=0.0,
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.5,
+        ),
+    )
+    # Pads closing at the speed of a robot hand with a capped force onto a rod lying on the ground, then lifting it
+    gripper = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=two_pad_gripper,
+            pos=(0.0, 0.0, 0.0215),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.9,
+            gravity_compensation=1.0,
+        ),
+    )
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=7,
+            interval=0.01,
+            pos=(-0.03, 0.0, radius),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.01,
+            segment_radius=radius,
+        ),
+    )
+    scene.build()
+    lift_dof = gripper.get_joint("lift").dofs_idx_local
+    pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
+    gripper.set_dofs_kp([1e4], lift_dof)
+    gripper.set_dofs_kv([150.0], lift_dof)
+    gripper.set_dofs_kp([4000.0, 4000.0], pads_dof)
+    gripper.set_dofs_force_range([-max_force, -max_force], [max_force, max_force], pads_dof)
+    carriage = gripper.get_link("carriage")
+    n_close_steps, n_lift_steps = 300, 500
+    speed_max, pads_speed_max = 0.0, 0.0
+    for i_step in range(n_close_steps + n_lift_steps):
+        closing = min(close_speed * 1e-3 * (i_step + 1), 0.015)
+        gripper.control_dofs_position([closing, closing], pads_dof)
+        lifting = min(lift_speed * 1e-3 * max(i_step + 1 - n_close_steps, 0), 0.1)
+        gripper.control_dofs_position([lifting], lift_dof)
+        scene.step()
+        if i_step == n_close_steps - 1:
+            grasp_offset = rod.get_state().pos[0, :, 2] - carriage.get_pos()[2]
+        speed_max = max(speed_max, float(torch.linalg.norm(rod.get_state().vel, dim=-1).max()))
+        pads_speed_max = max(pads_speed_max, float(torch.linalg.norm(gripper.get_dofs_velocity(), dim=-1)))
+    # The rod is lifted with the carriage, and never moves faster than the pads plus a margin
+    assert carriage.get_pos()[2] > 0.0215 + 0.09
+    assert_allclose(rod.get_state().pos[0, :, 2] - carriage.get_pos()[2], grasp_offset, atol=2e-3)
+    assert speed_max < pads_speed_max + 0.1

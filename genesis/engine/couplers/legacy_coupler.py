@@ -40,42 +40,65 @@ CLAMPED_INV_DT = 50.0
 # points, then five pairs of steps (see 'LegacyCoupler._func_rod_rigid_contact')
 ROD_EDGE_CONTACT_N_EVALS = 15
 # How much deeper than the spheres of its two vertices, relative to the radius, the deepest point inside an edge must
-# be to make a contact of its own, which keeps the rounding of a face parallel to the edge from making one
-ROD_EDGE_CONTACT_REL_DEPTH = 1e-3
+# be to make a contact of its own, which keeps the rounding of a face parallel to the edge, or of the corner of a pad
+# across it, from making one: such a contact, met on one side of a rod squeezed between two pads, would push the edge
+# into the other pad, then back
+ROD_EDGE_CONTACT_REL_DEPTH = 0.05
 # The fraction of the penetration of a rod into rigid geoms at the start of a substep, of the part the rod cannot leave
 # alone (squeezed between two geoms), that the impulses of the contacts push the links back by at each substep. A rigid
 # link pressing a rod against another geom, whose inverse mass the contacts overestimate, then stops a little inside it,
 # rather than creeping through it (see 'LegacyCoupler.kernel_project_rod_rigid_normal')
 ROD_RIGID_OVERLAP_RECOVERY = 0.1
 # The fraction of the slip a contact of a rod with a rigid geom accumulated while sticking that the rod alone is moved
-# back by at each substep, without changing its velocity. A rod held by a link whose inverse mass the contacts
-# overestimate (a link driven or held by its joints) then stays a little away from where it stuck, rather than creeping
-# (see 'LegacyCoupler.kernel_project_rod_rigid_friction')
+# back by at each substep, without changing its velocity, within what Coulomb's bound leaves of its normal corrections.
+# A rod held by a link whose inverse mass the contacts overestimate (a link driven or held by its joints) then stays a
+# little away from where it stuck, rather than creeping (see 'LegacyCoupler.kernel_project_rod_rigid_friction'). A
+# full recovery at each substep oscillates.
 ROD_RIGID_ANCHOR_RECOVERY = 0.1
-# The relative regularization of the friction of the contacts of a vertex with geoms that do not move
-ROD_RIGID_FRICTION_REGULARIZATION = 1e-6
+# The fraction of its penetration at the start of a substep that the rod alone is moved out of a geom by at each
+# substep. A move of the whole penetration out of one geom can push the rod into another one across it, which pushes it
+# back by as much at the next substep, an oscillation that a fraction lets decay
+ROD_RIGID_OVERLAP_RELAXATION = 0.5
+# The Gauss-Seidel sweeps over the contacts of a vertex of the friction bounding its slip along each
+ROD_RIGID_FRICTION_SWEEPS = 2
 # The largest rate of change of the signed distance of a rigid geom along a line: the gradient of the trilinear
 # interpolation of a signed distance grid reaches sqrt(3) at a corner of the geom
 ROD_SDF_MAX_SLOPE = math.sqrt(3.0)
 
 
 @qd.func
+def func_rod_rigid_contacts_are_squeezing(i_v: int, i_b: int, n_contacts: int, rod_state: RodState) -> bool:
+    """Whether two contacts of a vertex of the rods with rigid geoms push it from opposite sides (see
+    'RodRigidContacts'), their normals opposing."""
+    is_squeezed = False
+    for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
+        for j_c in qd.static(range(i_c + 1, ROD_RIGID_CONTACTS_PER_VERT)):
+            if j_c < n_contacts:
+                if (
+                    rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(rod_state.rigid_contacts.normal[i_v, j_c, i_b])
+                    < 0.0
+                ):
+                    is_squeezed = True
+    return is_squeezed
+
+
+@qd.func
 def func_rod_rigid_contact_response(
-    i_v: int, i_c: int, i_b: int, t: float, n_contacts: int, rod_state: RodState, rod_info: RodInfo
+    i_v: int, i_c: int, i_b: int, t: float, is_squeezed: bool, rod_state: RodState, rod_info: RodInfo
 ):
     """Return the vertices of the edge of a contact of a vertex of the rods with a rigid geom (see 'RodRigidContacts'),
     the displacement of each per unit impulse of the contact, and the displacement of its point of parameter 't'.
 
-    The impulse of the only contact of a vertex is split between the vertices of its edge by their weights in its point.
-    The impulses of the contacts of a vertex with several are taken by the vertex alone, as if their points were at the
-    vertex: the other vertex of an edge would let impulses pressing the vertex from opposite sides move it out of all
-    proportion.
+    The impulse is split between the vertices of the edge by their weights in its point, unless the vertex is squeezed
+    between geoms (see 'func_rod_rigid_contacts_are_squeezing'): the vertex then takes the impulses of its contacts
+    alone, as if their points were at the vertex, the other vertex of an edge letting impulses pressing the vertex from
+    opposite sides move it out of all proportion.
     """
     verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
     i_v_s, i_v_e = verts_idx[0], verts_idx[1]
     response_s, response_e = gs.qd_float(0.0), gs.qd_float(0.0)
     response = func_inverse_mass(i_v, i_b, rod_state, rod_info)
-    if n_contacts == 1:
+    if not is_squeezed:
         response_s = (1.0 - t) * func_inverse_mass(i_v_s, i_b, rod_state, rod_info)
         response_e = t * func_inverse_mass(i_v_e, i_b, rod_state, rod_info)
         response = (1.0 - t) * response_s + t * response_e
@@ -84,6 +107,31 @@ def func_rod_rigid_contact_response(
     else:
         response_e = response
     return i_v_s, i_v_e, response_s, response_e, response
+
+
+@qd.func
+def func_rod_rigid_contacts_coupling(
+    i_v: int, i_c: int, j_c: int, i_b: int, is_squeezed: bool, rod_state: RodState, rod_info: RodInfo
+) -> float:
+    """Return the displacement of the point of a contact of a vertex of the rods with a rigid geom per unit impulse at
+    the point of another contact of the vertex (see 'func_rod_rigid_contact_response'), along the impulse: through the
+    vertex for a squeezed vertex, through the vertices the two points share, by their weights in both, otherwise."""
+    inv_mass = func_inverse_mass(i_v, i_b, rod_state, rod_info)
+    if not is_squeezed:
+        verts_idx_i = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
+        verts_idx_j = rod_state.rigid_contacts.verts_idx[i_v, j_c, i_b]
+        t_i, t_j = rod_state.rigid_contacts.t[i_v, i_c, i_b], rod_state.rigid_contacts.t[i_v, j_c, i_b]
+        weights_i = qd.Vector([1.0 - t_i, t_i], dt=gs.qd_float)
+        weights_j = qd.Vector([1.0 - t_j, t_j], dt=gs.qd_float)
+        inv_mass = 0.0
+        for k_i in qd.static(range(2)):
+            for k_j in qd.static(range(2)):
+                if verts_idx_i[k_i] == verts_idx_j[k_j]:
+                    i_v_k = verts_idx_i[k_i]
+                    inv_mass = inv_mass + weights_i[k_i] * weights_j[k_j] * func_inverse_mass(
+                        i_v_k, i_b, rod_state, rod_info
+                    )
+    return inv_mass
 
 
 @qd.func
@@ -303,6 +351,7 @@ class LegacyCoupler(RBC):
             RodData.rod_state.verts.dp_rigid_normal,
             RodData.rod_state.verts.dp_rigid_overlap,
             RodData.rod_state.verts.dp_rigid_friction,
+            RodData.rod_state.verts.dp_rigid_stick,
             RodData.rod_state.verts.contact_geom_idx,
             RodData.rod_state.rigid_contacts,
             RodData.rod_state.rigid_anchors,
@@ -1218,17 +1267,18 @@ class LegacyCoupler(RBC):
         Each contact (see '_func_rod_rigid_contact') is kept by the vertex owning it, the vertex of a sphere and the
         nearer vertex of an edge contact (see 'RodRigidContacts'), and takes over the anchor of the contact of the last
         substep with the same geom and edge (see 'RodRigidAnchors'). The contacts of a vertex are solved together, each
-        impulse non-negative (see 'func_solve_nonnegative'), the vertex taking their impulses alone, as if their points
-        were at the vertex: the other vertex of an edge would let the impulses of contacts pressing the vertex from
-        opposite sides move it out of all proportion, while the point of an edge contact moves no further than its
-        vertex. First the penetration the rod started the substep with is removed from the rod alone, the links held, as
-        a correction of its position that changes no velocity, as far as the rod can leave the geoms alone. Then the
-        approach of the substep, plus 'ROD_RIGID_OVERLAP_RECOVERY' of the penetration the rod cannot leave alone
-        (squeezed between two geoms), is resolved by impulses on the rod and on the links, each link responding through
-        the bound of its inverse mass shared by its contacts (see 'func_rod_rigid_contact_link_inverse_mass'). The rod
-        takes each impulse along the normal, and the link the opposite one (applied in
-        'kernel_project_rod_rigid_friction'): a vertex squeezed between two geoms pushes both back by the impulse that
-        stops them, while a free rod and a free link meeting take the impulses of two free bodies.
+        impulse non-negative (see 'func_solve_nonnegative'), the impulses of a vertex squeezed between geoms taken by
+        the vertex alone (see 'func_rod_rigid_contact_response'). First the penetration the rod started the substep with
+        is removed from the rod alone, the links held, as a correction of its position that changes no velocity,
+        'ROD_RIGID_OVERLAP_RELAXATION' of it at each substep and as far as the rod can leave the geoms alone: its slip
+        along each geom by this move is bounded by Coulomb's bound of the move of that contact, so that geoms squeezing
+        it from nearly opposite sides hold it. Then the approach of the substep, plus 'ROD_RIGID_OVERLAP_RECOVERY' of
+        the penetration the rod cannot leave alone (squeezed between two geoms), is resolved by impulses on the rod and
+        on the links, each link responding through the bound of its inverse mass shared by its contacts (see
+        'func_rod_rigid_contact_link_inverse_mass'). The rod takes each impulse along the normal, and the link the
+        opposite one (applied in 'kernel_project_rod_rigid_friction'): a vertex squeezed between two geoms pushes both
+        back by the impulse that stops them, while a free rod and a free link meeting take the impulses of two free
+        bodies.
 
         The geom each free vertex penetrates deepest is recorded where it penetrates one, through its sphere or an edge
         contact on its half of the edge, the record being cleared at the first substep of a step ('is_step_start'), so
@@ -1352,25 +1402,16 @@ class LegacyCoupler(RBC):
                 # The displacement of the point of each contact along its normal per unit impulse along the normal of
                 # each, through the rod alone, an unused contact left out by a unit diagonal
                 inv_mass = func_inverse_mass(i_v, i_b, rod_state, rod_info)
+                is_squeezed = func_rod_rigid_contacts_are_squeezing(i_v, i_b, n_contacts, rod_state)
                 coupling = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, ROD_RIGID_CONTACTS_PER_VERT)
                 for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
                     for j_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
                         if i_c < n_contacts and j_c < n_contacts:
-                            if qd.static(i_c == j_c):
-                                _, _, _, _, response = func_rod_rigid_contact_response(
-                                    i_v,
-                                    i_c,
-                                    i_b,
-                                    rod_state.rigid_contacts.t[i_v, i_c, i_b],
-                                    n_contacts,
-                                    rod_state,
-                                    rod_info,
-                                )
-                                coupling[i_c, i_c] = response
-                            else:
-                                coupling[i_c, j_c] = inv_mass * rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(
-                                    rod_state.rigid_contacts.normal[i_v, j_c, i_b]
-                                )
+                            coupling[i_c, j_c] = func_rod_rigid_contacts_coupling(
+                                i_v, i_c, j_c, i_b, is_squeezed, rod_state, rod_info
+                            ) * rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(
+                                rod_state.rigid_contacts.normal[i_v, j_c, i_b]
+                            )
                 # The penetration at the start of the substep is removed from the rod alone, the links held, each
                 # contact moving the rod out of its geom, shared with the contacts pushing the rod the opposite way.
                 # Solving them together would let the rod leave two geoms pressing it from nearly opposite sides along
@@ -1386,7 +1427,37 @@ class LegacyCoupler(RBC):
                                     n_sharing += 1
                         target[i_c, 0] = rod_state.rigid_contacts.penetration_start[i_v, i_c, i_b]
                         impulses_held[i_c, 0] = target[i_c, 0] / (n_sharing * coupling[i_c, i_c])
-                penetration_left = target - coupling @ impulses_held
+                # The friction of each contact bounds the slip of the vertex along its geom by this move, as it does the
+                # impulses (see 'kernel_project_rod_rigid_friction'): moving out of geoms pressing it from nearly
+                # opposite sides along the difference of their normals is a slip along both, which the geoms hold
+                # back within Coulomb's bound. A vertex that is not squeezed is moved along each normal alone.
+                move = qd.Vector.zero(gs.qd_float, 3)
+                for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
+                    if i_c < n_contacts:
+                        move = move + inv_mass * impulses_held[i_c, 0] * rod_state.rigid_contacts.normal[i_v, i_c, i_b]
+                if is_squeezed:
+                    for _ in qd.static(range(ROD_RIGID_FRICTION_SWEEPS)):
+                        for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
+                            if i_c < n_contacts:
+                                normal = rod_state.rigid_contacts.normal[i_v, i_c, i_b]
+                                i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
+                                slip = move - move.dot(normal) * normal
+                                slip_max = geoms_info.coup_friction[i_g] * inv_mass * impulses_held[i_c, 0]
+                                if slip.norm_sqr() > slip_max**2:
+                                    slip = slip * (slip_max / slip.norm())
+                                move = move - slip
+                penetration_left = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, 1)
+                for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
+                    if i_c < n_contacts:
+                        rod_state.rigid_contacts.impulse_overlap[i_v, i_c, i_b] = impulses_held[i_c, 0]
+                        if is_squeezed:
+                            penetration_left[i_c, 0] = target[i_c, 0] - move.dot(
+                                rod_state.rigid_contacts.normal[i_v, i_c, i_b]
+                            )
+                if not is_squeezed:
+                    penetration_left = target - coupling @ impulses_held
+                else:
+                    qd.atomic_add(rod_state.verts.dp_rigid_overlap[i_v, i_b], ROD_RIGID_OVERLAP_RELAXATION * move)
                 # The approach of the substep, its separation counting against, and a fraction of the penetration the
                 # rod cannot leave alone, are resolved with the links free
                 system = coupling * 1.0
@@ -1408,7 +1479,7 @@ class LegacyCoupler(RBC):
                         rod_state.rigid_contacts.impulse_normal[i_v, i_c, i_b] = impulses[i_c, 0]
                         normal = rod_state.rigid_contacts.normal[i_v, i_c, i_b]
                         i_v_s, i_v_e, response_s, response_e, _ = func_rod_rigid_contact_response(
-                            i_v, i_c, i_b, rod_state.rigid_contacts.t[i_v, i_c, i_b], n_contacts, rod_state, rod_info
+                            i_v, i_c, i_b, rod_state.rigid_contacts.t[i_v, i_c, i_b], is_squeezed, rod_state, rod_info
                         )
                         qd.atomic_add(
                             rod_state.verts.dp_rigid_normal[i_v_s, i_b], response_s * impulses[i_c, 0] * normal
@@ -1416,12 +1487,15 @@ class LegacyCoupler(RBC):
                         qd.atomic_add(
                             rod_state.verts.dp_rigid_normal[i_v_e, i_b], response_e * impulses[i_c, 0] * normal
                         )
-                        qd.atomic_add(
-                            rod_state.verts.dp_rigid_overlap[i_v_s, i_b], response_s * impulses_held[i_c, 0] * normal
-                        )
-                        qd.atomic_add(
-                            rod_state.verts.dp_rigid_overlap[i_v_e, i_b], response_e * impulses_held[i_c, 0] * normal
-                        )
+                        if not is_squeezed:
+                            qd.atomic_add(
+                                rod_state.verts.dp_rigid_overlap[i_v_s, i_b],
+                                ROD_RIGID_OVERLAP_RELAXATION * response_s * impulses_held[i_c, 0] * normal,
+                            )
+                            qd.atomic_add(
+                                rod_state.verts.dp_rigid_overlap[i_v_e, i_b],
+                                ROD_RIGID_OVERLAP_RELAXATION * response_e * impulses_held[i_c, 0] * normal,
+                            )
 
     @qd.kernel
     def kernel_project_rod_rigid_friction(
@@ -1436,21 +1510,24 @@ class LegacyCoupler(RBC):
         """Compute the friction of the contacts of the rods with the rigid geoms, and apply the reaction to the links.
 
         The contacts are those 'kernel_project_rod_rigid_normal' kept. The slip of the point of each contact relative to
-        the geom over the substep, along the surface and its normal correction included, is cancelled by tangential
-        impulses solved together for the contacts of a vertex as the normal ones, the tangent planes of the contacts of
-        a vertex taken as one, each then bounded by the friction coefficient of its geom ('coup_friction') times its
-        normal impulse. A vertex squeezed from two sides thus holds against twice the friction of one. The rod takes
-        each impulse, and the link the opposite of the normal and tangential impulses of the contact over the substep,
-        as a force at the contact point on the surface of the rod.
+        the geom over the substep, along the surface and its normal correction included, is cancelled by a tangential
+        impulse on the rod and the opposite one on the link, the contacts of a vertex in turn (Gauss-Seidel, each seeing
+        the moves of the others, see 'func_rod_rigid_contacts_coupling'), each bounded by the friction coefficient of
+        its geom ('coup_friction') times its normal impulse. A vertex squeezed from two sides thus holds against twice
+        the friction of one, and no combination of contacts moves the rod further than their bounds allow. The link
+        takes the opposite of the normal and tangential impulses of the contact over the substep, as a force at the
+        contact point on the surface of the rod.
 
-        A contact within its bound sticks to a point of the geom (see 'RodRigidAnchors'), and the rod alone is moved
-        back by 'ROD_RIGID_ANCHOR_RECOVERY' of the slip it accumulated since, without changing its velocity. The bound
-        of the inverse mass of a link held by its joints overestimates how far it moves, so that the impulses leave some
-        slip, which would otherwise accumulate into a creep of the rod out of a grip. A sliding contact sticks next to
-        where its friction leaves its point.
+        A contact sticks to a point of the geom (see 'RodRigidAnchors'): the slip of its point since, the moves of the
+        rod alone out of the geoms included, is moved back by 'ROD_RIGID_ANCHOR_RECOVERY' by the rod alone, without
+        changing its velocity, within what Coulomb's bound leaves of the normal corrections of the contact, impulse and
+        move out of the geoms together; beyond it the contact slides, and sticks next to where its point is left. The
+        bound of the inverse mass of a link held by its joints overestimates how far it moves, so that the impulses
+        leave some slip, which would otherwise accumulate into a creep of the rod out of a grip.
         """
         for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
             rod_state.verts.dp_rigid_friction[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            rod_state.verts.dp_rigid_stick[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
             rod_state.rigid_anchors.n_anchors[i_v, i_b] = rod_state.rigid_contacts.n_contacts[i_v, i_b]
 
         for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
@@ -1458,27 +1535,22 @@ class LegacyCoupler(RBC):
             if n_contacts > 0:
                 dt = rod_info.substep_dt[None]
                 inv_mass = func_inverse_mass(i_v, i_b, rod_state, rod_info)
-                system = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, ROD_RIGID_CONTACTS_PER_VERT)
+                # The displacement of the point of each contact per unit impulse along the surface, through the rod and
+                # the link, and the slip of the point to cancel
+                is_squeezed = func_rod_rigid_contacts_are_squeezing(i_v, i_b, n_contacts, rod_state)
+                coupling = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, ROD_RIGID_CONTACTS_PER_VERT)
+                inv_masses = qd.Vector.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT)
                 target = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, 3)
                 for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
                     if i_c < n_contacts:
                         for j_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
                             if j_c < n_contacts:
-                                system[i_c, j_c] = inv_mass
-                        _, _, _, _, response = func_rod_rigid_contact_response(
-                            i_v,
-                            i_c,
-                            i_b,
-                            rod_state.rigid_contacts.anchor_t[i_v, i_c, i_b],
-                            n_contacts,
-                            rod_state,
-                            rod_info,
+                                coupling[i_c, j_c] = func_rod_rigid_contacts_coupling(
+                                    i_v, i_c, j_c, i_b, is_squeezed, rod_state, rod_info
+                                )
+                        inv_masses[i_c] = coupling[i_c, i_c] + func_rod_rigid_contact_link_inverse_mass(
+                            i_v, i_c, i_b, rod_state, geoms_info
                         )
-                        # The regularization keeps the impulses finite where several contacts of the vertex are with
-                        # geoms that do not move, their tangent planes being taken as one
-                        system[i_c, i_c] = (
-                            1.0 + ROD_RIGID_FRICTION_REGULARIZATION
-                        ) * response + func_rod_rigid_contact_link_inverse_mass(i_v, i_c, i_b, rod_state, geoms_info)
                         # The slip of the point of the edge sticking to the anchor, its normal correction included,
                         # from where it would be had it stuck to the geom over the substep
                         verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
@@ -1501,10 +1573,103 @@ class LegacyCoupler(RBC):
                         slip = pos - pos_stuck
                         slip = slip - slip.dot(normal) * normal
                         for k in qd.static(range(3)):
-                            target[i_c, k] = -slip[k]
-                    else:
-                        system[i_c, i_c] = 1.0
-                impulses = system.inverse() @ target
+                            target[i_c, k] = slip[k]
+                # The contacts in turn cancel the slip of their point, the moves of the vertex by the others included,
+                # each within Coulomb's bound, so that no combination of them moves the vertex further than their
+                # bounds allow (a vertex with several contacts moves with their points, see
+                # 'func_rod_rigid_contact_response')
+                impulses = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, 3)
+                is_sliding = qd.Vector.zero(gs.qd_int, ROD_RIGID_CONTACTS_PER_VERT)
+                for _ in qd.static(range(ROD_RIGID_FRICTION_SWEEPS)):
+                    for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
+                        if i_c < n_contacts:
+                            normal = rod_state.rigid_contacts.normal[i_v, i_c, i_b]
+                            slip = qd.Vector([target[i_c, 0], target[i_c, 1], target[i_c, 2]])
+                            slip = slip - slip.dot(normal) * normal
+                            impulse_old = qd.Vector([impulses[i_c, 0], impulses[i_c, 1], impulses[i_c, 2]])
+                            impulse = impulse_old - slip / inv_masses[i_c]
+                            impulse = impulse - impulse.dot(normal) * normal
+                            i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
+                            impulse_max = (
+                                geoms_info.coup_friction[i_g] * rod_state.rigid_contacts.impulse_normal[i_v, i_c, i_b]
+                            )
+                            is_sliding[i_c] = 0
+                            if impulse.norm_sqr() > impulse_max**2:
+                                impulse = impulse * (impulse_max / impulse.norm())
+                                is_sliding[i_c] = 1
+                            for k in qd.static(range(3)):
+                                impulses[i_c, k] = impulse[k]
+                            # The other points move with the vertices they share with this one
+                            for j_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
+                                if j_c < n_contacts:
+                                    for k in qd.static(range(3)):
+                                        target[j_c, k] = target[j_c, k] + coupling[j_c, i_c] * (
+                                            impulse[k] - impulse_old[k]
+                                        )
+                # The slip of the point of each contact from where it sticks, the moves of the rod alone out of the
+                # geoms and the friction impulses included, is moved back by the rod alone, within what Coulomb's bound
+                # leaves of the normal corrections of the contact, the contacts in turn; a contact beyond it slides,
+                # its anchor following its point
+                drifts = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, 3)
+                for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
+                    if i_c < n_contacts:
+                        verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
+                        i_v_s, i_v_e = verts_idx[0], verts_idx[1]
+                        anchor_t = rod_state.rigid_contacts.anchor_t[i_v, i_c, i_b]
+                        pos = (1.0 - anchor_t) * (
+                            rod_state.verts.pos[i_v_s, i_b]
+                            + rod_state.verts.dp_rigid_normal[i_v_s, i_b]
+                            + rod_state.verts.dp_rigid_overlap[i_v_s, i_b]
+                        )
+                        pos = pos + anchor_t * (
+                            rod_state.verts.pos[i_v_e, i_b]
+                            + rod_state.verts.dp_rigid_normal[i_v_e, i_b]
+                            + rod_state.verts.dp_rigid_overlap[i_v_e, i_b]
+                        )
+                        # The slip left by the friction impulses, as they moved the point
+                        drift = pos - rod_state.rigid_contacts.anchor[i_v, i_c, i_b]
+                        for j_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
+                            if j_c < n_contacts:
+                                drift = drift + coupling[i_c, j_c] * qd.Vector(
+                                    [impulses[j_c, 0], impulses[j_c, 1], impulses[j_c, 2]]
+                                )
+                        for k in qd.static(range(3)):
+                            drifts[i_c, k] = drift[k]
+                corrections = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, 3)
+                drifts_full = drifts * 1.0
+                drifts = ROD_RIGID_ANCHOR_RECOVERY * drifts
+                for _ in qd.static(range(ROD_RIGID_FRICTION_SWEEPS)):
+                    for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
+                        if i_c < n_contacts:
+                            normal = rod_state.rigid_contacts.normal[i_v, i_c, i_b]
+                            drift = qd.Vector([drifts[i_c, 0], drifts[i_c, 1], drifts[i_c, 2]])
+                            drift = drift - drift.dot(normal) * normal
+                            correction_old = qd.Vector([corrections[i_c, 0], corrections[i_c, 1], corrections[i_c, 2]])
+                            correction = correction_old - drift / coupling[i_c, i_c]
+                            correction = correction - correction.dot(normal) * normal
+                            i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
+                            impulse_friction = qd.Vector([impulses[i_c, 0], impulses[i_c, 1], impulses[i_c, 2]])
+                            correction_max = qd.max(
+                                geoms_info.coup_friction[i_g]
+                                * (
+                                    rod_state.rigid_contacts.impulse_normal[i_v, i_c, i_b]
+                                    + rod_state.rigid_contacts.impulse_overlap[i_v, i_c, i_b]
+                                )
+                                - qd.sqrt(impulse_friction.norm_sqr() + gs.EPS**2),
+                                0.0,
+                            )
+                            is_sliding[i_c] = 0
+                            if correction.norm_sqr() > correction_max**2:
+                                correction = correction * (correction_max / correction.norm())
+                                is_sliding[i_c] = 1
+                            for k in qd.static(range(3)):
+                                corrections[i_c, k] = correction[k]
+                            for j_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
+                                if j_c < n_contacts:
+                                    for k in qd.static(range(3)):
+                                        drifts[j_c, k] = drifts[j_c, k] + coupling[j_c, i_c] * (
+                                            correction[k] - correction_old[k]
+                                        )
                 for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
                     if i_c < n_contacts:
                         i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
@@ -1517,23 +1682,19 @@ class LegacyCoupler(RBC):
                         normal = rod_state.rigid_contacts.normal[i_v, i_c, i_b]
                         impulse_normal = rod_state.rigid_contacts.impulse_normal[i_v, i_c, i_b]
                         impulse_friction = qd.Vector([impulses[i_c, 0], impulses[i_c, 1], impulses[i_c, 2]])
-                        impulse_friction = impulse_friction - impulse_friction.dot(normal) * normal
-                        impulse_friction_max = geoms_info.coup_friction[i_g] * impulse_normal
-                        pos_s = rod_state.verts.pos[i_v_s, i_b] + rod_state.verts.dp_rigid_normal[i_v_s, i_b]
-                        pos_e = rod_state.verts.pos[i_v_e, i_b] + rod_state.verts.dp_rigid_normal[i_v_e, i_b]
-                        _, _, response_s, response_e, response = func_rod_rigid_contact_response(
-                            i_v, i_c, i_b, anchor_t, n_contacts, rod_state, rod_info
+                        correction = qd.Vector([corrections[i_c, 0], corrections[i_c, 1], corrections[i_c, 2]])
+                        _, _, response_s, response_e, _ = func_rod_rigid_contact_response(
+                            i_v, i_c, i_b, anchor_t, is_squeezed, rod_state, rod_info
                         )
-                        if impulse_friction.norm_sqr() > impulse_friction_max**2:
-                            impulse_friction = impulse_friction * (impulse_friction_max / impulse_friction.norm())
+                        if is_sliding[i_c] == 1:
+                            # The point where the contact leaves it, at the parameter of its anchor
                             anchor_t = t
-                            anchor = (1.0 - t) * pos_s + t * pos_e + response * impulse_friction
-                        else:
-                            drift = (1.0 - anchor_t) * pos_s + anchor_t * pos_e - anchor
-                            drift = drift - drift.dot(normal) * normal
-                            correction = -ROD_RIGID_ANCHOR_RECOVERY / response * drift
-                            qd.atomic_add(rod_state.verts.dp_rigid_overlap[i_v_s, i_b], response_s * correction)
-                            qd.atomic_add(rod_state.verts.dp_rigid_overlap[i_v_e, i_b], response_e * correction)
+                            anchor = anchor + qd.Vector([drifts_full[i_c, 0], drifts_full[i_c, 1], drifts_full[i_c, 2]])
+                            for j_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
+                                if j_c < n_contacts:
+                                    anchor = anchor + coupling[i_c, j_c] * qd.Vector(
+                                        [corrections[j_c, 0], corrections[j_c, 1], corrections[j_c, 2]]
+                                    )
                         rod_state.rigid_anchors.geom_idx[i_v, i_c, i_b] = i_g
                         rod_state.rigid_anchors.verts_idx[i_v, i_c, i_b] = verts_idx
                         rod_state.rigid_anchors.t[i_v, i_c, i_b] = anchor_t
@@ -1542,6 +1703,8 @@ class LegacyCoupler(RBC):
                         )
                         qd.atomic_add(rod_state.verts.dp_rigid_friction[i_v_s, i_b], response_s * impulse_friction)
                         qd.atomic_add(rod_state.verts.dp_rigid_friction[i_v_e, i_b], response_e * impulse_friction)
+                        qd.atomic_add(rod_state.verts.dp_rigid_stick[i_v_s, i_b], response_s * correction)
+                        qd.atomic_add(rod_state.verts.dp_rigid_stick[i_v_e, i_b], response_e * correction)
                         I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
                         if not links_info.is_fixed[I_l]:
                             radius = (1.0 - t) * rod_info.verts.radius[i_v_s] + t * rod_info.verts.radius[i_v_e]

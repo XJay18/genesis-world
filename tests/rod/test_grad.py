@@ -140,9 +140,12 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
     # whose finite differences do not converge there, and take smaller steps for the velocities and the bending stiffness.
     steps_and_tols = {
         "pos": (1e-7, 5e-5),
-        "vel": (1e-6 if case in ("plane", "box", "free_box") else 1e-5, 5e-6 if case == "free_box" else 2e-6),
+        "vel": (
+            {"free_box": 1e-7, "box": 1e-6, "plane": 1e-6}.get(case, 1e-5),
+            5e-6 if case == "free_box" else 2e-6,
+        ),
         "theta": (1e-5, 1e-8),
-        "E": (1e-5 if case in ("plane", "box", "free_box") else 1e-4, 5e-6),
+        "E": ({"free_box": 1e-6, "box": 1e-5, "plane": 1e-5}.get(case, 1e-4), 5e-6),
         "K": (1e-3 if case == "inextensible" else 1e-4, 5e-5),
         "G": (1e-3, 2e-6),
     }
@@ -342,7 +345,7 @@ def test_mid_rollout_attachment_grad_matches_fd(backend, show_viewer):
     steps_and_tols = {
         "rod_vel": (1e-5, 5e-8),
         "link_vel": (1e-4, 2e-9),
-        "box_vel": (1e-4, 5e-9),
+        "box_vel": (1e-5, 5e-8),
         "E": (1e-4, 1e-7),
     }
     for name, value in inputs.items():

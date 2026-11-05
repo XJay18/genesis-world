@@ -431,6 +431,7 @@ def kernel_finalize_rod_positions(
                 rod_state.verts.dp_rigid_normal[i_v, i_b]
                 + rod_state.verts.dp_rigid_overlap[i_v, i_b]
                 + rod_state.verts.dp_rigid_friction[i_v, i_b]
+                + rod_state.verts.dp_rigid_stick[i_v, i_b]
             )
         else:
             dp = func_last_projection_correction(i_v, i_b, rod_state, has_edge_pairs)
@@ -452,7 +453,7 @@ def kernel_finalize_rod_positions(
             dp = rod_state.verts.pos[i_v, i_b] - rod_state.verts.pos_prev[i_v, i_b]
             # The moves of the rod alone out of the rigid geoms and back to where its contacts stick change no velocity
             if qd.static(has_rigid_contacts):
-                dp = dp - rod_state.verts.dp_rigid_overlap[i_v, i_b]
+                dp = dp - rod_state.verts.dp_rigid_overlap[i_v, i_b] - rod_state.verts.dp_rigid_stick[i_v, i_b]
             rod_state.verts.vel[i_v, i_b] = dp / rod_info.substep_dt[None]
 
     if qd.static(has_edge_pairs):
@@ -542,6 +543,15 @@ def kernel_check_rod_finite(rod_state: RodState, errno: qd.Tensor):
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         if not (qd_isfinite(rod_state.verts.pos[i_v, i_b]) and qd_isfinite(rod_state.verts.vel[i_v, i_b])):
             errno[i_b] = errno[i_b] | ErrorCode.INVALID_VERTEX_NAN
+
+
+@qd.kernel(fastcache=True)
+def kernel_clear_rod_rigid_anchors(envs_idx: qd.types.ndarray(), rod_state: RodState):
+    """Release the contacts of the rods with the rigid geoms from the points they stick to (see 'RodRigidAnchors'), in
+    some environments."""
+    for i_v, i_b_ in qd.ndrange(rod_state.verts.pos.shape[0], envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        rod_state.rigid_anchors.n_anchors[i_v, i_b] = 0
 
 
 @qd.kernel(fastcache=True)
@@ -991,6 +1001,9 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         values = [tensor[envs_idx].contiguous() for tensor in state[1:]]
         kernel_set_rod_state(envs_idx, *values, self.rod_state)
+        # The state holds no contact with the rigid geoms, which stick again from where they start
+        if self._rigid_coupler is not None:
+            kernel_clear_rod_rigid_anchors(envs_idx, self.rod_state)
         self.clear_errno(envs_idx)
 
     @gs.assert_built
