@@ -927,7 +927,9 @@ class LegacyCoupler(RBC):
             if i_e >= 0:
                 edge_verts_idx = rod_info.edges.verts_idx[i_e]
                 i_v_s, i_v_e = edge_verts_idx[0], edge_verts_idx[1]
-                n_evals = ROD_EDGE_CONTACT_N_EVALS
+                # The signed distance of a plane is linear along an edge, whose ends are then its deepest points
+                if geoms_info.type[i_g] != gs.GEOM_TYPE.PLANE:
+                    n_evals = ROD_EDGE_CONTACT_N_EVALS
 
         # The search only finds the parameter of the contact, evaluated afterwards
         t = gs.qd_float(0.0)
@@ -935,33 +937,42 @@ class LegacyCoupler(RBC):
         dist_s, dist_e = gs.qd_float(0.0), gs.qd_float(0.0)
         is_interior = False
         t_center, step = gs.qd_float(0.0), gs.qd_float(0.25)
+        is_searching = True
         for i_eval in range(n_evals):
-            # The ends first, then the middle points, then a pair of steps on both sides of the deepest point so far
-            t_eval = gs.qd_float(0.0)
-            if i_eval == 1:
-                t_eval = 1.0
-            elif i_eval >= 2 and i_eval < 5:
-                t_eval = 0.25 * (i_eval - 1)
-            elif i_eval >= 5:
-                if (i_eval - 5) % 2 == 0:
-                    t_center = t
-                    step = 0.5 * step
-                    t_eval = qd.max(t_center - step, 0.0)
-                else:
-                    t_eval = qd.min(t_center + step, 1.0)
-            pos_eval = (1.0 - t_eval) * rod_state.verts.pos[i_v_s, i_b] + t_eval * rod_state.verts.pos[i_v_e, i_b]
-            radius_eval = (1.0 - t_eval) * rod_info.verts.radius[i_v_s] + t_eval * rod_info.verts.radius[i_v_e]
-            signed_dist_eval, _ = self._func_rod_geom_signed_distance(
-                i_g, i_b, pos_eval, geoms_state, geoms_info, rigid_info, sdf_info, collider_config
-            )
-            dist_eval = signed_dist_eval - radius_eval
-            if i_eval == 0:
-                dist_s = dist_eval
-            elif i_eval == 1:
-                dist_e = dist_eval
-            if dist_eval < dist_min:
-                t, dist_min = t_eval, dist_eval
-                is_interior = i_eval >= 2
+            # The signed distance changes along the edge no faster than the point, so that no point inside the edge
+            # penetrates where the distances of its two ends add up to more than its length (plus the change of radius)
+            if i_eval == 2:
+                edge_reach = (rod_state.verts.pos[i_v_e, i_b] - rod_state.verts.pos[i_v_s, i_b]).norm() + qd.abs(
+                    rod_info.verts.radius[i_v_e] - rod_info.verts.radius[i_v_s]
+                )
+                is_searching = dist_s + dist_e <= edge_reach
+            if is_searching:
+                # The ends first, then the middle points, then a pair of steps on both sides of the deepest point so far
+                t_eval = gs.qd_float(0.0)
+                if i_eval == 1:
+                    t_eval = 1.0
+                elif i_eval >= 2 and i_eval < 5:
+                    t_eval = 0.25 * (i_eval - 1)
+                elif i_eval >= 5:
+                    if (i_eval - 5) % 2 == 0:
+                        t_center = t
+                        step = 0.5 * step
+                        t_eval = qd.max(t_center - step, 0.0)
+                    else:
+                        t_eval = qd.min(t_center + step, 1.0)
+                pos_eval = (1.0 - t_eval) * rod_state.verts.pos[i_v_s, i_b] + t_eval * rod_state.verts.pos[i_v_e, i_b]
+                radius_eval = (1.0 - t_eval) * rod_info.verts.radius[i_v_s] + t_eval * rod_info.verts.radius[i_v_e]
+                signed_dist_eval, _ = self._func_rod_geom_signed_distance(
+                    i_g, i_b, pos_eval, geoms_state, geoms_info, rigid_info, sdf_info, collider_config
+                )
+                dist_eval = signed_dist_eval - radius_eval
+                if i_eval == 0:
+                    dist_s = dist_eval
+                elif i_eval == 1:
+                    dist_e = dist_eval
+                if dist_eval < dist_min:
+                    t, dist_min = t_eval, dist_eval
+                    is_interior = i_eval >= 2
 
         pos = (1.0 - t) * rod_state.verts.pos[i_v_s, i_b] + t * rod_state.verts.pos[i_v_e, i_b]
         radius = (1.0 - t) * rod_info.verts.radius[i_v_s] + t * rod_info.verts.radius[i_v_e]
