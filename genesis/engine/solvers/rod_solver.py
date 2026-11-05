@@ -450,7 +450,7 @@ def kernel_finalize_rod_positions(
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         if func_is_free(i_v, i_b, rod_state):
             dp = rod_state.verts.pos[i_v, i_b] - rod_state.verts.pos_prev[i_v, i_b]
-            # The penetration of a rigid geom the vertex started the substep with is recovered without velocity
+            # The moves of the rod alone out of the rigid geoms and back to where its contacts stick change no velocity
             if qd.static(has_rigid_contacts):
                 dp = dp - rod_state.verts.dp_rigid_overlap[i_v, i_b]
             rod_state.verts.vel[i_v, i_b] = dp / rod_info.substep_dt[None]

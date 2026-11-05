@@ -7,7 +7,7 @@ import torch
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.misc import tensor_to_array
+from genesis.utils.misc import qd_to_numpy, tensor_to_array
 
 from ..utils.assertions import assert_allclose, assert_equal
 
@@ -284,14 +284,15 @@ def test_vertex_constraints_reset_with_state(show_viewer):
             needs_coup=True,
         ),
     )
-    # The rod attached to the box whips back once shifted, and the box only carries the attachment
+    # The rod attached to the box whips back at tens of meters per second once shifted, and hits the box, which is heavy
+    # enough to keep falling
     box = scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.6, 0.0, 0.2),
             size=(0.1, 0.1, 0.1),
         ),
         material=gs.materials.Rigid(
-            needs_coup=False,
+            rho=1e5,
         ),
     )
     rods = [
@@ -776,3 +777,227 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
         (0.0, 0.5 * slope_acc * substep_dt**2 * n_substeps * (n_substeps + 1)),
     ):
         assert_allclose(tensor_to_array(rod.get_state().pos - pos_init) @ tangent, slide, atol=1e-6)
+
+
+@pytest.mark.required
+def test_rod_rigid_squeeze_conserves_momentum(two_pad_gripper, show_viewer):
+    radius, squeeze_force, n_close_steps, n_hold_steps = 0.01, 5.0, 40, 120
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, -9.81),
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=0.0,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.4, 0.4),
+            camera_lookat=(0.0, 0.0, 0.3),
+        ),
+        show_viewer=show_viewer,
+    )
+    # The pads squeeze a rod on a carriage free to slide along z, which only the weight of the rod moves
+    gripper = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=two_pad_gripper,
+            pos=(0.0, 0.0, 0.3),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.5,
+            gravity_compensation=1.0,
+        ),
+    )
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=5,
+            interval=0.01,
+            pos=(-0.02, 0.0, 0.3),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.005,
+            segment_radius=radius,
+        ),
+    )
+    scene.build()
+    lift_dof = gripper.get_joint("lift").dofs_idx_local
+    pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
+    gripper.control_dofs_force(squeeze_force, pads_dof)
+    verts_mass = qd_to_numpy(scene.sim.rod_solver.rod_info.verts.mass)
+
+    def momentum_z():
+        rod_momentum = (verts_mass * tensor_to_array(rod.get_state().vel)[0, :, 2]).sum()
+        # The generalized momentum along the slide of the carriage, the armature of the slide included
+        gripper_momentum = tensor_to_array(gripper.get_mass_mat() @ gripper.get_dofs_velocity())[lift_dof[0]]
+        return rod_momentum + gripper_momentum
+
+    for _ in range(n_close_steps):
+        scene.step()
+    momentum_init = momentum_z()
+    for i_step in range(n_hold_steps):
+        scene.step()
+        # The pads stop at the surface of the rod, and do not rise
+        assert gripper.get_dofs_position(pads_dof).sum() < 0.03 - (2.0 * radius - 1e-4)
+        assert gripper.get_dofs_velocity(lift_dof)[0] < 1e-6
+    # The weight of the rod is the only vertical force on the rod and the gripper
+    assert_allclose(momentum_z() - momentum_init, -verts_mass.sum() * 9.81 * n_hold_steps * 1e-3, rtol=2e-2)
+    # The rod is held, moving with the carriage
+    assert_allclose(rod.get_state().vel[0, :, 2].mean(), gripper.get_dofs_velocity(lift_dof)[0], atol=2e-3)
+
+
+@pytest.mark.required
+def test_rod_rigid_friction_conserves_momentum(show_viewer):
+    radius, rod_vel, n_steps = 0.005, 0.2, 200
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, -9.81),
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=0.0,
+        ),
+        show_viewer=show_viewer,
+    )
+    # A rod sliding on a free box lighter than itself drags it along
+    box = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.2),
+            size=(0.2, 0.1, 0.02),
+        ),
+        material=gs.materials.Rigid(
+            rho=10.0,
+            needs_coup=True,
+            coup_friction=0.5,
+            gravity_compensation=1.0,
+        ),
+    )
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=6,
+            interval=0.02,
+            pos=(-0.05, 0.0, 0.21 + radius - 1e-5),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.005,
+            segment_radius=radius,
+        ),
+    )
+    scene.build()
+    rod.set_velocity((rod_vel, 0.0, 0.0))
+    verts_mass = qd_to_numpy(scene.sim.rod_solver.rod_info.verts.mass)
+    box_mass = float(box.get_mass())
+
+    def momentum_x():
+        return (verts_mass * tensor_to_array(rod.get_state().vel)[0, :, 0]).sum(), box_mass * float(box.get_vel()[0])
+
+    momentum_init = sum(momentum_x())
+    for _ in range(n_steps):
+        scene.step()
+    rod_momentum, box_momentum = momentum_x()
+    assert box_momentum > 0.1 * momentum_init
+    assert_allclose(rod_momentum + box_momentum, momentum_init, rtol=1e-3)
+
+
+@pytest.mark.required
+def test_rod_rigid_grip_holds_twice_the_friction(two_pad_gripper, show_viewer):
+    radius, friction, n_steps = 0.01, 0.5, 100
+    # The rod pulled out of the grip along its axis by its weight, gravity pointing along it
+    gravity = 9.81
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(-gravity, 0.0, 0.0),
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=0.0,
+        ),
+        show_viewer=show_viewer,
+    )
+    gripper = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=two_pad_gripper,
+            pos=(0.0, 0.0, 0.3),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=friction,
+        ),
+    )
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=9,
+            interval=0.01,
+            pos=(-0.04, 0.0, 0.3),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.005,
+            segment_radius=radius,
+        ),
+    )
+    scene.build(n_envs=2)
+    pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
+    # Each pad presses the rod by a force whose friction holds the pull of the rod with one pad but not the other, then
+    # holds it with both
+    pull = float(qd_to_numpy(scene.sim.rod_solver.rod_info.verts.mass).sum()) * gravity
+    squeeze_force = np.array([0.8, 1.25])[:, None] * pull / (2.0 * friction)
+    gripper.set_dofs_position(np.full((2, 2), 0.005 - 1e-5), pads_dof)
+    gripper.control_dofs_force(squeeze_force.repeat(2, axis=1), pads_dof)
+    for _ in range(10):
+        scene.step()
+    pos_start = rod.get_state().pos[..., 0].mean(dim=-1)
+    vel_start = rod.get_state().vel[..., 0].mean(dim=-1)
+    for _ in range(n_steps):
+        scene.step()
+    # Twice the friction of one pad holds, less slides with the acceleration of Coulomb friction
+    assert abs(rod.get_state().pos[1, :, 0].mean() - pos_start[1]) < 1e-4
+    acc_slip = (rod.get_state().vel[0, :, 0].mean() - vel_start[0]) / (n_steps * 1e-3)
+    assert_allclose(acc_slip, -gravity * (1.0 - 0.8), rtol=0.05)
+
+
+@pytest.mark.required
+def test_rod_rests_on_supported_rigid_link(show_viewer):
+    radius, n_steps = 0.005, 300
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=0.0,
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    # A free beam lying on the ground, thin about its axis, along which the rod lies on it
+    beam = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.005),
+            size=(0.3, 0.01, 0.01),
+        ),
+        material=gs.materials.Rigid(
+            rho=1.0 / (0.3 * 0.01 * 0.01),
+            needs_coup=True,
+        ),
+    )
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=10,
+            interval=0.02,
+            pos=(-0.09, 0.0, 0.01 + radius),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.005,
+            segment_radius=radius,
+        ),
+    )
+    scene.build()
+    for _ in range(n_steps):
+        scene.step()
+    # The rod rests, the velocity of the vertices zero to the share of the substep its contacts leave to the link
+    assert_allclose(rod.get_state().vel, 0.0, atol=5e-4)
+    assert_allclose(rod.get_state().pos[..., 2], beam.get_pos()[..., 2] + 0.005 + radius, atol=1e-5)
