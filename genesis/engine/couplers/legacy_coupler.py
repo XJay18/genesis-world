@@ -845,8 +845,10 @@ class LegacyCoupler(RBC):
         rigid_info: RigidInfo,
         sdf_info: SDFInfo,
         collider_config: qd.template(),
+        compute_normal: qd.template(),
     ):
-        """Return the signed distance of a point to a geom and the outward normal of the geom there.
+        """Return the signed distance of a point to a geom and the outward normal of the geom there, zero unless
+        'compute_normal' asks for it.
 
         Planes and spheres are exact. A mesh reads its signed distance field (SDF) grid, which extends past the mesh by a
         fraction of its size only. Beyond the grid, the distance is the one to the closest point of the surface estimated
@@ -872,15 +874,23 @@ class LegacyCoupler(RBC):
             sdf_upper = qd.cast(sdf_info.geoms_info.sdf_res[i_g] - 1, gs.qd_float)
             pos_sdf_grid = qd.math.clamp(pos_sdf, 0.0, sdf_upper)
             signed_dist = sdf.sdf_func_true_sdf(i_g, pos_sdf_grid, sdf_info)
-            normal_mesh = qd_normalize(
-                sdf.sdf_func_true_grad(i_g, pos_sdf_grid, geoms_info, sdf_info, collider_config), EPS
-            )
-            if sdf.sdf_func_is_outside_sdf_grid(i_g, pos_sdf, sdf_info):
-                # The grid frame scales the mesh frame along its axes by the inverse of the cell size
-                offset = (pos_sdf - pos_sdf_grid) * sdf_info.geoms_info.sdf_cell_size[i_g] + signed_dist * normal_mesh
-                signed_dist = offset.norm()
-                normal_mesh = qd_normalize(offset, EPS)
-            normal = qd_transform_by_quat(normal_mesh, g_quat)
+            is_outside = sdf.sdf_func_is_outside_sdf_grid(i_g, pos_sdf, sdf_info)
+            # The distance beyond the grid needs the normal at its border
+            is_normal_needed = is_outside
+            if qd.static(compute_normal):
+                is_normal_needed = True
+            if is_normal_needed:
+                normal_mesh = qd_normalize(
+                    sdf.sdf_func_true_grad(i_g, pos_sdf_grid, geoms_info, sdf_info, collider_config), EPS
+                )
+                if is_outside:
+                    # The grid frame scales the mesh frame along its axes by the inverse of the cell size
+                    offset = (pos_sdf - pos_sdf_grid) * sdf_info.geoms_info.sdf_cell_size[
+                        i_g
+                    ] + signed_dist * normal_mesh
+                    signed_dist = offset.norm()
+                    normal_mesh = qd_normalize(offset, EPS)
+                normal = qd_transform_by_quat(normal_mesh, g_quat)
         return signed_dist, normal
 
     @qd.func
@@ -963,7 +973,15 @@ class LegacyCoupler(RBC):
                 pos_eval = (1.0 - t_eval) * rod_state.verts.pos[i_v_s, i_b] + t_eval * rod_state.verts.pos[i_v_e, i_b]
                 radius_eval = (1.0 - t_eval) * rod_info.verts.radius[i_v_s] + t_eval * rod_info.verts.radius[i_v_e]
                 signed_dist_eval, _ = self._func_rod_geom_signed_distance(
-                    i_g, i_b, pos_eval, geoms_state, geoms_info, rigid_info, sdf_info, collider_config
+                    i_g,
+                    i_b,
+                    pos_eval,
+                    geoms_state,
+                    geoms_info,
+                    rigid_info,
+                    sdf_info,
+                    collider_config,
+                    compute_normal=False,
                 )
                 dist_eval = signed_dist_eval - radius_eval
                 if i_eval == 0:
@@ -977,7 +995,7 @@ class LegacyCoupler(RBC):
         pos = (1.0 - t) * rod_state.verts.pos[i_v_s, i_b] + t * rod_state.verts.pos[i_v_e, i_b]
         radius = (1.0 - t) * rod_info.verts.radius[i_v_s] + t * rod_info.verts.radius[i_v_e]
         signed_dist, normal = self._func_rod_geom_signed_distance(
-            i_g, i_b, pos, geoms_state, geoms_info, rigid_info, sdf_info, collider_config
+            i_g, i_b, pos, geoms_state, geoms_info, rigid_info, sdf_info, collider_config, compute_normal=True
         )
         dist = signed_dist - radius
         penetration = -dist
@@ -1054,8 +1072,14 @@ class LegacyCoupler(RBC):
         rod_info: RodInfo,
         geoms_info: GeomsInfo,
         rigid_info: RigidInfo,
+        sdf_info: SDFInfo,
+        collider_config: qd.template(),
     ) -> bool:
-        """Whether the bounding sphere of a geom reaches the capsules of the edges of a vertex of the rods."""
+        """Whether a geom may reach the capsules of the edges of a vertex of the rods.
+
+        Its bounding sphere must reach them, then its signed distance at the vertex, which changes no faster than the
+        point along the edges.
+        """
         pos = rod_state.verts.pos[i_v, i_b]
         reach = rod_info.verts.radius[i_v]
         for i_slot in qd.static(range(2)):
@@ -1070,9 +1094,15 @@ class LegacyCoupler(RBC):
             0.5 * (aabb_min + aabb_max), geoms_state.pos[i_g, i_b], geoms_state.quat[i_g, i_b]
         )
         # A plane is unbounded, whatever the vertices of its mesh
-        return geoms_info.type[i_g] == gs.GEOM_TYPE.PLANE or (center - pos).norm() < (
+        is_near = geoms_info.type[i_g] == gs.GEOM_TYPE.PLANE or (center - pos).norm() < (
             0.5 * (aabb_max - aabb_min).norm() + reach
         )
+        if is_near:
+            signed_dist, _ = self._func_rod_geom_signed_distance(
+                i_g, i_b, pos, geoms_state, geoms_info, rigid_info, sdf_info, collider_config, compute_normal=False
+            )
+            is_near = signed_dist < reach
+        return is_near
 
     @qd.kernel
     def kernel_project_rod_rigid_normal(
@@ -1121,7 +1151,16 @@ class LegacyCoupler(RBC):
                 for i_g in range(geoms_info.needs_coup.shape[0]):
                     if geoms_info.needs_coup[i_g]:
                         if self._func_is_geom_near_rod_vertex(
-                            i_v, i_g, i_b, rod_state, geoms_state, rod_info, geoms_info, rigid_info
+                            i_v,
+                            i_g,
+                            i_b,
+                            rod_state,
+                            geoms_state,
+                            rod_info,
+                            geoms_info,
+                            rigid_info,
+                            sdf_info,
+                            collider_config,
                         ):
                             is_covered = False
                             # FIXME: quadrants autodiff - a runtime loop over the slots gets wrong adjoints of the geom pose
@@ -1217,7 +1256,16 @@ class LegacyCoupler(RBC):
                 for i_g in range(geoms_info.needs_coup.shape[0]):
                     if geoms_info.needs_coup[i_g]:
                         if self._func_is_geom_near_rod_vertex(
-                            i_v, i_g, i_b, rod_state, geoms_state, rod_info, geoms_info, rigid_info
+                            i_v,
+                            i_g,
+                            i_b,
+                            rod_state,
+                            geoms_state,
+                            rod_info,
+                            geoms_info,
+                            rigid_info,
+                            sdf_info,
+                            collider_config,
                         ):
                             is_covered = False
                             # FIXME: quadrants autodiff - a runtime loop over the slots gets wrong adjoints of the geom pose
