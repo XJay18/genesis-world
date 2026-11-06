@@ -378,6 +378,21 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
             penetration = radius_a + radius_b - dist
             if dist > rod_info.EPS[None]:
                 normal = dist_vec / dist
+        # A contact is resolved through the vertices owning its points, the nearer vertex of each edge: where both are
+        # immovable (fixed or attached), only the far vertices could move, by the penetration over their weight in the
+        # points, levering a free vertex next to a fixed one out of all proportion
+        inv_mass_a1 = func_inverse_mass(i_v_a1, i_b, rod_state, rod_info)
+        inv_mass_a2 = func_inverse_mass(i_v_a2, i_b, rod_state, rod_info)
+        inv_mass_b1 = func_inverse_mass(i_v_b1, i_b, rod_state, rod_info)
+        inv_mass_b2 = func_inverse_mass(i_v_b2, i_b, rod_state, rod_info)
+        inv_mass_owner_a = qd.select(
+            t < 0.5, inv_mass_a1, qd.select(t > 0.5, inv_mass_a2, qd.max(inv_mass_a1, inv_mass_a2))
+        )
+        inv_mass_owner_b = qd.select(
+            u < 0.5, inv_mass_b1, qd.select(u > 0.5, inv_mass_b2, qd.max(inv_mass_b1, inv_mass_b2))
+        )
+        if inv_mass_owner_a + inv_mass_owner_b <= 0.0:
+            penetration = gs.qd_float(-1.0)
         # The normal of a pair is read by the friction only where it penetrates (see 'kernel_finalize_rod_positions')
         if i_iter == 0:
             rod_state.edge_pairs.penetration[i_p, i_b] = penetration
@@ -386,15 +401,7 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
         if penetration > 0.0:
             verts_idx = qd.Vector([i_v_a1, i_v_a2, i_v_b1, i_v_b2], dt=gs.qd_int)
             weights = qd.Vector([1.0 - t, t, 1.0 - u, u], dt=gs.qd_float)
-            inv_masses = qd.Vector(
-                [
-                    func_inverse_mass(i_v_a1, i_b, rod_state, rod_info),
-                    func_inverse_mass(i_v_a2, i_b, rod_state, rod_info),
-                    func_inverse_mass(i_v_b1, i_b, rod_state, rod_info),
-                    func_inverse_mass(i_v_b2, i_b, rod_state, rod_info),
-                ],
-                dt=gs.qd_float,
-            )
+            inv_masses = qd.Vector([inv_mass_a1, inv_mass_a2, inv_mass_b1, inv_mass_b2], dt=gs.qd_float)
             inv_mass_eff = (weights * weights).dot(inv_masses)
             if inv_mass_eff > rod_info.EPS[None]:
                 impulse = penetration / inv_mass_eff * normal

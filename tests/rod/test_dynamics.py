@@ -472,6 +472,50 @@ def test_rod_contacts_resolve_at_any_precision(precision, show_viewer):
 
 
 @pytest.mark.required
+def test_rod_contact_at_immovable_vertices_does_not_lever_free_vertex(show_viewer):
+    radius, penetration = 0.01, 2e-4
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    material = gs.materials.Rod.Base(
+        segment_radius=radius,
+    )
+    # A fixed rod crossing a free one 0.2 mm from its fixed first vertex, 1 % along its first edge, their capsules
+    # overlapping there (the slingshot band pressed against its post next to the vertex attached to the hand)
+    scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=3,
+            interval=0.02,
+            axis="y",
+            pos=(0.0002, -0.02, 0.3),
+            fixed=True,
+        ),
+        material=material,
+    )
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=3,
+            interval=0.02,
+            pos=(0.0, 0.0, 0.3 + 2.0 * radius - penetration),
+        ),
+        material=material,
+    )
+    scene.build()
+    rod.set_verts_fixed(True, [0])
+    pos_init = rod.get_state().pos
+    for _ in range(10):
+        scene.step()
+    # The overlap is at immovable points of both rods: removing it would turn the free edge about its fixed vertex,
+    # moving its free vertex by the penetration over its weight in the point (20 mm), so it stays
+    assert_allclose(rod.get_state().pos, pos_init, atol=1e-9)
+
+
+@pytest.mark.required
 @pytest.mark.parametrize("rod_mpm", [True, False])
 def test_rod_mpm_coupling(rod_mpm, show_viewer):
     scene = gs.Scene(
@@ -1006,7 +1050,8 @@ def test_rod_rests_on_supported_rigid_link(show_viewer):
 @pytest.mark.required
 @pytest.mark.parametrize("two_pad_gripper", [5.0, 9.0], indirect=True)
 def test_rod_rigid_friction_holds_rod_between_tilted_pads(two_pad_gripper, request, show_viewer):
-    radius, squeeze_force, n_settle_steps, n_steps = 0.01, 5.0, 100, 1000
+    # The squeeze of a Franka hand
+    radius, squeeze_force, n_settle_steps, n_steps, n_release_steps = 0.01, 20.0, 100, 1000, 30
     tilt = math.radians(request.node.callspec.params["two_pad_gripper"])
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -1050,21 +1095,44 @@ def test_rod_rigid_friction_holds_rod_between_tilted_pads(two_pad_gripper, reque
         for i in range(2)
     ]
     scene.build()
+    pads_dof_held = [grippers[0].get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
     for gripper in grippers:
         lift_dof = gripper.get_joint("lift").dofs_idx_local
         pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
         gripper.set_dofs_kp([1e4], lift_dof)
+        gripper.set_dofs_kv([200.0], lift_dof)
         gripper.control_dofs_position([0.0], lift_dof)
         gripper.control_dofs_force([squeeze_force, squeeze_force], pads_dof)
     for _ in range(n_settle_steps):
         scene.step()
     z_start = [float(rod.get_state().pos[0, :, 2].mean()) for rod in rods]
+    vel_error = 0.0
+    pos_prev = tensor_to_array(rods[0].get_state().pos[0])
     for _ in range(n_steps):
         scene.step()
+        state = rods[0].get_state()
+        pos = tensor_to_array(state.pos[0])
+        # The velocity of the vertices between the pads against the motion of the step
+        vel_fd = (pos - pos_prev) / 1e-3
+        vel = tensor_to_array(state.vel[0])
+        vel_error = max(vel_error, float(np.linalg.norm(vel[1:4] - vel_fd[1:4], axis=-1).max()))
+        pos_prev = pos
     drift = [float(rod.get_state().pos[0, :, 2].mean()) - z for rod, z in zip(rods, z_start)]
     # Friction above the tangent of the tilt holds the rod, below it the rod slides down out of the pads
     assert abs(drift[0]) < 5e-4
     assert drift[1] < -1e-2
+    # A rod held at rest moves as its velocity says: a correction of its position at every substep that changes no
+    # velocity would leave it one it does not have (6 and 15 mm/s at 5 and 9 deg before the squeezed vertices were
+    # left to the impulses). What is left (1.3 and 3 mm/s) is the pull of the free ends, which swing undamped within
+    # the step, and the anchor recovery of the friction
+    assert vel_error < 5e-3
+    # Opened, the pads let the rod fall freely, their tilted faces pushing it down as they leave (9 mm/s at 9 deg)
+    grippers[0].control_dofs_force([-squeeze_force, -squeeze_force], pads_dof_held)
+    vel_start = tensor_to_array(rods[0].get_state().vel[0, :, 2]).mean()
+    for _ in range(n_release_steps):
+        scene.step()
+    vel_fall = tensor_to_array(rods[0].get_state().vel[0, :, 2]).mean() - vel_start
+    assert_allclose(vel_fall, -9.81 * n_release_steps * 1e-3, atol=1e-2)
 
 
 @pytest.mark.required

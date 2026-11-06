@@ -59,7 +59,7 @@ ROD_RIGID_ANCHOR_RECOVERY = 0.1
 # substep. A move of the whole penetration out of one geom can push the rod into another one across it, which pushes it
 # back by as much at the next substep, an oscillation that a fraction lets decay
 ROD_RIGID_OVERLAP_RELAXATION = 0.5
-# The Gauss-Seidel sweeps over the contacts of a vertex of the friction bounding its slip along each
+# The Gauss-Seidel sweeps over the contacts of a vertex of the friction impulses and the anchor recovery
 ROD_RIGID_FRICTION_SWEEPS = 2
 # The largest rate of change of the signed distance of a rigid geom along a line: the gradient of the trilinear
 # interpolation of a signed distance grid reaches sqrt(3) at a corner of the geom
@@ -1270,11 +1270,11 @@ class LegacyCoupler(RBC):
         impulse non-negative (see 'func_solve_nonnegative'), the impulses of a vertex squeezed between geoms taken by
         the vertex alone (see 'func_rod_rigid_contact_response'). First the penetration the rod started the substep with
         is removed from the rod alone, the links held, as a correction of its position that changes no velocity,
-        'ROD_RIGID_OVERLAP_RELAXATION' of it at each substep and as far as the rod can leave the geoms alone: its slip
-        along each geom by this move is bounded by Coulomb's bound of the move of that contact, so that geoms squeezing
-        it from nearly opposite sides hold it. Then the approach of the substep, plus 'ROD_RIGID_OVERLAP_RECOVERY' of
-        the penetration the rod cannot leave alone (squeezed between two geoms), is resolved by impulses on the rod and
-        on the links, each link responding through the bound of its inverse mass shared by its contacts (see
+        'ROD_RIGID_OVERLAP_RELAXATION' of it at each substep, along the normal of each contact. A vertex squeezed
+        between geoms is not moved: it cannot leave one without going into the other, and its penetration is the one
+        the links pressing it keep up, which only the impulses can take back. Then the approach of the substep, plus
+        'ROD_RIGID_OVERLAP_RECOVERY' of the penetration the rod cannot leave alone, is resolved by impulses on the rod
+        and on the links, each link responding through the bound of its inverse mass shared by its contacts (see
         'func_rod_rigid_contact_link_inverse_mass'). The rod takes each impulse along the normal, and the link the
         opposite one (applied in 'kernel_project_rod_rigid_friction'): a vertex squeezed between two geoms pushes both
         back by the impulse that stops them, while a free rod and a free link meeting take the impulses of two free
@@ -1401,7 +1401,6 @@ class LegacyCoupler(RBC):
             if n_contacts > 0:
                 # The displacement of the point of each contact along its normal per unit impulse along the normal of
                 # each, through the rod alone, an unused contact left out by a unit diagonal
-                inv_mass = func_inverse_mass(i_v, i_b, rod_state, rod_info)
                 is_squeezed = func_rod_rigid_contacts_are_squeezing(i_v, i_b, n_contacts, rod_state)
                 coupling = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, ROD_RIGID_CONTACTS_PER_VERT)
                 for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
@@ -1413,9 +1412,11 @@ class LegacyCoupler(RBC):
                                 rod_state.rigid_contacts.normal[i_v, j_c, i_b]
                             )
                 # The penetration at the start of the substep is removed from the rod alone, the links held, each
-                # contact moving the rod out of its geom, shared with the contacts pushing the rod the opposite way.
-                # Solving them together would let the rod leave two geoms pressing it from nearly opposite sides along
-                # the small difference of their normals, by far more than its penetration and against friction
+                # contact moving the rod out of its geom along its normal, shared with the contacts pushing the rod the
+                # opposite way. A vertex squeezed between geoms is not moved: it cannot leave one without going into
+                # the other, and in a steady squeeze its penetration is the one the links keep up, held by their own
+                # forces while the impulses push them back. A move changing no velocity would take it out of the rod at
+                # every substep and leave the rod a velocity it does not have; the impulses resolve it instead
                 target = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, 1)
                 impulses_held = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, 1)
                 for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
@@ -1426,38 +1427,10 @@ class LegacyCoupler(RBC):
                                 if j_c < n_contacts and coupling[i_c, j_c] < 0.0:
                                     n_sharing += 1
                         target[i_c, 0] = rod_state.rigid_contacts.penetration_start[i_v, i_c, i_b]
-                        impulses_held[i_c, 0] = target[i_c, 0] / (n_sharing * coupling[i_c, i_c])
-                # The friction of each contact bounds the slip of the vertex along its geom by this move, as it does the
-                # impulses (see 'kernel_project_rod_rigid_friction'): moving out of geoms pressing it from nearly
-                # opposite sides along the difference of their normals is a slip along both, which the geoms hold
-                # back within Coulomb's bound. A vertex that is not squeezed is moved along each normal alone.
-                move = qd.Vector.zero(gs.qd_float, 3)
-                for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
-                    if i_c < n_contacts:
-                        move = move + inv_mass * impulses_held[i_c, 0] * rod_state.rigid_contacts.normal[i_v, i_c, i_b]
-                if is_squeezed:
-                    for _ in qd.static(range(ROD_RIGID_FRICTION_SWEEPS)):
-                        for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
-                            if i_c < n_contacts:
-                                normal = rod_state.rigid_contacts.normal[i_v, i_c, i_b]
-                                i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
-                                slip = move - move.dot(normal) * normal
-                                slip_max = geoms_info.coup_friction[i_g] * inv_mass * impulses_held[i_c, 0]
-                                if slip.norm_sqr() > slip_max**2:
-                                    slip = slip * (slip_max / slip.norm())
-                                move = move - slip
-                penetration_left = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, 1)
-                for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
-                    if i_c < n_contacts:
+                        if not is_squeezed:
+                            impulses_held[i_c, 0] = target[i_c, 0] / (n_sharing * coupling[i_c, i_c])
                         rod_state.rigid_contacts.impulse_overlap[i_v, i_c, i_b] = impulses_held[i_c, 0]
-                        if is_squeezed:
-                            penetration_left[i_c, 0] = target[i_c, 0] - move.dot(
-                                rod_state.rigid_contacts.normal[i_v, i_c, i_b]
-                            )
-                if not is_squeezed:
-                    penetration_left = target - coupling @ impulses_held
-                else:
-                    qd.atomic_add(rod_state.verts.dp_rigid_overlap[i_v, i_b], ROD_RIGID_OVERLAP_RELAXATION * move)
+                penetration_left = target - coupling @ impulses_held
                 # The approach of the substep, its separation counting against, and a fraction of the penetration the
                 # rod cannot leave alone, are resolved with the links free
                 system = coupling * 1.0
@@ -1683,7 +1656,7 @@ class LegacyCoupler(RBC):
                         impulse_normal = rod_state.rigid_contacts.impulse_normal[i_v, i_c, i_b]
                         impulse_friction = qd.Vector([impulses[i_c, 0], impulses[i_c, 1], impulses[i_c, 2]])
                         correction = qd.Vector([corrections[i_c, 0], corrections[i_c, 1], corrections[i_c, 2]])
-                        _, _, response_s, response_e, _ = func_rod_rigid_contact_response(
+                        _i_v_s, _i_v_e, response_s, response_e, _response = func_rod_rigid_contact_response(
                             i_v, i_c, i_b, anchor_t, is_squeezed, rod_state, rod_info
                         )
                         if is_sliding[i_c] == 1:
