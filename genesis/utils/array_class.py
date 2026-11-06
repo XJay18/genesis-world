@@ -1640,6 +1640,8 @@ ROD_VERTS = Size("rod_verts")
 ROD_EDGES = Size("rod_edges")
 ROD_HINGES = Size("rod_hinges")
 ROD_EDGE_PAIRS = Size("rod_edge_pairs")
+# The rigid links, of which the rods count their contacts
+ROD_RIGID_LINKS = Size("rod_rigid_links")
 
 # The arrays of the rod-rod contacts, which a scene without any pair of edges to test never reads
 ROD_CONTACTS = "rod_contacts"
@@ -1740,8 +1742,16 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
     dp_inextensibility: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True)
     dp_contact: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, labels=ROD_CONTACTS)
     dv_friction: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, labels=ROD_CONTACTS)
-    # The velocity once the coupling with the rigid geoms acted on it, before it is written back
-    vel_coupled: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    # The number of rod-rod contacts moving the vertex in the projection, over which its correction is averaged
+    n_contacts: qd.Tensor = field(int, kind=DataKind.SCRATCH, labels=ROD_CONTACTS)
+    # The corrections of the contacts with the rigid geoms, summed over the contacts of the vertex (see
+    # 'LegacyCoupler.project_rod_rigid_contacts'): the normal impulses, the correction of the overlap by the rod alone,
+    # the friction impulses, and the move of the rod alone back to where its contacts stick (see 'RodRigidAnchors'),
+    # the moves of the rod alone changing no velocity
+    dp_rigid_normal: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    dp_rigid_overlap: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    dp_rigid_friction: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    dp_rigid_stick: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     # The change of velocity the MPM grid nodes impart, summed over the nodes before it is applied
     dv_mpm: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     # The rigid geom the vertex penetrated deepest at the latest substep of the step with a penetration, -1 for none
@@ -1796,6 +1806,60 @@ class RodEdgePairsState(Data, kind=DataKind.SCRATCH, shape=(ROD_EDGE_PAIRS, ENVS
     penetration: qd.Tensor = field(float, grad=True, labels=ROD_CONTACTS)
 
 
+# The most contacts with the rigid geoms a vertex of the rods owns (see 'RodRigidContacts')
+ROD_RIGID_CONTACTS_PER_VERT = 4
+
+
+class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_CONTACTS_PER_VERT, ENVS)):
+    """The contacts of each free vertex of the rods with the rigid geoms that need coupling in each environment, found
+    once per substep (see 'LegacyCoupler.kernel_project_rod_rigid_normal').
+
+    A contact is the sphere of a vertex or the deepest point of the capsule of an edge in a geom, owned by the vertex,
+    or by the nearer vertex of the edge, the first vertex at its middle. A vertex keeps the first contacts it owns, the
+    geoms in their order and the edges before its sphere.
+    """
+
+    n_contacts: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))
+    # The number of contacts of the rods with each link, which share its motion
+    links_n_contacts: qd.Tensor = field(int, shape=(ROD_RIGID_LINKS, ENVS))
+    geom_idx: qd.Tensor = field(int)
+    # The vertices of the edge of the point, the vertex twice for its sphere, and the parameter of the point along it
+    verts_idx: qd.Tensor = field((int, 2))
+    t: qd.Tensor = field(float, grad=True)
+    # The outward normal of the geom, the penetration, and the penetration at the start of the substep, the penetration
+    # less the approach of the point to the geom over the substep, zero if they were apart
+    normal: qd.Tensor = field((float, 3), grad=True)
+    penetration: qd.Tensor = field(float, grad=True)
+    penetration_start: qd.Tensor = field(float, grad=True)
+    # The bound of the inverse mass of the link of the geom at the point along the normal
+    inv_mass_link: qd.Tensor = field(float, grad=True)
+    # The point of the geom the contact sticks to, moved with its link to the end of the substep, and the parameter of
+    # the point of the edge sticking to it (see 'RodRigidAnchors')
+    anchor: qd.Tensor = field((float, 3), grad=True)
+    anchor_t: qd.Tensor = field(float, grad=True)
+    # The normal impulse of the contact over the substep (in kg m, the change of momentum times the substep), and the
+    # one of its share of the move of the rod alone out of the geoms, which bound the friction of the contact
+    impulse_normal: qd.Tensor = field(float, grad=True)
+    impulse_overlap: qd.Tensor = field(float, grad=True)
+
+
+class RodRigidAnchors(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ROD_RIGID_CONTACTS_PER_VERT, ENVS)):
+    """The points of the rigid geoms the contacts of each free vertex of the rods stick to in each environment, from one
+    substep to the next (see 'LegacyCoupler.kernel_project_rod_rigid_friction').
+
+    A contact sticks to the point of the geom its point of the edge (or vertex) was at when it last slid or started, so
+    that the friction cancels the slip it accumulates while it sticks, and not only that of the last substep. A contact
+    of a later substep with the same geom and edge (or vertex) takes it over.
+    """
+
+    n_anchors: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))
+    geom_idx: qd.Tensor = field(int)
+    verts_idx: qd.Tensor = field((int, 2))
+    t: qd.Tensor = field(float, grad=True)
+    # The point in the frame of the link of the geom
+    pos: qd.Tensor = field((float, 3), grad=True)
+
+
 class RodState(Data):
     """The state of the rods, one struct per element type."""
 
@@ -1804,6 +1868,8 @@ class RodState(Data):
     edges: RodEdgesState
     hinges: RodHingesState
     edge_pairs: RodEdgePairsState
+    rigid_contacts: RodRigidContacts = field(opt_in=True)
+    rigid_anchors: RodRigidAnchors = field(opt_in=True)
     # The bounding box of the vertices of all the rods in each environment, which bounds the MPM grid nodes that can
     # collide with them
     aabb_min: qd.Tensor = field((float, 3), shape=(ENVS,), kind=DataKind.SCRATCH, opt_in=True)
@@ -1827,6 +1893,7 @@ class RodData(Data):
                 rod_edges=solver.n_edges,
                 rod_hinges=solver.n_hinges,
                 rod_edge_pairs=solver.n_edge_pairs,
+                rod_rigid_links=solver._sim.rigid_solver.n_links,
             ),
             values=dict(
                 rod_info=dict(
