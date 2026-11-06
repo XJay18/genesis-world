@@ -1496,7 +1496,10 @@ class LegacyCoupler(RBC):
         changing its velocity, within what Coulomb's bound leaves of the normal corrections of the contact, impulse and
         move out of the geoms together; beyond it the contact slides, and sticks next to where its point is left. The
         bound of the inverse mass of a link held by its joints overestimates how far it moves, so that the impulses
-        leave some slip, which would otherwise accumulate into a creep of the rod out of a grip.
+        leave some slip, which would otherwise accumulate into a creep of the rod out of a grip. A contact slips and
+        sticks where its impulse acts, at its point, or at the vertex for a squeezed vertex, which takes the impulses
+        of its contacts alone: corrections of the vertex for the motion of the other vertex of an edge would fight the
+        rod at every substep. An anchor taken at another parameter moves with the point, keeping the slip since.
         """
         for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
             rod_state.verts.dp_rigid_friction[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
@@ -1514,6 +1517,8 @@ class LegacyCoupler(RBC):
                 coupling = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, ROD_RIGID_CONTACTS_PER_VERT)
                 inv_masses = qd.Vector.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT)
                 target = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, 3)
+                anchors = qd.Matrix.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT, 3)
+                anchors_t = qd.Vector.zero(gs.qd_float, ROD_RIGID_CONTACTS_PER_VERT)
                 for i_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
                     if i_c < n_contacts:
                         for j_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
@@ -1529,7 +1534,24 @@ class LegacyCoupler(RBC):
                         verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
                         i_v_s, i_v_e = verts_idx[0], verts_idx[1]
                         anchor_t = rod_state.rigid_contacts.anchor_t[i_v, i_c, i_b]
+                        anchor = rod_state.rigid_contacts.anchor[i_v, i_c, i_b]
                         normal = rod_state.rigid_contacts.normal[i_v, i_c, i_b]
+                        i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
+                        i_l = geoms_info.link_idx[i_g]
+                        # A contact slips and sticks where its impulse acts: at its point, or at the vertex for a
+                        # squeezed vertex, which takes the impulses of its contacts alone as if their points were at
+                        # the vertex (see 'func_rod_rigid_contact_response'), the slip of a point along the edge,
+                        # which the other vertex moves too, being out of its reach
+                        anchor_t_vert = qd.select(i_v == i_v_s, 0.0, 1.0)
+                        anchor_t_new = qd.select(is_squeezed, anchor_t_vert, rod_state.rigid_contacts.t[i_v, i_c, i_b])
+                        is_rebased = anchor_t != anchor_t_new
+                        # The point of the anchor at the start of the substep, moved with the geom
+                        point_prev = (1.0 - anchor_t) * rod_state.verts.pos_prev[i_v_s, i_b]
+                        point_prev = point_prev + anchor_t * rod_state.verts.pos_prev[i_v_e, i_b]
+                        point_stuck = (
+                            point_prev + self.rigid_solver._func_vel_at_point(i_l, i_b, point_prev, links_state) * dt
+                        )
+                        anchor_t = anchor_t_new
                         pos = (1.0 - anchor_t) * (
                             rod_state.verts.pos[i_v_s, i_b] + rod_state.verts.dp_rigid_normal[i_v_s, i_b]
                         )
@@ -1538,11 +1560,16 @@ class LegacyCoupler(RBC):
                         )
                         pos_prev = (1.0 - anchor_t) * rod_state.verts.pos_prev[i_v_s, i_b]
                         pos_prev = pos_prev + anchor_t * rod_state.verts.pos_prev[i_v_e, i_b]
-                        i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
-                        i_l = geoms_info.link_idx[i_g]
                         pos_stuck = (
                             pos_prev + self.rigid_solver._func_vel_at_point(i_l, i_b, pos_prev, links_state) * dt
                         )
+                        # An anchor taken at another point of the edge moves with the point, keeping the slip of the
+                        # contact since it stuck
+                        if is_rebased:
+                            anchor = anchor + pos_stuck - point_stuck
+                        anchors_t[i_c] = anchor_t
+                        for k in qd.static(range(3)):
+                            anchors[i_c, k] = anchor[k]
                         slip = pos - pos_stuck
                         slip = slip - slip.dot(normal) * normal
                         for k in qd.static(range(3)):
@@ -1588,7 +1615,7 @@ class LegacyCoupler(RBC):
                     if i_c < n_contacts:
                         verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
                         i_v_s, i_v_e = verts_idx[0], verts_idx[1]
-                        anchor_t = rod_state.rigid_contacts.anchor_t[i_v, i_c, i_b]
+                        anchor_t = anchors_t[i_c]
                         pos = (1.0 - anchor_t) * (
                             rod_state.verts.pos[i_v_s, i_b]
                             + rod_state.verts.dp_rigid_normal[i_v_s, i_b]
@@ -1600,7 +1627,7 @@ class LegacyCoupler(RBC):
                             + rod_state.verts.dp_rigid_overlap[i_v_e, i_b]
                         )
                         # The slip left by the friction impulses, as they moved the point
-                        drift = pos - rod_state.rigid_contacts.anchor[i_v, i_c, i_b]
+                        drift = pos - qd.Vector([anchors[i_c, 0], anchors[i_c, 1], anchors[i_c, 2]])
                         for j_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
                             if j_c < n_contacts:
                                 drift = drift + coupling[i_c, j_c] * qd.Vector(
@@ -1650,8 +1677,8 @@ class LegacyCoupler(RBC):
                         verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
                         i_v_s, i_v_e = verts_idx[0], verts_idx[1]
                         t = rod_state.rigid_contacts.t[i_v, i_c, i_b]
-                        anchor_t = rod_state.rigid_contacts.anchor_t[i_v, i_c, i_b]
-                        anchor = rod_state.rigid_contacts.anchor[i_v, i_c, i_b]
+                        anchor_t = anchors_t[i_c]
+                        anchor = qd.Vector([anchors[i_c, 0], anchors[i_c, 1], anchors[i_c, 2]])
                         normal = rod_state.rigid_contacts.normal[i_v, i_c, i_b]
                         impulse_normal = rod_state.rigid_contacts.impulse_normal[i_v, i_c, i_b]
                         impulse_friction = qd.Vector([impulses[i_c, 0], impulses[i_c, 1], impulses[i_c, 2]])
@@ -1661,7 +1688,6 @@ class LegacyCoupler(RBC):
                         )
                         if is_sliding[i_c] == 1:
                             # The point where the contact leaves it, at the parameter of its anchor
-                            anchor_t = t
                             anchor = anchor + qd.Vector([drifts_full[i_c, 0], drifts_full[i_c, 1], drifts_full[i_c, 2]])
                             for j_c in qd.static(range(ROD_RIGID_CONTACTS_PER_VERT)):
                                 if j_c < n_contacts:
