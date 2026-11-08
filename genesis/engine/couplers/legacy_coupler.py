@@ -1621,7 +1621,7 @@ class LegacyCoupler(RBC):
                         # which the other vertex moves too, being out of its reach
                         anchor_t_vert = qd.select(i_v == i_v_s, 0.0, 1.0)
                         anchor_t_new = qd.select(is_squeezed, anchor_t_vert, rod_state.rigid_contacts.t[i_v, i_c, i_b])
-                        is_rebased = anchor_t != anchor_t_new
+                        is_rebased = qd.abs(anchor_t - anchor_t_new) > rod_info.EPS[None]
                         # The point of the anchor at the start of the substep, moved with the geom
                         point_prev = (1.0 - anchor_t) * rod_state.verts.pos_prev[i_v_s, i_b]
                         point_prev = point_prev + anchor_t * rod_state.verts.pos_prev[i_v_e, i_b]
