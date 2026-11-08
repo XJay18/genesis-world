@@ -10,6 +10,7 @@ import genesis.utils.sdf as sdf
 from genesis.options.solvers import LegacyCouplerOptions
 from genesis.repr_base import RBC
 from genesis.utils.array_class import (
+    ROD_RUN_LEN,
     GeomsInfo,
     GeomsState,
     LinksInfo,
@@ -357,7 +358,15 @@ class LegacyCoupler(RBC):
             RodData.rod_state.rigid_anchors,
         ):
             opt_in(field_ref, cond=lambda: self.rigid_couplings[4])
-        for field_ref in (RodData.rod_state.verts.dv_mpm, RodData.rod_state.aabb_min, RodData.rod_state.aabb_max):
+        for field_ref in (
+            RodData.rod_state.verts.dv_mpm,
+            RodData.rod_state.aabb_min,
+            RodData.rod_state.aabb_max,
+            RodData.rod_state.verts_runs_min,
+            RodData.rod_state.verts_runs_max,
+            RodData.rod_state.edges_runs_min,
+            RodData.rod_state.edges_runs_max,
+        ):
             opt_in(field_ref, cond=lambda: self.has_rod_mpm_coupling)
 
     @property
@@ -669,46 +678,68 @@ class LegacyCoupler(RBC):
         # The bounding box of the rods spares the nodes far from every rod (see 'rod_mpm_prepare')
         is_near = ((pos - rod_state.aabb_min[i_b]).min() >= 0.0) * ((rod_state.aabb_max[i_b] - pos).min() >= 0.0)
         if is_near:
-            for i_v in range(rod_state.verts.pos.shape[0]):
-                dist_vec = pos - rod_state.verts.pos[i_v, i_b]
-                dist = dist_vec.norm()
-                if dist < dx + rod_info.verts.radius[i_v]:
-                    if dist > rod_info.EPS[None]:
-                        normal = dist_vec / dist
-                        vel_normal = (vel - rod_state.verts.vel[i_v, i_b]).dot(normal)
-                        if vel_normal < 0.0:
-                            inv_mass_rod = func_inverse_mass(i_v, i_b, rod_state, rod_info)
-                            mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
-                            # The impulse is written without the inverse mass of the node, whose derivative cancels out
-                            # analytically but not in floating point for the nodes of a tiny mass
-                            impulse_scale = (
-                                -(1.0 + rod_info.verts.restitution[i_v]) * vel_normal / (1.0 + inv_mass_rod * mass)
-                            )
-                            vel = vel + impulse_scale * normal
-                            rod_state.verts.dv_mpm[i_v, i_b] -= impulse_scale * mass * inv_mass_rod * normal
+            # The elements are visited in their index order, those of a run out of reach being skipped: the node meets
+            # the rod elements one after the other, each from the velocity the previous ones left
+            for i_run in range(rod_state.verts_runs_min.shape[0]):
+                if ((pos - rod_state.verts_runs_min[i_run, i_b]).min() >= 0.0) * (
+                    (rod_state.verts_runs_max[i_run, i_b] - pos).min() >= 0.0
+                ):
+                    i_v_start = i_run * ROD_RUN_LEN
+                    for i_v in range(i_v_start, qd.min(i_v_start + ROD_RUN_LEN, rod_state.verts.pos.shape[0])):
+                        dist_vec = pos - rod_state.verts.pos[i_v, i_b]
+                        dist = dist_vec.norm()
+                        if dist < dx + rod_info.verts.radius[i_v]:
+                            if dist > rod_info.EPS[None]:
+                                normal = dist_vec / dist
+                                vel_normal = (vel - rod_state.verts.vel[i_v, i_b]).dot(normal)
+                                if vel_normal < 0.0:
+                                    inv_mass_rod = func_inverse_mass(i_v, i_b, rod_state, rod_info)
+                                    mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
+                                    # The impulse is written without the inverse mass of the node, whose derivative
+                                    # cancels out analytically but not in floating point for the nodes of a tiny mass
+                                    impulse_scale = (
+                                        -(1.0 + rod_info.verts.restitution[i_v])
+                                        * vel_normal
+                                        / (1.0 + inv_mass_rod * mass)
+                                    )
+                                    vel = vel + impulse_scale * normal
+                                    rod_state.verts.dv_mpm[i_v, i_b] -= impulse_scale * mass * inv_mass_rod * normal
 
-            for i_e in range(rod_info.edges.verts_idx.shape[0]):
-                i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
-                pos_s, pos_e = rod_state.verts.pos[i_v_s, i_b], rod_state.verts.pos[i_v_e, i_b]
-                edge = pos_e - pos_s
-                t = qd.math.clamp((pos - pos_s).dot(edge) / qd.max(edge.dot(edge), rod_info.EPS[None]), 0.0, 1.0)
-                dist_vec = pos - (pos_s + t * edge)
-                dist = dist_vec.norm()
-                if dist < dx + 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e]):
-                    if dist > rod_info.EPS[None]:
-                        normal = dist_vec / dist
-                        vel_rod = (1.0 - t) * rod_state.verts.vel[i_v_s, i_b] + t * rod_state.verts.vel[i_v_e, i_b]
-                        vel_normal = (vel - vel_rod).dot(normal)
-                        if vel_normal < 0.0:
-                            inv_mass_s = func_inverse_mass(i_v_s, i_b, rod_state, rod_info)
-                            inv_mass_e = func_inverse_mass(i_v_e, i_b, rod_state, rod_info)
-                            restitution = 0.5 * (rod_info.verts.restitution[i_v_s] + rod_info.verts.restitution[i_v_e])
-                            inv_mass_rod = 0.5 * (inv_mass_s + inv_mass_e)
-                            mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
-                            impulse_scale = -(1.0 + restitution) * vel_normal / (1.0 + inv_mass_rod * mass)
-                            vel = vel + impulse_scale * normal
-                            rod_state.verts.dv_mpm[i_v_s, i_b] -= impulse_scale * mass * (1.0 - t) * inv_mass_s * normal
-                            rod_state.verts.dv_mpm[i_v_e, i_b] -= impulse_scale * mass * t * inv_mass_e * normal
+            for i_run in range(rod_state.edges_runs_min.shape[0]):
+                if ((pos - rod_state.edges_runs_min[i_run, i_b]).min() >= 0.0) * (
+                    (rod_state.edges_runs_max[i_run, i_b] - pos).min() >= 0.0
+                ):
+                    i_e_start = i_run * ROD_RUN_LEN
+                    for i_e in range(i_e_start, qd.min(i_e_start + ROD_RUN_LEN, rod_info.edges.verts_idx.shape[0])):
+                        i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
+                        pos_s, pos_e = rod_state.verts.pos[i_v_s, i_b], rod_state.verts.pos[i_v_e, i_b]
+                        edge = pos_e - pos_s
+                        t = qd.math.clamp(
+                            (pos - pos_s).dot(edge) / qd.max(edge.dot(edge), rod_info.EPS[None]), 0.0, 1.0
+                        )
+                        dist_vec = pos - (pos_s + t * edge)
+                        dist = dist_vec.norm()
+                        if dist < dx + 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e]):
+                            if dist > rod_info.EPS[None]:
+                                normal = dist_vec / dist
+                                vel_rod = (
+                                    (1.0 - t) * rod_state.verts.vel[i_v_s, i_b] + t * rod_state.verts.vel[i_v_e, i_b]
+                                )
+                                vel_normal = (vel - vel_rod).dot(normal)
+                                if vel_normal < 0.0:
+                                    inv_mass_s = func_inverse_mass(i_v_s, i_b, rod_state, rod_info)
+                                    inv_mass_e = func_inverse_mass(i_v_e, i_b, rod_state, rod_info)
+                                    restitution = 0.5 * (
+                                        rod_info.verts.restitution[i_v_s] + rod_info.verts.restitution[i_v_e]
+                                    )
+                                    inv_mass_rod = 0.5 * (inv_mass_s + inv_mass_e)
+                                    mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
+                                    impulse_scale = -(1.0 + restitution) * vel_normal / (1.0 + inv_mass_rod * mass)
+                                    vel = vel + impulse_scale * normal
+                                    rod_state.verts.dv_mpm[i_v_s, i_b] -= (
+                                        impulse_scale * mass * (1.0 - t) * inv_mass_s * normal
+                                    )
+                                    rod_state.verts.dv_mpm[i_v_e, i_b] -= impulse_scale * mass * t * inv_mass_e * normal
         return vel
 
     @qd.kernel
@@ -716,14 +747,41 @@ class LegacyCoupler(RBC):
         """Clear the change of velocity the MPM grid nodes impart to the rods, and compute the bounding box of the rods in
         each environment, grown by the reach of their collisions with the nodes, the radius of a vertex plus the grid
         spacing."""
+        for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
+            rod_state.verts.dv_mpm[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+
+        # The boxes are grown in place in the fields rather than carried in locals, which would take an autodiff stack
+        for i_run, i_b in qd.ndrange(rod_state.verts_runs_min.shape[0], rod_state.verts_runs_min.shape[1]):
+            rod_state.verts_runs_min[i_run, i_b] = qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
+            rod_state.verts_runs_max[i_run, i_b] = -qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
+            i_v_start = i_run * ROD_RUN_LEN
+            for i_v in range(i_v_start, qd.min(i_v_start + ROD_RUN_LEN, rod_state.verts.pos.shape[0])):
+                reach = rod_info.verts.radius[i_v] + self.mpm_solver.dx
+                pos = rod_state.verts.pos[i_v, i_b]
+                rod_state.verts_runs_min[i_run, i_b] = qd.min(rod_state.verts_runs_min[i_run, i_b], pos - reach)
+                rod_state.verts_runs_max[i_run, i_b] = qd.max(rod_state.verts_runs_max[i_run, i_b], pos + reach)
+
+        for i_run, i_b in qd.ndrange(rod_state.edges_runs_min.shape[0], rod_state.edges_runs_min.shape[1]):
+            rod_state.edges_runs_min[i_run, i_b] = qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
+            rod_state.edges_runs_max[i_run, i_b] = -qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
+            i_e_start = i_run * ROD_RUN_LEN
+            for i_e in range(i_e_start, qd.min(i_e_start + ROD_RUN_LEN, rod_info.edges.verts_idx.shape[0])):
+                i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
+                pos_s, pos_e = rod_state.verts.pos[i_v_s, i_b], rod_state.verts.pos[i_v_e, i_b]
+                reach = 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e]) + self.mpm_solver.dx
+                rod_state.edges_runs_min[i_run, i_b] = qd.min(
+                    rod_state.edges_runs_min[i_run, i_b], qd.min(pos_s, pos_e) - reach
+                )
+                rod_state.edges_runs_max[i_run, i_b] = qd.max(
+                    rod_state.edges_runs_max[i_run, i_b], qd.max(pos_s, pos_e) + reach
+                )
+
         for i_b in range(rod_state.aabb_min.shape[0]):
             rod_state.aabb_min[i_b] = qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
             rod_state.aabb_max[i_b] = -qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
-        for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
-            rod_state.verts.dv_mpm[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
-            reach = rod_info.verts.radius[i_v] + self.mpm_solver.dx
-            qd.atomic_min(rod_state.aabb_min[i_b], rod_state.verts.pos[i_v, i_b] - reach)
-            qd.atomic_max(rod_state.aabb_max[i_b], rod_state.verts.pos[i_v, i_b] + reach)
+            for i_run in range(rod_state.verts_runs_min.shape[0]):
+                rod_state.aabb_min[i_b] = qd.min(rod_state.aabb_min[i_b], rod_state.verts_runs_min[i_run, i_b])
+                rod_state.aabb_max[i_b] = qd.max(rod_state.aabb_max[i_b], rod_state.verts_runs_max[i_run, i_b])
 
     @qd.kernel
     def rod_apply_mpm_dv(self, rod_state: RodState):

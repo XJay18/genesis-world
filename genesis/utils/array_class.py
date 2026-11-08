@@ -1644,6 +1644,11 @@ ROD_HINGES = Size("rod_hinges")
 # the edges in heap order, the first being unused
 ROD_EDGE_PAIRS = Size("rod_edge_pairs")
 ROD_BVH_NODES = Size("rod_bvh_nodes")
+# The runs of consecutive vertices and edges of the rods, of length ROD_RUN_LEN but the last, whose bounding boxes bound
+# the elements an MPM grid node can collide with
+ROD_VERT_RUNS = Size("rod_vert_runs")
+ROD_EDGE_RUNS = Size("rod_edge_runs")
+ROD_RUN_LEN = 16
 # The rigid links, of which the rods count their contacts
 ROD_RIGID_LINKS = Size("rod_rigid_links")
 
@@ -1924,6 +1929,12 @@ class RodState(Data):
     # collide with them
     aabb_min: qd.Tensor = field((float, 3), shape=(ENVS,), kind=DataKind.SCRATCH, opt_in=True)
     aabb_max: qd.Tensor = field((float, 3), shape=(ENVS,), kind=DataKind.SCRATCH, opt_in=True)
+    # The bounding boxes of runs of vertices and of edges in each environment, grown like the bounding box above, which
+    # bound the rod elements an MPM grid node can collide with (see 'LegacyCoupler._func_mpm_collide_with_rods')
+    verts_runs_min: qd.Tensor = field((float, 3), shape=(ROD_VERT_RUNS, ENVS), kind=DataKind.SCRATCH, opt_in=True)
+    verts_runs_max: qd.Tensor = field((float, 3), shape=(ROD_VERT_RUNS, ENVS), kind=DataKind.SCRATCH, opt_in=True)
+    edges_runs_min: qd.Tensor = field((float, 3), shape=(ROD_EDGE_RUNS, ENVS), kind=DataKind.SCRATCH, opt_in=True)
+    edges_runs_max: qd.Tensor = field((float, 3), shape=(ROD_EDGE_RUNS, ENVS), kind=DataKind.SCRATCH, opt_in=True)
 
 
 class RodData(Data):
@@ -1944,6 +1955,8 @@ class RodData(Data):
                 rod_hinges=solver.n_hinges,
                 rod_edge_pairs=solver.n_edge_pair_candidates,
                 rod_bvh_nodes=2 * solver.n_bvh_leaves,
+                rod_vert_runs=(solver.n_verts + ROD_RUN_LEN - 1) // ROD_RUN_LEN,
+                rod_edge_runs=(solver.n_edges + ROD_RUN_LEN - 1) // ROD_RUN_LEN,
                 rod_rigid_links=solver._sim.rigid_solver.n_links,
             ),
             values=dict(
