@@ -75,6 +75,15 @@ def test_morphs_fall_freely_at_rest_shape(asset_tmp_path, show_viewer):
     assert [rod.is_loop for rod in rods] == [False, True, False, False]
     rods_topology = [(16, 15, 14), (16, 16, 16), (16, 15, 14), (16, 15, 14)]
     assert [(rod.n_verts, rod.n_edges, rod.n_hinges) for rod in rods] == rods_topology
+    # The pairs of edges within two edges along a rod, or around a loop, do not collide
+    edges_rod = np.repeat(np.arange(len(rods)), [rod.n_edges for rod in rods])
+    edges_local = np.concatenate([np.arange(rod.n_edges) for rod in rods])
+    i_a, i_b = np.triu_indices(len(edges_rod), k=1)
+    gap = edges_local[i_b] - edges_local[i_a]
+    is_loop = np.array([rod.is_loop for rod in rods])[edges_rod[i_a]]
+    n_verts_rod = np.array([rod.n_verts for rod in rods])[edges_rod[i_a]]
+    gap = np.where(is_loop, np.minimum(gap, n_verts_rod - gap), gap)
+    assert scene.rod_solver.n_edge_pairs == np.count_nonzero((edges_rod[i_a] != edges_rod[i_b]) | (gap >= 3))
     pos_init = [rod.get_state().pos for rod in rods]
     for rod in rods:
         assert_allclose(rod.get_energy(), 0.0, tol=gs.EPS)
@@ -359,7 +368,8 @@ def test_vertex_constraints_reset_with_state(show_viewer):
 
 
 @pytest.mark.required
-def test_rod_contacts_match_reference(show_viewer):
+@pytest.mark.parametrize("contact_margin", [None, 1e-6])
+def test_rod_contacts_match_reference(contact_margin, show_viewer):
     # FIXME: the reference trajectory is a recorded GPU run of this scene. Replace with physics-informed assertions on
     # the contacts between the rods.
     ref = np.load(os.path.join(os.path.dirname(__file__), "data", "s1_hanging_gpu_200steps.npz"))
@@ -371,6 +381,7 @@ def test_rod_contacts_match_reference(show_viewer):
         rod_options=gs.options.RodOptions(
             damping=10.0,
             angular_damping=5.0,
+            contact_margin=contact_margin,
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(0.8, -0.5, 0.8),
@@ -418,6 +429,44 @@ def test_rod_contacts_match_reference(show_viewer):
             scene.step()
         pos.append(torch.cat([rod.get_state().pos for rod in rods], dim=1))
     assert_allclose(torch.stack(pos), ref["pos"], atol=1e-3)
+
+
+@pytest.mark.required
+def test_rod_contact_candidates_overflow_is_reported(asset_tmp_path, show_viewer):
+    # A coil holding far more pairs of edges in contact than the capacity of the broadphase set by the multiplier
+    radius = 0.005
+    angle = np.linspace(0.0, 6.0 * np.pi, 60)
+    coil = np.stack([0.03 * np.cos(angle), 0.03 * np.sin(angle), 0.9 * radius * angle / np.pi], axis=-1)
+    file = str(asset_tmp_path / "rod_coil.npy")
+    np.save(file, coil)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=1,
+        ),
+        rod_options=gs.options.RodOptions(
+            multiplier_contact_candidates=1,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.3, 0.3),
+            camera_lookat=(0.0, 0.0, 0.05),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Rod(
+            file=file,
+            pos=(0.0, 0.0, 0.05),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=radius,
+        ),
+    )
+    scene.build()
+    # A step raises the errors of the last ones, one call later on the devices not blocking on their flags
+    with pytest.raises(gs.GenesisException, match="multiplier_contact_candidates"):
+        for _ in range(3):
+            scene.step()
 
 
 @pytest.mark.required

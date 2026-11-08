@@ -24,6 +24,7 @@ class ErrorCode(IntEnum):
     INVALID_GRAD_NAN = 0b00000000000000000000000010000000
     INVALID_VELOCITY_NAN = 0b00000000000000000000000100000000
     INVALID_VERTEX_NAN = 0b00000000000000000000001000000000
+    OVERFLOW_ROD_CANDIDATES = 0b00000000000000000000010000000000
 
 
 # =========================================== RigidInfo ===========================================
@@ -1639,17 +1640,27 @@ RODS = Size("rods")
 ROD_VERTS = Size("rod_verts")
 ROD_EDGES = Size("rod_edges")
 ROD_HINGES = Size("rod_hinges")
+# The capacity of the candidate pairs of edges of the broadphase, per environment, and the nodes of its hierarchy over
+# the edges in heap order, the first being unused
 ROD_EDGE_PAIRS = Size("rod_edge_pairs")
+ROD_BVH_NODES = Size("rod_bvh_nodes")
 # The rigid links, of which the rods count their contacts
 ROD_RIGID_LINKS = Size("rod_rigid_links")
 
 # The arrays of the rod-rod contacts, which a scene without any pair of edges to test never reads
 ROD_CONTACTS = "rod_contacts"
+# The arrays of the broadphase of the rod-rod contacts, which a scene whose possible pairs all fit the capacity never
+# reads (see 'RodSolver.has_broadphase'), and the list of those pairs, which any other scene never reads
+ROD_BROADPHASE = "rod_broadphase"
+ROD_ALL_PAIRS = "rod_all_pairs"
 
 
 class RodsInfo(Data, kind=DataKind.INFO, shape=(RODS,)):
-    """The material of each rod: inextensibility, bending plasticity and twist inertia."""
+    """The material of each rod: inextensibility, bending plasticity and twist inertia, and its edge count and closure,
+    from which the broadphase reads the gap between two edges of the rod."""
 
+    n_edges: qd.Tensor = field(int, kind=DataKind.CONSTANT)
+    is_loop: qd.Tensor = field(bool, kind=DataKind.CONSTANT)
     is_inextensible: qd.Tensor = field(bool)
     plastic_yield: qd.Tensor = field(float)
     plastic_creep: qd.Tensor = field(float)
@@ -1699,10 +1710,19 @@ class RodInfo(Data):
     verts: RodVertsInfo
     edges: RodEdgesInfo
     hinges: RodHingesInfo
-    # The pairs of edges tested for rod-rod contact, the adjacent edges of a rod left out
-    edge_pairs_idx: qd.Tensor = field((int, 2), shape=(ROD_EDGE_PAIRS,), kind=DataKind.CONSTANT, labels=ROD_CONTACTS)
+    # The pairs of edges tested for rod-rod contact when they all fit the capacity of the broadphase, the adjacent edges
+    # of a rod left out
+    edge_pairs_idx: qd.Tensor = field((int, 2), shape=(ROD_EDGE_PAIRS,), kind=DataKind.CONSTANT, labels=ROD_ALL_PAIRS)
     gravity: qd.Tensor = field((float, 3), shape=(ENVS,), kind=DataKind.INFO)
     substep_dt: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
+    # The edges of a rod closer than this many edges do not collide (see 'RodOptions.adjacent_gap'), and the margin of
+    # the broadphase, how far the vertices of an environment may move over the projections of a substep before the
+    # pairs outside of the candidates are tested (see 'kernel_project_rod_contacts')
+    adjacent_gap: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
+    contact_margin: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
+    # The number of leaves of the hierarchy of the broadphase, a power of two, and its depth
+    n_bvh_leaves: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
+    bvh_depth: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
     damping: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
     angular_damping: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
     EPS: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
@@ -1730,6 +1750,9 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
 
     pos: qd.Tensor = field((float, 3), grad=True)
     vel: qd.Tensor = field((float, 3), grad=True)
+    # The position of the vertex when the broadphase ran, compared with the projections of the substep against its
+    # margin (see 'kernel_project_rod_contacts')
+    pos_broadphase: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, labels=ROD_BROADPHASE)
     # A fixed vertex keeps its position and velocity, and its inverse mass is zero in every projection
     is_fixed: qd.Tensor = field(bool)
     # A constrained vertex is placed at its target at the end of every substep with zero velocity. The target is given
@@ -1799,11 +1822,37 @@ class RodHingesState(Data, kind=DataKind.STATE, shape=(ROD_HINGES, ENVS)):
 
 
 class RodEdgePairsState(Data, kind=DataKind.SCRATCH, shape=(ROD_EDGE_PAIRS, ENVS)):
-    """The contact normal and penetration of each pair of edges at the first projection of the substep, from which the
-    friction of the substep follows."""
+    """The candidate pairs of edges of the broadphase in each environment, and the contact normal and penetration of
+    each candidate at the first projection of the substep, from which the friction of the substep follows.
 
+    The broadphase (see 'kernel_update_rod_contact_candidates') writes the candidates once per substep, the slots of an
+    environment sorted by increasing first edge, then by increasing second edge.
+    """
+
+    # The first and the second edge of the candidate, by increasing index
+    edges_idx: qd.Tensor = field((int, 2), labels=ROD_BROADPHASE)
     normal: qd.Tensor = field((float, 3), grad=True, labels=ROD_CONTACTS)
     penetration: qd.Tensor = field(float, grad=True, labels=ROD_CONTACTS)
+
+
+class RodBroadphase(Data, kind=DataKind.SCRATCH):
+    """The hierarchy of bounding boxes of the edges of the rods in each environment and the candidate counts its queries
+    find, rebuilt once per substep (see 'kernel_update_rod_contact_candidates').
+
+    The hierarchy is a perfect binary tree over the edges in their index order, consecutive edges of a rod being close
+    in space, so that it needs no sort: the children of node i are the nodes 2 * i and 2 * i + 1 and the leaf of edge
+    i_e is node n_leaves + i_e, the leaves past the last edge being empty boxes.
+    """
+
+    nodes_min: qd.Tensor = field((float, 3), shape=(ROD_BVH_NODES, ENVS), labels=ROD_BROADPHASE)
+    nodes_max: qd.Tensor = field((float, 3), shape=(ROD_BVH_NODES, ENVS), labels=ROD_BROADPHASE)
+    # The candidate count of each edge, the pairs it starts, and the slot of its first candidate
+    edges_n_candidates: qd.Tensor = field(int, shape=(ROD_EDGES, ENVS), labels=ROD_BROADPHASE)
+    edges_candidates_start: qd.Tensor = field(int, shape=(ROD_EDGES, ENVS), labels=ROD_BROADPHASE)
+    # The number of candidates in each environment, which may exceed the capacity (see OVERFLOW_ROD_CANDIDATES)
+    n_candidates: qd.Tensor = field(int, shape=(ENVS,), labels=ROD_BROADPHASE)
+    # Whether a vertex of the environment moved further than half of the margin since the broadphase ran
+    is_stale: qd.Tensor = field(bool, shape=(ENVS,), labels=ROD_BROADPHASE)
 
 
 # The most contacts with the rigid geoms a vertex of the rods owns (see 'RodRigidContacts')
@@ -1868,6 +1917,7 @@ class RodState(Data):
     edges: RodEdgesState
     hinges: RodHingesState
     edge_pairs: RodEdgePairsState
+    broadphase: RodBroadphase
     rigid_contacts: RodRigidContacts = field(opt_in=True)
     rigid_anchors: RodRigidAnchors = field(opt_in=True)
     # The bounding box of the vertices of all the rods in each environment, which bounds the MPM grid nodes that can
@@ -1892,7 +1942,8 @@ class RodData(Data):
                 rod_verts=solver.n_verts,
                 rod_edges=solver.n_edges,
                 rod_hinges=solver.n_hinges,
-                rod_edge_pairs=solver.n_edge_pairs,
+                rod_edge_pairs=solver.n_edge_pair_candidates,
+                rod_bvh_nodes=2 * solver.n_bvh_leaves,
                 rod_rigid_links=solver._sim.rigid_solver.n_links,
             ),
             values=dict(
@@ -1901,9 +1952,17 @@ class RodData(Data):
                     damping=options.damping,
                     angular_damping=options.angular_damping,
                     EPS=gs.EPS,
+                    adjacent_gap=options.adjacent_gap,
+                    contact_margin=solver.contact_margin,
+                    n_bvh_leaves=solver.n_bvh_leaves,
+                    bvh_depth=solver.bvh_depth,
                 )
             ),
-            unused={ROD_CONTACTS: solver.n_edge_pairs == 0},
+            unused={
+                ROD_CONTACTS: solver.n_edge_pairs == 0,
+                ROD_BROADPHASE: not solver.has_broadphase,
+                ROD_ALL_PAIRS: solver.has_broadphase or solver.n_edge_pairs == 0,
+            },
             requires_grad=solver._requires_grad,
         )
 

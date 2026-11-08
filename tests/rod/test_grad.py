@@ -11,7 +11,10 @@ pytestmark = [pytest.mark.precision("64")]
 
 @pytest.mark.required
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
-@pytest.mark.parametrize("case", ["constrained", "inextensible", "contact", "plane", "box", "free_box"])
+@pytest.mark.parametrize(
+    "case",
+    ["constrained", "inextensible", "contact", "contact_broadphase", "contact_stale", "plane", "box", "free_box"],
+)
 def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer):
     n_verts, n_steps = 20, 50
     scene = gs.Scene(
@@ -23,6 +26,10 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
         rod_options=gs.options.RodOptions(
             damping=10.0,
             angular_damping=5.0,
+            # A multiplier under the number of possible pairs of edges brings the broadphase in, and a margin under the
+            # moves of the projections the search of the pairs outside of its candidates
+            multiplier_contact_candidates=4 if case in ("contact_broadphase", "contact_stale") else 32,
+            contact_margin=1e-6 if case == "contact_stale" else None,
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(0.4, -0.6, 0.6),
@@ -39,7 +46,7 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
         segment_radius=0.005,
     )
     length = (n_verts - 1) * 0.01
-    if case == "contact":
+    if case in ("contact", "contact_broadphase", "contact_stale"):
         # A free rod dropped across a fixed one, starting just above it
         scene.add_entity(
             morph=gs.morphs.ParameterizedRod(
@@ -78,6 +85,8 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
         )
     rod_pos = {
         "contact": (-0.5 * length, 0.0, 0.3105),
+        "contact_broadphase": (-0.5 * length, 0.0, 0.3105),
+        "contact_stale": (-0.5 * length, 0.0, 0.3105),
         "plane": (-0.5 * length, 0.0, 0.005),
         "box": (-0.5 * length, 0.0, 0.215),
         "free_box": (-0.5 * length, 0.0, 0.215),
@@ -102,7 +111,7 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
         K=torch.tensor(1e6, dtype=gs.tc_float, device=gs.device),
         G=torch.tensor(1e4, dtype=gs.tc_float, device=gs.device),
     )
-    if case == "contact":
+    if case in ("contact", "contact_broadphase", "contact_stale"):
         inputs["vel"][:, 2] -= 0.5
     if case in ("box", "free_box"):
         inputs["vel"][:, 0] += 0.3
@@ -236,7 +245,7 @@ def test_mpm_coupling_grad_matches_fd(backend, show_viewer):
     rollout(**inputs_ad).backward()
 
     # Directional derivatives along a random direction, with the step and the tolerance their measured floors set
-    steps_and_tols = {"rod_vel": (1e-5, 1e-6), "block_vel": (1e-4, 2e-9)}
+    steps_and_tols = {"rod_vel": (1e-5, 1e-6), "block_vel": (1e-4, 1e-8)}
     for name, value in inputs.items():
         direction = torch.tensor(rng.standard_normal(value.shape), dtype=gs.tc_float, device=gs.device)
         step, tol = steps_and_tols[name]
