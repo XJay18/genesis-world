@@ -616,19 +616,95 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
             segment_radius=0.005,
         ),
     )
+    # A second rod dropped onto the block lands without rebounding, restitution being zero
+    rod_landing = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=15,
+            interval=0.005,
+            pos=(-0.035, 0.06, 0.15),
+        ),
+        material=gs.materials.Rod.Base(
+            E=1e5,
+            G=1e4,
+            segment_radius=0.005,
+        ),
+    )
     scene.build(n_envs=2)
 
-    for _ in range(100):
+    heights_landing = []
+    for _ in range(150):
         scene.step()
         block_top = block.get_particles_pos()[..., 2].max(dim=-1).values
         rod_bottom = rod.get_state().pos[..., 2].min(dim=-1).values
+        heights_landing.append(rod_landing.get_state().pos[..., 2].mean(dim=-1))
         # The coupled rod rests on the block, while the uncoupled one falls through it
         if rod_mpm:
             assert (rod_bottom > block_top).all()
     if not rod_mpm:
         assert (rod_bottom < block_top - 0.01).all()
+    else:
+        heights_landing = torch.stack(heights_landing)
+        # The rod has landed once its height stops falling, and it does not rise from there
+        i_landing = 110
+        assert (heights_landing[i_landing:] < heights_landing[i_landing - 1] + 5e-4).all()
     # The impulses of the grid nodes on a vertex add up through atomics, whose order varies
     assert_allclose(rod.get_state().pos[0], rod.get_state().pos[1], tol=1e-9)
+
+
+@pytest.mark.required
+def test_rod_mpm_coupling_conserves_momentum(show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.3, -0.3, -0.3),
+            upper_bound=(0.3, 0.3, 0.3),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.4, -0.6, 0.4),
+            camera_lookat=(0.0, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    block = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, -0.05),
+            size=(0.1, 0.1, 0.05),
+        ),
+        material=gs.materials.MPM.Elastic(),
+    )
+    # A rod starting above the block, thrown down at it and pushing it along, the block and the rod being free. Its
+    # edges are longer than its radius, so that it does not touch itself
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=8,
+            interval=0.01,
+            pos=(-0.035, 0.0, 0.0),
+        ),
+        material=gs.materials.Rod.Base(
+            E=1e5,
+            G=1e4,
+            segment_radius=0.005,
+        ),
+    )
+    scene.build(n_envs=1)
+    rod.set_verts_vel(torch.tensor((0.0, 0.0, -1.0), dtype=gs.tc_float, device=gs.device))
+
+    rod_mass = rod.material.segment_mass
+    particle_mass = (block.get_mass() / block.n_particles)[..., None, None]
+    momentum = []
+    for _ in range(30):
+        scene.step()
+        momentum.append(
+            rod_mass * rod.get_state().vel.sum(dim=-2) + (particle_mass * block.get_particles_vel()).sum(dim=-2)
+        )
+    assert_allclose(torch.stack(momentum), momentum[0][None], atol=1e-12)
+    # The rod stays behind the block it pushed, restitution being zero, instead of rebounding off it
+    assert (block.get_particles_vel()[..., 2].mean(dim=-1) < -0.1).all()
+    assert (rod.get_state().vel[..., 2].mean(dim=-1) < 0.0).all()
 
 
 @pytest.mark.required

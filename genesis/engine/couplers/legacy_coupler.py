@@ -653,6 +653,20 @@ class LegacyCoupler(RBC):
         return vel
 
     @qd.func
+    def _func_rod_mpm_node_weight(self, dist: float, reach: float) -> float:
+        """Return the share of a grid node at a given distance from a contact point of the impulses of the nodes within
+        reach of it.
+
+        The share is a smooth kernel vanishing at the reach, whose integral over the grid is one, so that the shares of
+        the nodes around a point sum to about one, whatever their number, and the impulses of the nodes a rod element
+        reaches add up to the impulse of a single contact at the element.
+        """
+        scaled = 1.0 - (dist * dist) / (reach * reach)
+        # The integral of the kernel over the ball of the reach, in units of the volume of a grid cell, is 32 pi / 105
+        # times the cube of the reach over the grid spacing
+        return scaled * scaled / (0.957 * (reach * self.mpm_solver.inv_dx) ** 3)
+
+    @qd.func
     def _func_mpm_collide_with_rods(
         self,
         f: int,
@@ -666,9 +680,10 @@ class LegacyCoupler(RBC):
         """Collide an MPM grid node with the vertices and the edges of the rods within reach, at the velocity level.
 
         A node within the grid spacing of the capsule of a vertex or an edge that approaches it gets an impulse along the
-        line joining them, which cancels their relative normal velocity, scaled by one plus the restitution of the rod.
-        The rod takes the opposite impulse, split between the two vertices of an edge by their weights in the contact
-        point, a fixed or constrained vertex taking none. The node meets the rod elements one after the other, each
+        line joining them, its share of the one that cancels their relative normal velocity scaled by one plus the
+        restitution of the rod: the weight of the node at the contact point (see '_func_rod_mpm_node_weight'). The rod
+        takes the opposite impulse, split between the two vertices of an edge by their weights in the contact point, a
+        fixed or constrained vertex taking none. The node meets the rod elements one after the other, each
         from the velocity the previous ones left. The rod accumulates its change of velocity apart, applied once every
         node computed it (see 'rod_apply_mpm_dv'), so that autodiff reverses the coupling.
         """
@@ -701,7 +716,7 @@ class LegacyCoupler(RBC):
                                         -(1.0 + rod_info.verts.restitution[i_v])
                                         * vel_normal
                                         / (1.0 + inv_mass_rod * mass)
-                                    )
+                                    ) * self._func_rod_mpm_node_weight(dist, dx + rod_info.verts.radius[i_v])
                                     vel = vel + impulse_scale * normal
                                     rod_state.verts.dv_mpm[i_v, i_b] -= impulse_scale * mass * inv_mass_rod * normal
 
@@ -734,7 +749,11 @@ class LegacyCoupler(RBC):
                                     )
                                     inv_mass_rod = 0.5 * (inv_mass_s + inv_mass_e)
                                     mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
-                                    impulse_scale = -(1.0 + restitution) * vel_normal / (1.0 + inv_mass_rod * mass)
+                                    impulse_scale = (
+                                        -(1.0 + restitution) * vel_normal / (1.0 + inv_mass_rod * mass)
+                                    ) * self._func_rod_mpm_node_weight(
+                                        dist, dx + 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e])
+                                    )
                                     vel = vel + impulse_scale * normal
                                     rod_state.verts.dv_mpm[i_v_s, i_b] -= (
                                         impulse_scale * mass * (1.0 - t) * inv_mass_s * normal
