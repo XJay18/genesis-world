@@ -3,8 +3,10 @@ import pytest
 import torch
 
 import genesis as gs
+from genesis.utils.misc import qd_to_numpy
 
 from ..grad.conftest import step_overwrites  # noqa: F401
+from ..utils.assertions import assert_allclose
 
 pytestmark = [pytest.mark.precision("64")]
 
@@ -170,6 +172,98 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
         grad_fd = (loss_plus - loss_minus) / (2.0 * eps)
         grad_ad = (inputs_ad[name].grad * direction).sum()
         assert abs(grad_ad - grad_fd) <= tol * abs(grad_fd), name
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+def test_rod_contact_outside_candidates_grad_matches_fd(backend, show_viewer):
+    n_verts_b, n_verts_a, dent, n_steps = 21, 11, 0.005, 3
+    # Three vertices of the rod B are thrown down so that integrating them dents it, and the inextensibility pulls them
+    # back up into the rod A, which sits beyond the contact distance when the broadphase runs. With a margin this small,
+    # the pair is outside of the candidates and only the fallback finds it. RodOptions are shared by the rods of a
+    # solver, so the reference testing all the pairs of edges takes a second scene.
+    pos_by_config = []
+    for multiplier_contact_candidates, contact_margin in ((100000, None), (4, 1e-6)):
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(
+                dt=1e-3,
+                substeps=1,
+                gravity=(0.0, 0.0, 0.0),
+                requires_grad=True,
+            ),
+            rod_options=gs.options.RodOptions(
+                contact_margin=contact_margin,
+                multiplier_contact_candidates=multiplier_contact_candidates,
+            ),
+            viewer_options=gs.options.ViewerOptions(
+                camera_pos=(0.2, -0.3, 0.2),
+                camera_lookat=(0.0, 0.0, 0.0),
+            ),
+            show_viewer=show_viewer,
+        )
+        rod_b, rod_a = (
+            scene.add_entity(
+                morph=gs.morphs.ParameterizedRod(
+                    n_vertices=n_verts,
+                    interval=0.01,
+                    axis=axis,
+                    pos=pos,
+                ),
+                material=gs.materials.Rod.Base(
+                    E=1e5,
+                    G=1e4,
+                    inextensible=True,
+                    segment_mass=0.002,
+                    segment_radius=radius,
+                ),
+            )
+            for n_verts, axis, pos, radius in (
+                (n_verts_b, "x", (-0.1, 0.0, 0.0), 0.005),
+                (n_verts_a, "y", (0.0, -0.05, -dent + 0.007 + 3e-5), 0.002),
+            )
+        )
+        scene.build()
+
+        vel = torch.zeros((n_verts_b, 3), dtype=gs.tc_float, device=gs.device)
+        vel[n_verts_b // 2 - 1 : n_verts_b // 2 + 2, 2] = -dent / 1e-3
+
+        def rollout(vel):
+            scene.reset()
+            rod_b.set_velocity(vel)
+            for _ in range(n_steps):
+                scene.step()
+            return rod_b.get_state().pos[0]
+
+        with torch.no_grad():
+            scene.reset()
+            rod_b.set_velocity(vel)
+            scene.step()
+        pos_by_config.append(torch.cat([rod_b.get_state().pos[0], rod_a.get_state().pos[0]]))
+    assert_allclose(pos_by_config[1], pos_by_config[0], atol=1e-12)
+
+    # The contact is real and comes from the fallback: the broadphase listed no pair of edges of the two rods, the
+    # environment went past the margin, and the contact moved the rod A up
+    solver = scene.rod_solver
+    assert solver.has_broadphase
+    assert qd_to_numpy(solver.rod_state.broadphase.is_stale)[0]
+    n_edges_b = n_verts_b - 1
+    edges_idx = qd_to_numpy(solver.rod_state.edge_pairs.edges_idx)[:, 0]
+    n_candidates = int(qd_to_numpy(solver.rod_state.broadphase.n_candidates)[0])
+    assert not ((edges_idx[:n_candidates, 0] < n_edges_b) & (edges_idx[:n_candidates, 1] >= n_edges_b)).any()
+    assert (pos_by_config[1][n_verts_b:, 2] - rod_a.init_positions[:, 2]).abs().max() > 1e-5
+
+    rng = np.random.default_rng(0)
+    weights = torch.tensor(rng.standard_normal((n_verts_b, 3)), dtype=gs.tc_float, device=gs.device)
+    direction = torch.tensor(rng.standard_normal((n_verts_b, 3)), dtype=gs.tc_float, device=gs.device)
+    vel_ad = vel.clone().requires_grad_()
+    (rollout(vel_ad) * weights).sum().backward()
+    grad_ad = (vel_ad.grad * direction).sum()
+    step = 1e-5
+    with torch.no_grad():
+        loss_plus = (rollout(vel + step * direction) * weights).sum()
+        loss_minus = (rollout(vel - step * direction) * weights).sum()
+    grad_fd = (loss_plus - loss_minus) / (2.0 * step)
+    assert abs(grad_ad - grad_fd) <= 1e-5 * abs(grad_fd)
 
 
 @pytest.mark.required

@@ -444,6 +444,7 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
     # The internal nodes, a child being refit before its parent
     for i_b in range(rod_state.verts.pos.shape[1]):
         rod_state.broadphase.is_stale[i_b] = False
+        rod_state.broadphase.n_envs_fallback[None] = 0
         for i_n_ in range(rod_info.n_bvh_leaves[None] - 1):
             i_n = rod_info.n_bvh_leaves[None] - 1 - i_n_
             rod_state.broadphase.nodes_min[i_n, i_b] = qd.min(
@@ -564,6 +565,7 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
             move = pos - rod_state.verts.pos_broadphase[i_v, i_b]
             if move.dot(move) > 0.25 * rod_info.contact_margin[None] * rod_info.contact_margin[None]:
                 rod_state.broadphase.is_stale[i_b] = True
+                rod_state.broadphase.n_envs_fallback[None] = rod_state.verts.pos.shape[1]
 
     # The pairs sharing a vertex add their corrections up through atomics, whose order varies on GPU
     for i_c, i_b in qd.ndrange(rod_state.edge_pairs.penetration.shape[0], rod_state.edge_pairs.penetration.shape[1]):
@@ -571,19 +573,22 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
             if i_c < rod_state.broadphase.n_candidates[i_b]:
                 i_e_a, i_e_b = rod_state.edge_pairs.edges_idx[i_c, i_b]
                 func_project_rod_edge_pair(i_e_a, i_e_b, i_c, i_iter, i_b, rod_state, rod_info)
-            # The first slot of an environment with a vertex past the margin also tests the pairs outside of the
-            # candidates, which is rare and costs a loop over all of them there alone. Two leaf boxes that overlap at
-            # the broadphase made the pair a candidate. Sharing the loop of the candidates spares a kernel task per
-            # projection
-            if i_c == 0 and rod_state.broadphase.is_stale[i_b]:
-                for i_e_a in range(rod_state.edges.theta.shape[0]):
-                    for i_e_b in range(i_e_a + 1, rod_state.edges.theta.shape[0]):
-                        if func_is_rod_edge_pair_valid(i_e_a, i_e_b, rod_info):
-                            if not func_is_rod_broadphase_overlap(i_e_a, i_e_b, i_b, rod_state, rod_info):
-                                func_project_rod_edge_pair(i_e_a, i_e_b, -1, i_iter, i_b, rod_state, rod_info)
         else:
             i_e_a, i_e_b = rod_info.edge_pairs_idx[i_c]
             func_project_rod_edge_pair(i_e_a, i_e_b, i_c, i_iter, i_b, rod_state, rod_info)
+
+    # An environment with a vertex past the margin also tests the pairs outside of the candidates, two leaf boxes that
+    # overlap at the broadphase having made the pair a candidate. The loop runs over no environment until then.
+    # FIXME: quadrants - the adjoint of the narrowphase is wrong where this loop is nested in the loop of the candidates,
+    # so that the pairs take a task of their own, at the cost of a kernel task per projection.
+    if qd.static(has_broadphase):
+        for i_b, i_e_a, i_e_b in qd.ndrange(
+            rod_state.broadphase.n_envs_fallback[None], rod_state.edges.theta.shape[0], rod_state.edges.theta.shape[0]
+        ):
+            if rod_state.broadphase.is_stale[i_b] and i_e_a < i_e_b:
+                if func_is_rod_edge_pair_valid(i_e_a, i_e_b, rod_info):
+                    if not func_is_rod_broadphase_overlap(i_e_a, i_e_b, i_b, rod_state, rod_info):
+                        func_project_rod_edge_pair(i_e_a, i_e_b, -1, i_iter, i_b, rod_state, rod_info)
 
 
 @qd.kernel(fastcache=True)

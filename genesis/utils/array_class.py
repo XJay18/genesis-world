@@ -1858,6 +1858,9 @@ class RodBroadphase(Data, kind=DataKind.SCRATCH):
     n_candidates: qd.Tensor = field(int, shape=(ENVS,), labels=ROD_BROADPHASE)
     # Whether a vertex of the environment moved further than half of the margin since the broadphase ran
     is_stale: qd.Tensor = field(bool, shape=(ENVS,), labels=ROD_BROADPHASE)
+    # The number of environments the loop over the pairs outside of the candidates runs over, zero until a vertex of any
+    # environment moved past the margin, which spares that loop (see 'kernel_project_rod_contacts')
+    n_envs_fallback: qd.Tensor = field(int, shape=(), labels=ROD_BROADPHASE)
 
 
 # The most contacts with the rigid geoms a vertex of the rods owns (see 'RodRigidContacts')
