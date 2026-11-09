@@ -697,12 +697,13 @@ class LegacyCoupler(RBC):
         """Collide an MPM grid node with the edges of the rods within reach, at the velocity level.
 
         A node of the material within the capsule of an edge, grown by a band of half a grid spacing, that approaches it
-        gets an impulse along the line joining them. An edge and the approaching grid nodes it reaches form one
+        gets an impulse along the line joining them. An edge and the approaching grid nodes it reaches share one
         inelastic contact: each node takes 1 / (1 + w M) of their relative normal velocity, with w the inverse mass of
         the edge at the contact point, each vertex counting for the edges it belongs to since they push it together,
         and M the mass of the approaching nodes gathered per edge ('rod_mpm_prepare'), each weighted by the squared
-        cosine of its normal with the relative motion, so that the edge and those nodes end up at the same normal
-        velocity, scaled by one plus the restitution of the rod. The rod takes the
+        cosine of its normal with the relative motion, scaled by one plus the restitution of the rod. A rod light
+        against those nodes loses part of its approach in one substep and reaches their velocity over the next substeps.
+        The rod takes the
         opposite impulse, split between the two vertices of an edge by their weights in the contact point, a fixed or
         constrained vertex taking none. The node meets the rod elements one after the other, each from the velocity the
         previous ones left. The rod accumulates its change of velocity apart, applied once every node computed it (see
