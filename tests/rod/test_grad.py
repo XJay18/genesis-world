@@ -305,7 +305,7 @@ def test_mpm_coupling_grad_matches_fd(backend, show_viewer):
         morph=gs.morphs.ParameterizedRod(
             n_vertices=n_verts,
             interval=0.01,
-            pos=(-0.025, 0.003, 0.084),
+            pos=(-0.025, 0.003, 0.077),
         ),
         material=gs.materials.Rod.Base(
             E=1e5,

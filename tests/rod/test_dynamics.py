@@ -621,7 +621,7 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
         morph=gs.morphs.ParameterizedRod(
             n_vertices=15,
             interval=0.005,
-            pos=(-0.035, 0.06, 0.15),
+            pos=(-0.035, 0.06, 0.125),
         ),
         material=gs.materials.Rod.Base(
             E=1e5,
@@ -632,7 +632,7 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
     scene.build(n_envs=2)
 
     heights_landing = []
-    for _ in range(150):
+    for _ in range(250):
         scene.step()
         block_top = block.get_particles_pos()[..., 2].max(dim=-1).values
         rod_bottom = rod.get_state().pos[..., 2].min(dim=-1).values
@@ -644,9 +644,17 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
         assert (rod_bottom < block_top - 0.01).all()
     else:
         heights_landing = torch.stack(heights_landing)
-        # The rod has landed once its height stops falling, and it does not rise from there
-        i_landing = 110
-        assert (heights_landing[i_landing:] < heights_landing[i_landing - 1] + 5e-4).all()
+        # The rod lands without rising from its lowest height, with restitution zero, and it stays on the surface, within
+        # half a grid spacing of the top of the block plus its radius, at the resolution of the grid nodes it touches. It
+        # is settled, sinking less than the sink rate of a rod the grid nodes do not hold up
+        height_min, i_min = heights_landing.min(dim=0)
+        for i_b in range(2):
+            assert (heights_landing[i_min[i_b] :, i_b] < height_min[i_b] + 1e-3).all()
+        dx = 1.0 / 64.0
+        assert_allclose(heights_landing[-1], block_top + 0.005, atol=0.5 * dx)
+        n_steps_settled = 50
+        sink_rate = (heights_landing[-n_steps_settled] - heights_landing[-1]) / (n_steps_settled * 1e-3)
+        assert (sink_rate.abs() < 5e-3).all()
     # The impulses of the grid nodes on a vertex add up through atomics, whose order varies
     assert_allclose(rod.get_state().pos[0], rod.get_state().pos[1], tol=1e-9)
 

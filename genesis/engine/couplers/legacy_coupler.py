@@ -31,12 +31,19 @@ from genesis.utils.geom import (
     qd_transform_by_T,
     qd_transform_by_trans_quat,
 )
+from genesis.utils.misc import qd_to_numpy
 from genesis.utils.rod import func_inverse_mass, func_is_free, func_last_projection_correction
 
 if TYPE_CHECKING:
     from genesis.engine.simulator import Simulator
 
 CLAMPED_INV_DT = 50.0
+# How far beyond the capsule of an edge a rod contacts the MPM grid nodes, in grid spacings, and the fraction of the
+# mass of a full grid node that makes a node part of the material. The grid nodes around a surface carry a fading mass
+# up to one and a half spacings outside of the material, and the fraction leaves those out. Half a spacing is the
+# smallest band that leaves no gap between the node columns of the top layer for an edge to fall through
+ROD_MPM_CONTACT_BAND = 0.5
+ROD_MPM_NODE_MASS_FRACTION = 0.3
 # The evaluations of the search of the deepest point of an edge of the rods in a rigid geom: its two ends, three middle
 # points, then five pairs of steps (see 'LegacyCoupler._func_rod_rigid_contact')
 ROD_EDGE_CONTACT_N_EVALS = 15
@@ -362,10 +369,9 @@ class LegacyCoupler(RBC):
             RodData.rod_state.verts.dv_mpm,
             RodData.rod_state.aabb_min,
             RodData.rod_state.aabb_max,
-            RodData.rod_state.verts_runs_min,
-            RodData.rod_state.verts_runs_max,
             RodData.rod_state.edges_runs_min,
             RodData.rod_state.edges_runs_max,
+            RodData.rod_state.edges_mpm_mass,
         ):
             opt_in(field_ref, cond=lambda: self.has_rod_mpm_coupling)
 
@@ -393,6 +399,17 @@ class LegacyCoupler(RBC):
     def build(self) -> None:
         self._rigid_mpm, self._rigid_sph, self._rigid_pbd, self._rigid_fem, _ = self.rigid_couplings
         self._rod_mpm = self.has_rod_mpm_coupling
+        if self._rod_mpm:
+            # The grid nodes an edge can reach fit a cube of side the longest rest edge plus the reach on both sides
+            rod_info = self.rod_solver.rod_info
+            reach = ROD_MPM_CONTACT_BAND * self.mpm_solver.dx + float(qd_to_numpy(rod_info.verts.radius).max())
+            extent = 1.2 * float(qd_to_numpy(rod_info.edges.rest_length).max()) + 2.0 * reach
+            self._rod_mpm_stencil = math.ceil(extent * self.mpm_solver.inv_dx) + 2
+            self._rod_mpm_node_mass_min = (
+                ROD_MPM_NODE_MASS_FRACTION
+                * min([entity.material.rho for entity in self.mpm_solver.entities])
+                * self.mpm_solver.dx**3
+            )
         self._mpm_sph = self.mpm_solver.is_active and self.sph_solver.is_active and self.options.mpm_sph
         self._mpm_pbd = self.mpm_solver.is_active and self.pbd_solver.is_active and self.options.mpm_pbd
         self._fem_mpm = self.fem_solver.is_active and self.mpm_solver.is_active and self.options.fem_mpm
@@ -653,20 +670,6 @@ class LegacyCoupler(RBC):
         return vel
 
     @qd.func
-    def _func_rod_mpm_node_weight(self, dist: float, reach: float) -> float:
-        """Return the share of a grid node at a given distance from a contact point of the impulses of the nodes within
-        reach of it.
-
-        The share is a smooth kernel vanishing at the reach, whose integral over the grid is one, so that the shares of
-        the nodes around a point sum to about one, whatever their number, and the impulses of the nodes a rod element
-        reaches add up to the impulse of a single contact at the element.
-        """
-        scaled = 1.0 - (dist * dist) / (reach * reach)
-        # The integral of the kernel over the ball of the reach, in units of the volume of a grid cell, is 32 pi / 105
-        # times the cube of the reach over the grid spacing
-        return scaled * scaled / (0.957 * (reach * self.mpm_solver.inv_dx) ** 3)
-
-    @qd.func
     def _func_mpm_collide_with_rods(
         self,
         f: int,
@@ -677,15 +680,17 @@ class LegacyCoupler(RBC):
         rod_state: RodState,
         rod_info: RodInfo,
     ):
-        """Collide an MPM grid node with the vertices and the edges of the rods within reach, at the velocity level.
+        """Collide an MPM grid node with the edges of the rods within reach, at the velocity level.
 
-        A node within the grid spacing of the capsule of a vertex or an edge that approaches it gets an impulse along the
-        line joining them, its share of the one that cancels their relative normal velocity scaled by one plus the
-        restitution of the rod: the weight of the node at the contact point (see '_func_rod_mpm_node_weight'). The rod
-        takes the opposite impulse, split between the two vertices of an edge by their weights in the contact point, a
-        fixed or constrained vertex taking none. The node meets the rod elements one after the other, each
-        from the velocity the previous ones left. The rod accumulates its change of velocity apart, applied once every
-        node computed it (see 'rod_apply_mpm_dv'), so that autodiff reverses the coupling.
+        A node of the material within the capsule of an edge, grown by a band of half a grid spacing, that approaches it
+        gets an impulse along the line joining them. An edge and the grid nodes it reaches form one inelastic contact:
+        each node takes 1 / (1 + w M) of their relative normal velocity, with w the inverse mass of the edge at the
+        contact point and M the mass of the nodes the edge reaches, so that they all end up at the same normal velocity,
+        scaled by one plus the restitution of the rod. The rod takes the
+        opposite impulse, split between the two vertices of an edge by their weights in the contact point, a fixed or
+        constrained vertex taking none. The node meets the rod elements one after the other, each from the velocity the
+        previous ones left. The rod accumulates its change of velocity apart, applied once every node computed it (see
+        'rod_apply_mpm_dv'), so that autodiff reverses the coupling.
         """
         # FIXME: quadrants - autodiff of a loop of runtime length gets a wrong adjoint for a local computed before the
         # loop and read in it, so the mass of the node is read from the grid where it is used.
@@ -693,33 +698,7 @@ class LegacyCoupler(RBC):
         # The bounding box of the rods spares the nodes far from every rod (see 'rod_mpm_prepare')
         is_near = ((pos - rod_state.aabb_min[i_b]).min() >= 0.0) * ((rod_state.aabb_max[i_b] - pos).min() >= 0.0)
         if is_near:
-            # The elements are visited in their index order, those of a run out of reach being skipped: the node meets
-            # the rod elements one after the other, each from the velocity the previous ones left
-            for i_run in range(rod_state.verts_runs_min.shape[0]):
-                if ((pos - rod_state.verts_runs_min[i_run, i_b]).min() >= 0.0) * (
-                    (rod_state.verts_runs_max[i_run, i_b] - pos).min() >= 0.0
-                ):
-                    i_v_start = i_run * ROD_RUN_LEN
-                    for i_v in range(i_v_start, qd.min(i_v_start + ROD_RUN_LEN, rod_state.verts.pos.shape[0])):
-                        dist_vec = pos - rod_state.verts.pos[i_v, i_b]
-                        dist = dist_vec.norm()
-                        if dist < dx + rod_info.verts.radius[i_v]:
-                            if dist > rod_info.EPS[None]:
-                                normal = dist_vec / dist
-                                vel_normal = (vel - rod_state.verts.vel[i_v, i_b]).dot(normal)
-                                if vel_normal < 0.0:
-                                    inv_mass_rod = func_inverse_mass(i_v, i_b, rod_state, rod_info)
-                                    mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
-                                    # The impulse is written without the inverse mass of the node, whose derivative
-                                    # cancels out analytically but not in floating point for the nodes of a tiny mass
-                                    impulse_scale = (
-                                        -(1.0 + rod_info.verts.restitution[i_v])
-                                        * vel_normal
-                                        / (1.0 + inv_mass_rod * mass)
-                                    ) * self._func_rod_mpm_node_weight(dist, dx + rod_info.verts.radius[i_v])
-                                    vel = vel + impulse_scale * normal
-                                    rod_state.verts.dv_mpm[i_v, i_b] -= impulse_scale * mass * inv_mass_rod * normal
-
+            # The edges are visited in their index order, those of a run out of reach being skipped
             for i_run in range(rod_state.edges_runs_min.shape[0]):
                 if ((pos - rod_state.edges_runs_min[i_run, i_b]).min() >= 0.0) * (
                     (rod_state.edges_runs_max[i_run, i_b] - pos).min() >= 0.0
@@ -734,7 +713,10 @@ class LegacyCoupler(RBC):
                         )
                         dist_vec = pos - (pos_s + t * edge)
                         dist = dist_vec.norm()
-                        if dist < dx + 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e]):
+                        node_mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
+                        radius = 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e])
+                        reach = radius + ROD_MPM_CONTACT_BAND * dx
+                        if dist < reach and node_mass > self._rod_mpm_node_mass_min:
                             if dist > rod_info.EPS[None]:
                                 normal = dist_vec / dist
                                 vel_rod = (
@@ -747,12 +729,12 @@ class LegacyCoupler(RBC):
                                     restitution = 0.5 * (
                                         rod_info.verts.restitution[i_v_s] + rod_info.verts.restitution[i_v_e]
                                     )
-                                    inv_mass_rod = 0.5 * (inv_mass_s + inv_mass_e)
+                                    inv_mass_rod = (1.0 - t) * (1.0 - t) * inv_mass_s + t * t * inv_mass_e
                                     mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
                                     impulse_scale = (
-                                        -(1.0 + restitution) * vel_normal / (1.0 + inv_mass_rod * mass)
-                                    ) * self._func_rod_mpm_node_weight(
-                                        dist, dx + 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e])
+                                        -(1.0 + restitution)
+                                        * vel_normal
+                                        / (1.0 + inv_mass_rod * rod_state.edges_mpm_mass[i_e, i_b])
                                     )
                                     vel = vel + impulse_scale * normal
                                     rod_state.verts.dv_mpm[i_v_s, i_b] -= (
@@ -762,24 +744,42 @@ class LegacyCoupler(RBC):
         return vel
 
     @qd.kernel
-    def rod_mpm_prepare(self, rod_state: RodState, rod_info: RodInfo):
-        """Clear the change of velocity the MPM grid nodes impart to the rods, and compute the bounding box of the rods in
-        each environment, grown by the reach of their collisions with the nodes, the radius of a vertex plus the grid
-        spacing."""
+    def rod_mpm_prepare(self, f: qd.i32, rod_state: RodState, rod_info: RodInfo):
+        """Clear the change of velocity the MPM grid nodes impart to the rods, compute the mass of the nodes of the
+        material each edge reaches, and the bounding boxes of the runs of edges and of the rods in each environment,
+        grown by the reach of the contacts."""
         for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
             rod_state.verts.dv_mpm[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
-        # The boxes are grown in place in the fields rather than carried in locals, which would take an autodiff stack
-        for i_run, i_b in qd.ndrange(rod_state.verts_runs_min.shape[0], rod_state.verts_runs_min.shape[1]):
-            rod_state.verts_runs_min[i_run, i_b] = qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
-            rod_state.verts_runs_max[i_run, i_b] = -qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
-            i_v_start = i_run * ROD_RUN_LEN
-            for i_v in range(i_v_start, qd.min(i_v_start + ROD_RUN_LEN, rod_state.verts.pos.shape[0])):
-                reach = rod_info.verts.radius[i_v] + self.mpm_solver.dx
-                pos = rod_state.verts.pos[i_v, i_b]
-                rod_state.verts_runs_min[i_run, i_b] = qd.min(rod_state.verts_runs_min[i_run, i_b], pos - reach)
-                rod_state.verts_runs_max[i_run, i_b] = qd.max(rod_state.verts_runs_max[i_run, i_b], pos + reach)
+        for i_e, i_b in qd.ndrange(rod_info.edges.verts_idx.shape[0], rod_state.verts.pos.shape[1]):
+            rod_state.edges_mpm_mass[i_e, i_b] = 0.0
 
+        # The mass of the grid nodes each edge reaches, which share its contact (see '_func_mpm_collide_with_rods')
+        for i_e, i_b, i_x, i_y, i_z in qd.ndrange(
+            rod_info.edges.verts_idx.shape[0],
+            rod_state.verts.pos.shape[1],
+            self._rod_mpm_stencil,
+            self._rod_mpm_stencil,
+            self._rod_mpm_stencil,
+        ):
+            i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
+            pos_s, pos_e = rod_state.verts.pos[i_v_s, i_b], rod_state.verts.pos[i_v_e, i_b]
+            reach = 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e])
+            reach = reach + ROD_MPM_CONTACT_BAND * self.mpm_solver.dx
+            I_start = qd.floor((qd.min(pos_s, pos_e) - reach) * self.mpm_solver.inv_dx).cast(gs.qd_int)
+            I = I_start + qd.Vector([i_x, i_y, i_z], dt=gs.qd_int) - self.mpm_solver.grid_offset
+            if (I >= 0).all() and (I < qd.Vector(self.mpm_solver.grid_res, dt=gs.qd_int)).all():
+                mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
+                if mass > self._rod_mpm_node_mass_min:
+                    pos = (I + self.mpm_solver.grid_offset) * self.mpm_solver.dx
+                    edge = pos_e - pos_s
+                    t = qd.math.clamp(
+                        (pos - pos_s).dot(edge) / qd.max(edge.dot(edge), rod_info.EPS[None]), 0.0, 1.0
+                    )
+                    if (pos - (pos_s + t * edge)).norm() < reach:
+                        rod_state.edges_mpm_mass[i_e, i_b] += mass
+
+        # The boxes are grown in place in the fields rather than carried in locals, which would take an autodiff stack
         for i_run, i_b in qd.ndrange(rod_state.edges_runs_min.shape[0], rod_state.edges_runs_min.shape[1]):
             rod_state.edges_runs_min[i_run, i_b] = qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
             rod_state.edges_runs_max[i_run, i_b] = -qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
@@ -787,7 +787,8 @@ class LegacyCoupler(RBC):
             for i_e in range(i_e_start, qd.min(i_e_start + ROD_RUN_LEN, rod_info.edges.verts_idx.shape[0])):
                 i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
                 pos_s, pos_e = rod_state.verts.pos[i_v_s, i_b], rod_state.verts.pos[i_v_e, i_b]
-                reach = 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e]) + self.mpm_solver.dx
+                reach = 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e])
+                reach = reach + ROD_MPM_CONTACT_BAND * self.mpm_solver.dx
                 rod_state.edges_runs_min[i_run, i_b] = qd.min(
                     rod_state.edges_runs_min[i_run, i_b], qd.min(pos_s, pos_e) - reach
                 )
@@ -798,9 +799,9 @@ class LegacyCoupler(RBC):
         for i_b in range(rod_state.aabb_min.shape[0]):
             rod_state.aabb_min[i_b] = qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
             rod_state.aabb_max[i_b] = -qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
-            for i_run in range(rod_state.verts_runs_min.shape[0]):
-                rod_state.aabb_min[i_b] = qd.min(rod_state.aabb_min[i_b], rod_state.verts_runs_min[i_run, i_b])
-                rod_state.aabb_max[i_b] = qd.max(rod_state.aabb_max[i_b], rod_state.verts_runs_max[i_run, i_b])
+            for i_run in range(rod_state.edges_runs_min.shape[0]):
+                rod_state.aabb_min[i_b] = qd.min(rod_state.aabb_min[i_b], rod_state.edges_runs_min[i_run, i_b])
+                rod_state.aabb_max[i_b] = qd.max(rod_state.aabb_max[i_b], rod_state.edges_runs_max[i_run, i_b])
 
     @qd.kernel
     def rod_apply_mpm_dv(self, rod_state: RodState):
@@ -2010,7 +2011,7 @@ class LegacyCoupler(RBC):
         # MPM <-> all others
         if self.mpm_solver.is_active:
             if self._rod_mpm:
-                self.rod_mpm_prepare(self.rod_solver.rod_state, self.rod_solver.rod_info)
+                self.rod_mpm_prepare(f, self.rod_solver.rod_state, self.rod_solver.rod_info)
             self.mpm_grid_op(
                 f,
                 self.sim.cur_t,
