@@ -750,10 +750,11 @@ class LegacyCoupler(RBC):
                                     inv_mass_rod = (1.0 - t) * (1.0 - t) * inv_mass_s * n_edges_s
                                     inv_mass_rod = inv_mass_rod + t * t * inv_mass_e * n_edges_e
                                     mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
+                                    # The gathered mass can miss this node on an edge stretched past the stencil (see
+                                    # 'rod_mpm_prepare'), which leaves the node alone in the contact
+                                    mass_contact = qd.max(rod_state.edges_mpm_mass[i_e, i_b], mass)
                                     impulse_scale = (
-                                        -(1.0 + restitution)
-                                        * vel_normal
-                                        / (1.0 + inv_mass_rod * rod_state.edges_mpm_mass[i_e, i_b])
+                                        -(1.0 + restitution) * vel_normal / (1.0 + inv_mass_rod * mass_contact)
                                     )
                                     vel = vel + impulse_scale * normal
                                     rod_state.verts.dv_mpm[i_v_s, i_b] -= (
