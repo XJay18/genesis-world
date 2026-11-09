@@ -720,6 +720,75 @@ def test_rod_mpm_contact_does_not_overshoot_at_any_mass(show_viewer):
 
 
 @pytest.mark.required
+def test_rod_mpm_contact_ignores_unrelated_material(show_viewer):
+    # A rod resting on a dense block, with and without a much lighter block that it never touches
+    heights = []
+    for is_with_unrelated in (False, True):
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(
+                dt=1e-3,
+                substeps=5,
+            ),
+            rod_options=gs.options.RodOptions(
+                damping=10.0,
+                angular_damping=5.0,
+            ),
+            mpm_options=gs.options.MPMOptions(
+                lower_bound=(-0.3, -0.3, -0.05),
+                upper_bound=(0.3, 0.3, 0.45),
+            ),
+            viewer_options=gs.options.ViewerOptions(
+                camera_pos=(0.4, -0.6, 0.4),
+                camera_lookat=(0.0, 0.0, 0.08),
+            ),
+            show_viewer=show_viewer,
+        )
+        scene.add_entity(
+            morph=gs.morphs.Plane(),
+            material=gs.materials.Rigid(
+                needs_coup=True,
+                coup_friction=0.1,
+            ),
+        )
+        scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(0.0, 0.0, 0.05),
+                size=(0.2, 0.2, 0.1),
+            ),
+            material=gs.materials.MPM.Elastic(
+                rho=5000.0,
+            ),
+        )
+        if is_with_unrelated:
+            scene.add_entity(
+                morph=gs.morphs.Box(
+                    pos=(0.21, 0.21, 0.05),
+                    size=(0.04, 0.04, 0.04),
+                ),
+                material=gs.materials.MPM.Elastic(
+                    rho=100.0,
+                ),
+            )
+        rod = scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=15,
+                interval=0.005,
+                pos=(-0.035, 0.0, 0.115),
+            ),
+            material=gs.materials.Rod.Base(
+                E=1e5,
+                G=1e4,
+                segment_radius=0.005,
+            ),
+        )
+        scene.build()
+        for _ in range(200):
+            scene.step()
+        heights.append(rod.get_state().pos[0, :, 2].mean())
+    assert_allclose(heights[1], heights[0], atol=1e-5)
+
+
+@pytest.mark.required
 def test_rod_mpm_coupling_conserves_momentum(show_viewer):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(

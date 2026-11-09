@@ -39,9 +39,10 @@ if TYPE_CHECKING:
 
 CLAMPED_INV_DT = 50.0
 # How far beyond the capsule of an edge a rod contacts the MPM grid nodes, in grid spacings, and the fraction of the
-# mass of a full grid node that makes a node part of the material. The grid nodes around a surface carry a fading mass
-# up to one and a half spacings outside of the material, and the fraction leaves those out. Half a spacing is the
-# smallest band that leaves no gap between the node columns of the top layer for an edge to fall through
+# largest mass among a grid node and its neighbours that makes the node part of the material. The grid nodes around a
+# surface carry a fading mass up to one and a half spacings outside of the material, and the fraction leaves those out
+# whatever the density of the material. Half a spacing is the smallest band that leaves no gap between the node columns
+# of the top layer for an edge to fall through
 ROD_MPM_CONTACT_BAND = 0.5
 ROD_MPM_NODE_MASS_FRACTION = 0.3
 # The evaluations of the search of the deepest point of an edge of the rods in a rigid geom: its two ends, three middle
@@ -405,11 +406,6 @@ class LegacyCoupler(RBC):
             reach = ROD_MPM_CONTACT_BAND * self.mpm_solver.dx + float(qd_to_numpy(rod_info.verts.radius).max())
             extent = 1.2 * float(qd_to_numpy(rod_info.edges.rest_length).max()) + 2.0 * reach
             self._rod_mpm_stencil = math.ceil(extent * self.mpm_solver.inv_dx) + 2
-            self._rod_mpm_node_mass_min = (
-                ROD_MPM_NODE_MASS_FRACTION
-                * min([entity.material.rho for entity in self.mpm_solver.entities])
-                * self.mpm_solver.dx**3
-            )
         self._mpm_sph = self.mpm_solver.is_active and self.sph_solver.is_active and self.options.mpm_sph
         self._mpm_pbd = self.mpm_solver.is_active and self.pbd_solver.is_active and self.options.mpm_pbd
         self._fem_mpm = self.fem_solver.is_active and self.mpm_solver.is_active and self.options.fem_mpm
@@ -670,6 +666,24 @@ class LegacyCoupler(RBC):
         return vel
 
     @qd.func
+    def _func_is_rod_mpm_material_node(self, f: int, I, i_b: int) -> bool:
+        """Return whether a grid node carries enough mass among its neighbours to belong to the material.
+
+        The fading mass the material leaves on the nodes around its surface is small next to the nodes inside it, the
+        comparison being with the neighbours along the axes so that it does not depend on the density of the material.
+        """
+        I_node = qd.Vector([I[0], I[1], I[2]], dt=gs.qd_int)
+        mass = self.mpm_solver.grid[f, I_node, i_b].mass
+        mass_max = mass
+        grid_res = qd.Vector(self.mpm_solver.grid_res, dt=gs.qd_int)
+        for i_axis in qd.static(range(3)):
+            for side in qd.static((-1, 1)):
+                I_neighbour = I_node + side * qd.Vector.unit(3, i_axis, gs.qd_int)
+                if (I_neighbour >= 0).all() and (I_neighbour < grid_res).all():
+                    mass_max = qd.max(mass_max, self.mpm_solver.grid[f, I_neighbour, i_b].mass)
+        return mass > gs.EPS and mass > ROD_MPM_NODE_MASS_FRACTION * mass_max
+
+    @qd.func
     def _func_mpm_collide_with_rods(
         self,
         f: int,
@@ -717,8 +731,7 @@ class LegacyCoupler(RBC):
                         dist = dist_vec.norm()
                         radius = 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e])
                         reach = radius + ROD_MPM_CONTACT_BAND * dx
-                        node_mass = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
-                        if dist < reach and node_mass > self._rod_mpm_node_mass_min:
+                        if dist < reach and self._func_is_rod_mpm_material_node(f, I, i_b):
                             if dist > rod_info.EPS[None]:
                                 normal = dist_vec / dist
                                 vel_rod = (
@@ -775,8 +788,8 @@ class LegacyCoupler(RBC):
             I_start = qd.floor((qd.min(pos_s, pos_e) - reach) * self.mpm_solver.inv_dx).cast(gs.qd_int)
             I = I_start + qd.Vector([i_x, i_y, i_z], dt=gs.qd_int) - self.mpm_solver.grid_offset
             if (I >= 0).all() and (I < qd.Vector(self.mpm_solver.grid_res, dt=gs.qd_int)).all():
-                grid_mass = self.mpm_solver.grid[f, I, i_b].mass
-                if grid_mass / self.mpm_solver._particle_volume_scale > self._rod_mpm_node_mass_min:
+                if self._func_is_rod_mpm_material_node(f, I, i_b):
+                    grid_mass = self.mpm_solver.grid[f, I, i_b].mass
                     pos = (I + self.mpm_solver.grid_offset) * self.mpm_solver.dx
                     edge = pos_e - pos_s
                     t = qd.math.clamp(
