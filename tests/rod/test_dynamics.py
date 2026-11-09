@@ -616,19 +616,23 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
             segment_radius=0.005,
         ),
     )
-    # A second rod dropped onto the block lands without rebounding, restitution being zero
-    rod_landing = scene.add_entity(
-        morph=gs.morphs.ParameterizedRod(
-            n_vertices=15,
-            interval=0.005,
-            pos=(-0.035, 0.06, 0.125),
-        ),
-        material=gs.materials.Rod.Base(
-            E=1e5,
-            G=1e4,
-            segment_radius=0.005,
-        ),
-    )
+    # Two rods dropped onto the block land without rebounding, restitution being zero, a heavy one and a light one
+    rods_landing = [
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=15,
+                interval=0.005,
+                pos=(-0.035, y, 0.125),
+            ),
+            material=gs.materials.Rod.Base(
+                E=1e5,
+                G=1e4,
+                segment_mass=segment_mass,
+                segment_radius=0.005,
+            ),
+        )
+        for y, segment_mass in ((0.06, 0.02), (-0.06, 2e-4))
+    ]
     scene.build(n_envs=2)
 
     heights_landing = []
@@ -636,27 +640,83 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
         scene.step()
         block_top = block.get_particles_pos()[..., 2].max(dim=-1).values
         rod_bottom = rod.get_state().pos[..., 2].min(dim=-1).values
-        heights_landing.append(rod_landing.get_state().pos[..., 2].mean(dim=-1))
+        heights_landing.append([rod_landing.get_state().pos[..., 2].mean(dim=-1) for rod_landing in rods_landing])
         # The coupled rod rests on the block, while the uncoupled one falls through it
         if rod_mpm:
             assert (rod_bottom > block_top).all()
     if not rod_mpm:
         assert (rod_bottom < block_top - 0.01).all()
     else:
-        heights_landing = torch.stack(heights_landing)
-        # The rod lands without rising from its lowest height, with restitution zero, and it stays on the surface, within
-        # half a grid spacing of the top of the block plus its radius, at the resolution of the grid nodes it touches. It
-        # is settled, sinking less than the sink rate of a rod the grid nodes do not hold up
-        height_min, i_min = heights_landing.min(dim=0)
-        for i_b in range(2):
-            assert (heights_landing[i_min[i_b] :, i_b] < height_min[i_b] + 1e-3).all()
         dx = 1.0 / 64.0
-        assert_allclose(heights_landing[-1], block_top + 0.005, atol=0.5 * dx)
         n_steps_settled = 50
-        sink_rate = (heights_landing[-n_steps_settled] - heights_landing[-1]) / (n_steps_settled * 1e-3)
-        assert (sink_rate.abs() < 5e-3).all()
+        for i_rod in range(len(rods_landing)):
+            heights = torch.stack([heights_step[i_rod] for heights_step in heights_landing])
+            # A rod lands without rising from its lowest height, with restitution zero, and it stays on the surface,
+            # within half a grid spacing of the top of the block plus its radius, at the resolution of the grid nodes it
+            # touches. It is settled, sinking less than a rod the grid nodes do not hold up
+            height_min, i_min = heights.min(dim=0)
+            for i_b in range(2):
+                assert (heights[i_min[i_b] :, i_b] < height_min[i_b] + 1e-3).all()
+            assert_allclose(heights[-1], block_top + 0.005, atol=0.5 * dx)
+            sink_rate = (heights[-n_steps_settled] - heights[-1]) / (n_steps_settled * 1e-3)
+            assert (sink_rate.abs() < 5e-3).all()
     # The impulses of the grid nodes on a vertex add up through atomics, whose order varies
     assert_allclose(rod.get_state().pos[0], rod.get_state().pos[1], tol=1e-9)
+
+
+@pytest.mark.required
+def test_rod_mpm_contact_does_not_overshoot_at_any_mass(show_viewer):
+    # Rods of a range of masses, far enough apart not to meet the same grid nodes, thrown down at a block at rest. With
+    # restitution zero, their vertices lose speed in the contact and none ends moving up
+    segment_masses = (0.02, 0.005, 0.001, 2e-4, 2e-5)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-4,
+            substeps=1,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.3, -0.3, -0.05),
+            upper_bound=(0.3, 0.3, 0.45),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.4, -0.6, 0.4),
+            camera_lookat=(0.0, 0.0, 0.08),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.05),
+            size=(0.2, 0.2, 0.1),
+        ),
+        material=gs.materials.MPM.Elastic(),
+    )
+    rods = [
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=15,
+                interval=0.01,
+                pos=(-0.07, y, 0.1045),
+            ),
+            material=gs.materials.Rod.Base(
+                E=1e5,
+                G=1e4,
+                segment_mass=segment_mass,
+                segment_radius=0.005,
+            ),
+        )
+        for y, segment_mass in zip((-0.08, -0.04, 0.0, 0.04, 0.08), segment_masses)
+    ]
+    scene.build()
+    for rod in rods:
+        rod.set_velocity(torch.tensor((0.0, 0.0, -1.0), dtype=gs.tc_float, device=gs.device))
+
+    scene.step()
+    for rod in rods:
+        vel_z = rod.get_state().vel[0, :, 2]
+        assert (vel_z < 0.0).all()
+        assert vel_z.max() > -0.99
 
 
 @pytest.mark.required
