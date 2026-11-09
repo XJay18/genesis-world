@@ -339,7 +339,7 @@ def test_mpm_coupling_grad_matches_fd(backend, show_viewer):
     rollout(**inputs_ad).backward()
 
     # Directional derivatives along a random direction, with the step and the tolerance their measured floors set
-    steps_and_tols = {"rod_vel": (1e-5, 1e-6), "block_vel": (1e-4, 1e-8)}
+    steps_and_tols = {"rod_vel": (1e-5, 1e-6), "block_vel": (1e-4, 2e-9)}
     for name, value in inputs.items():
         direction = torch.tensor(rng.standard_normal(value.shape), dtype=gs.tc_float, device=gs.device)
         step, tol = steps_and_tols[name]
