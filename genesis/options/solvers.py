@@ -926,12 +926,24 @@ class RodOptions(GravityMixin, TimeBasedMixin):
         Number of projections of the inextensibility and contact constraints per substep. More projections hold the
         length and resolve the contacts more accurately, at a runtime cost growing linearly with their number.
         Defaults to 10.
+    contact_margin : float, optional
+        The margin of the search for rod-rod contacts, in meters. Pairs of edges further apart than this are skipped
+        unless a vertex moves over half of it during the projections of a substep, in which case all pairs of edges are
+        tested. A larger margin tests more pairs of edges at every step, a smaller one tests all pairs more often. None
+        takes the largest vertex radius of the rods. Defaults to None.
+    multiplier_contact_candidates : int, optional
+        The capacity of the pairs of edges tested for rod-rod contact, as a multiple of the number of edges. Exceeding
+        it raises an error. Rods short enough for all their pairs of edges to fit it test them all at every substep,
+        skipping the search for the nearby ones. A larger value allows denser piles of rods at the cost of memory.
+        Defaults to 32.
     """
 
     damping: NonNegativeFloat = 0.0
     angular_damping: NonNegativeFloat = 0.0
     adjacent_gap: NonNegativeInt = 2
     n_pbd_iters: PositiveInt = 10
+    contact_margin: PositiveFloat | None = None
+    multiplier_contact_candidates: PositiveInt = 32
 
 
 class SFOptions(TimeBasedMixin):

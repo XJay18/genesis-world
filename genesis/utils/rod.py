@@ -24,6 +24,13 @@ def func_inverse_mass(i_v: int, i_b: int, rod_state: RodState, rod_info: RodInfo
 
 
 @qd.func
+def func_vert_n_edges(i_v: int, rod_info: RodInfo) -> int:
+    """Return the number of edges of the rods a vertex belongs to, one at the end of an open rod and two otherwise."""
+    edges_idx = rod_info.verts.edges_idx[i_v]
+    return qd.select(edges_idx[0] >= 0, 1, 0) + qd.select(edges_idx[1] >= 0, 1, 0)
+
+
+@qd.func
 def func_last_projection_correction(
     i_v: int, i_b: int, rod_state: RodState, has_edge_pairs: qd.template()
 ) -> qd.types.vector(3):
