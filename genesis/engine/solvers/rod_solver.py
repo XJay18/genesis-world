@@ -873,7 +873,7 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
         *rod_state.broadphase.edges_n_candidates.shape, axes=qd.static(eoa(rod_state.broadphase.edges_n_candidates))
     ):
         rod_state.broadphase.edges_n_candidates[i_e, i_b] = func_query_rod_bvh(
-            i_e, i_b, 0, rod_state, rod_info, is_filling=False
+            i_e, i_b, i_start=0, rod_state=rod_state, rod_info=rod_info, is_filling=False
         )
 
     for i_b in range(rod_state.broadphase.n_candidates.shape[0]):
@@ -1003,7 +1003,9 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
             if rod_state.broadphase.is_stale[i_b] and i_e_a < i_e_b:
                 if func_is_rod_edge_pair_valid(i_e_a, i_e_b, rod_info):
                     if not func_is_rod_broadphase_overlap(i_e_a, i_e_b, i_b, rod_state, rod_info):
-                        func_project_rod_edge_pair(i_e_a, i_e_b, -1, i_iter, i_b, rod_state, rod_info)
+                        func_project_rod_edge_pair(
+                            i_e_a, i_e_b, i_c=-1, i_iter=i_iter, i_b=i_b, rod_state=rod_state, rod_info=rod_info
+                        )
 
 
 @qd.kernel(fastcache=True)
@@ -1727,7 +1729,12 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             link_quat = broadcast_tensor(link_quat, gs.tc_float, (len(envs_idx), 1, 4))
             target_poss = gu.inv_transform_by_trans_quat(target_poss, link_pos, link_quat)
         kernel_set_rod_verts_constraints(
-            verts_idx, envs_idx, link_idx, target_poss.contiguous(), self.rod_state, is_constrained=True
+            verts_idx,
+            envs_idx,
+            link_idx,
+            target_pos=target_poss.contiguous(),
+            rod_state=self.rod_state,
+            is_constrained=True,
         )
 
     @gs.assert_built
@@ -1737,7 +1744,9 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         target_poss, verts_idx, envs_idx = self._sanitize_io_variables(
             0.0, verts_idx, self.n_verts, "verts_idx", envs_idx, (3,), batched_idx=True
         )
-        kernel_set_rod_verts_constraints(verts_idx, envs_idx, -1, target_poss, self.rod_state, is_constrained=False)
+        kernel_set_rod_verts_constraints(
+            verts_idx, envs_idx, link_idx=-1, target_pos=target_poss, rod_state=self.rod_state, is_constrained=False
+        )
 
     def get_verts_contact_geom_idx(self, verts_idx=None, envs_idx=None):
         """

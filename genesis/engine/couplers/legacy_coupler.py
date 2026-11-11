@@ -1871,10 +1871,10 @@ def func_rod_geom_signed_distance(
     normal = qd.Vector.zero(gs.qd_float, 3)
     if geoms_info.type[i_g] == gs.GEOM_TYPE.SPHERE:
         signed_dist = (pos - g_pos).norm() - geoms_info.data[i_g][0]
-        normal = qd_normalize(pos - g_pos, EPS)
+        normal = qd_normalize(v=pos - g_pos, eps=EPS)
     elif geoms_info.type[i_g] == gs.GEOM_TYPE.PLANE:
         geom_data = geoms_info.data[i_g]
-        normal = qd_transform_by_quat(gs.qd_vec3([geom_data[0], geom_data[1], geom_data[2]]), g_quat)
+        normal = qd_transform_by_quat(v=gs.qd_vec3([geom_data[0], geom_data[1], geom_data[2]]), quat=g_quat)
         signed_dist = (pos - g_pos).dot(normal)
     else:
         pos_mesh = qd_inv_transform_by_trans_quat(pos, g_pos, g_quat)
@@ -1889,7 +1889,7 @@ def func_rod_geom_signed_distance(
             is_normal_needed = True
         if is_normal_needed:
             normal_mesh = qd_normalize(
-                sdf.sdf_func_true_grad(i_g, pos_sdf_grid, geoms_info, sdf_info, collider_config), EPS
+                v=sdf.sdf_func_true_grad(i_g, pos_sdf_grid, geoms_info, sdf_info, collider_config), eps=EPS
             )
             if is_outside:
                 # The grid frame scales the mesh frame along its axes by the inverse of the cell size
@@ -1937,7 +1937,7 @@ def func_link_inverse_mass_bound(
         if inertia.determinant() > 0.0:
             arm = pos - (links_state.root_COM[i_l, i_b] + links_state.i_pos[i_l, i_b])
             # The arm of the torque in the principal frame of the inertia
-            torque_arm = qd_inv_transform_by_quat(arm.cross(normal), links_state.i_quat[i_l, i_b])
+            torque_arm = qd_inv_transform_by_quat(v=arm.cross(normal), quat=links_state.i_quat[i_l, i_b])
             inv_mass = inv_mass + torque_arm.dot(inertia.inverse() @ torque_arm)
     return inv_mass
 
@@ -1972,7 +1972,7 @@ def func_is_geom_near_rod_vertex(
             reach = qd.max(reach, edge_length + qd.max(rod_info.verts.radius[i_v_s], rod_info.verts.radius[i_v_e]))
     aabb_min, aabb_max = rigid_info.geoms_init_AABB[i_g, 0], rigid_info.geoms_init_AABB[i_g, 7]
     center = qd_transform_by_trans_quat(
-        0.5 * (aabb_min + aabb_max), geoms_state.pos[i_g, i_b], geoms_state.quat[i_g, i_b]
+        pos=0.5 * (aabb_min + aabb_max), trans=geoms_state.pos[i_g, i_b], quat=geoms_state.quat[i_g, i_b]
     )
     # A plane is unbounded, whatever the vertices of its mesh
     is_near = geoms_info.type[i_g] == gs.GEOM_TYPE.PLANE or (center - pos).norm() < (
