@@ -129,6 +129,9 @@ class RodInfo(Data):
     # The number of leaves of the hierarchy of the broadphase, a power of two, and its depth
     n_bvh_leaves: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
     bvh_depth: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
+    # The length of the runs of edges whose bounding boxes bound the edges an MPM grid node can collide with (see
+    # ROD_EDGE_RUNS)
+    edges_run_len: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
     damping: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
     angular_damping: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
     EPS: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
@@ -372,6 +375,7 @@ class RodData(Data):
                     contact_margin=solver.contact_margin,
                     n_bvh_leaves=solver.n_bvh_leaves,
                     bvh_depth=solver.bvh_depth,
+                    edges_run_len=ROD_RUN_LEN,
                 )
             ),
             unused={
