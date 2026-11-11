@@ -6,7 +6,6 @@ import torch
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.entities.rigid_entity import RigidLink
-from genesis.engine.states.entities import RodEntityState
 from genesis.utils.misc import broadcast_tensor
 
 from .base_entity import Entity
@@ -129,20 +128,6 @@ class RodEntity(Entity):
             vel = broadcast_tensor(vel, gs.tc_float, (*shape[:-1], 1, 3) if len(shape) < 3 else shape)
         self.set_verts_vel(vel, envs_idx=envs_idx)
 
-    def get_state(self):
-        """Get the positions and velocities of the vertices of the rod, and the twist angles and rates of its edges."""
-        solver_state = self._solver.get_state()
-        verts_slice = slice(self._v_start, self._v_start + self.n_verts)
-        edges_slice = slice(self._e_start, self._e_start + self.n_edges)
-        return RodEntityState(
-            self,
-            self._sim.cur_step_global,
-            solver_state.pos[:, verts_slice],
-            solver_state.vel[:, verts_slice],
-            solver_state.theta[:, edges_slice],
-            solver_state.omega[:, edges_slice],
-        )
-
     # ------------------------------------------------------------------------------------
     # ---------------------------- interfacing with solver -------------------------------
     # ------------------------------------------------------------------------------------
@@ -172,10 +157,65 @@ class RodEntity(Entity):
         self._solver.set_verts_vel(vels, verts_idx, envs_idx)
 
     @gs.assert_built
+    def get_verts_pos(self, verts_idx_local=None, envs_idx=None):
+        """
+        Get the position of some vertices.
+
+        Parameters
+        ----------
+        verts_idx_local : None | int | array_like, shape (N,)
+            Index of the vertices relative to this entity, the same in every environment. If None, all vertices will be
+            considered. Defaults to None.
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to get. If None, all environments will be considered. Defaults to None.
+
+        Returns
+        -------
+        poss : torch.Tensor, shape ([M,] N, 3)
+            The position of each vertex.
+        """
+        verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True)
+        return self._solver.get_verts_pos(verts_idx, envs_idx)
+
+    @gs.assert_built
+    def get_verts_vel(self, verts_idx_local=None, envs_idx=None):
+        """
+        Get the velocity of some vertices (see 'get_verts_pos').
+
+        Returns
+        -------
+        vels : torch.Tensor, shape ([M,] N, 3)
+            The velocity of each vertex.
+        """
+        verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True)
+        return self._solver.get_verts_vel(verts_idx, envs_idx)
+
+    @gs.assert_built
     def set_edges_theta(self, theta, edges_idx_local=None, envs_idx=None):
         """Set the twist angle of the material frame of some edges about their tangent, in radians."""
         edges_idx = self._get_global_idx(edges_idx_local, self.n_edges, self._e_start, unsafe=True, batched_idx=True)
         self._solver.set_edges_theta(theta, edges_idx, envs_idx)
+
+    @gs.assert_built
+    def get_edges_theta(self, edges_idx_local=None, envs_idx=None):
+        """
+        Get the twist angle of the material frame of some edges about their tangent, in radians.
+
+        Parameters
+        ----------
+        edges_idx_local : None | int | array_like, shape (N,)
+            Index of the edges relative to this entity, the same in every environment. If None, all edges will be
+            considered. Defaults to None.
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to get. If None, all environments will be considered. Defaults to None.
+
+        Returns
+        -------
+        theta : torch.Tensor, shape ([M,] N)
+            The twist angle of each edge.
+        """
+        edges_idx = self._get_global_idx(edges_idx_local, self.n_edges, self._e_start, unsafe=True)
+        return self._solver.get_edges_theta(edges_idx, envs_idx)
 
     @gs.assert_built
     def set_stretching_stiffness(self, stiffness, envs_idx=None):

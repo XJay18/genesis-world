@@ -1,53 +1,6 @@
 import numpy as np
 import trimesh
 
-import quadrants as qd
-
-import genesis as gs
-from genesis.utils.array_class import RodInfo, RodState
-
-
-@qd.func
-def func_is_free(i_v: int, i_b: int, rod_state: RodState) -> bool:
-    """Whether a vertex of the rods moves under the dynamics, neither fixed nor constrained to a target."""
-    return not rod_state.verts.is_fixed[i_v, i_b] and not rod_state.verts.is_constrained[i_v, i_b]
-
-
-@qd.func
-def func_inverse_mass(i_v: int, i_b: int, rod_state: RodState, rod_info: RodInfo) -> float:
-    """Return the inverse mass of a vertex of the rods, zero for a fixed or constrained vertex, which keeps its position
-    through every projection and every collision."""
-    inv_mass = gs.qd_float(0.0)
-    if func_is_free(i_v, i_b, rod_state):
-        inv_mass = 1.0 / rod_info.verts.mass[i_v]
-    return inv_mass
-
-
-@qd.func
-def func_vert_n_edges(i_v: int, rod_info: RodInfo) -> int:
-    """Return the number of edges of the rods a vertex belongs to, one at the end of an open rod and two otherwise."""
-    edges_idx = rod_info.verts.edges_idx[i_v]
-    return qd.select(edges_idx[0] >= 0, 1, 0) + qd.select(edges_idx[1] >= 0, 1, 0)
-
-
-@qd.func
-def func_last_projection_correction(
-    i_v: int, i_b: int, rod_state: RodState, has_edge_pairs: qd.template()
-) -> qd.types.vector(3):
-    """Return the correction of the position of a vertex the last projection of the rods computed and left to apply:
-    the one of the rod-rod contacts, averaged over the contacts moving the vertex, where pairs of edges are tested, the
-    one of the inextensibility otherwise.
-
-    The projections of a substep chain their kernels, each applying the correction of the previous one before computing
-    its own (see 'kernel_project_rod_inextensibility').
-    """
-    dp = qd.Vector.zero(gs.qd_float, 3)
-    if qd.static(has_edge_pairs):
-        dp = rod_state.verts.dp_contact[i_v, i_b] / qd.max(rod_state.verts.n_contacts[i_v, i_b], 1)
-    else:
-        dp = rod_state.verts.dp_inextensibility[i_v, i_b]
-    return dp
-
 
 def mesh_from_centerline(verts, radii, d1, is_loop, n_radial=16, n_cap=8):
     """

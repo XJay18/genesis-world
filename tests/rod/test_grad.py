@@ -135,8 +135,7 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
         rod.set_twisting_stiffness(G)
         for _ in range(n_steps):
             scene.step()
-        state = rod.get_state()
-        loss = (state.pos[0] * weights).sum() + (state.theta[0] ** 2).sum()
+        loss = (rod.get_verts_pos() * weights).sum() + (rod.get_edges_theta() ** 2).sum()
         if case == "free_box":
             loss = loss + (box.get_pos() * box_weights).sum()
         return loss
@@ -232,13 +231,13 @@ def test_rod_contact_outside_candidates_grad_matches_fd(backend, show_viewer):
             rod_b.set_velocity(vel)
             for _ in range(n_steps):
                 scene.step()
-            return rod_b.get_state().pos[0]
+            return rod_b.get_verts_pos()
 
         with torch.no_grad():
             scene.reset()
             rod_b.set_velocity(vel)
             scene.step()
-        pos_by_config.append(torch.cat([rod_b.get_state().pos[0], rod_a.get_state().pos[0]]))
+        pos_by_config.append(torch.cat([rod_b.get_verts_pos(), rod_a.get_verts_pos()]))
     assert_allclose(pos_by_config[1], pos_by_config[0], atol=1e-12)
 
     # The contact is real and comes from the fallback: the broadphase listed no pair of edges of the two rods, the
@@ -333,7 +332,7 @@ def test_mpm_coupling_grad_matches_fd(backend, show_viewer):
         block.set_velocity(block_vel)
         for _ in range(n_steps):
             scene.step()
-        return (rod.get_state().pos[0] * rod_weights).sum() + (block.get_state().pos[0] * block_weights).sum()
+        return (rod.get_verts_pos() * rod_weights).sum() + (block.get_particles_pos() * block_weights).sum()
 
     inputs_ad = {name: value.clone().requires_grad_() for name, value in inputs.items()}
     rollout(**inputs_ad).backward()
@@ -438,7 +437,7 @@ def test_mid_rollout_attachment_grad_matches_fd(backend, show_viewer):
                 rods[0].set_vertex_constraints([0, 1], link=link_box.base_link)
                 rods[1].set_vertex_constraints(0, link=free_box.base_link)
             scene.step()
-        loss = (torch.stack([rod.get_state().pos[0] for rod in rods]) * rods_weights).sum()
+        loss = (torch.stack([rod.get_verts_pos() for rod in rods]) * rods_weights).sum()
         return loss + (free_box.get_pos() * box_weights).sum() + rods[0].get_geodesic_distance(2, 7)
 
     inputs_ad = {name: value.clone().requires_grad_() for name, value in inputs.items()}
