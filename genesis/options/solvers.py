@@ -4,7 +4,7 @@ import numpy as np
 from pydantic import PrivateAttr, StrictBool, model_validator
 
 import genesis as gs
-from genesis.typing import NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt, UnitVec4FType, Vec3FType
+from genesis.typing import NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt, Vec3FType
 
 from .options import Options
 
@@ -38,8 +38,6 @@ class SimOptions(Options):
         exception. Defaults to 1.
     gravity : tuple, optional
         Gravity force in N/kg. Defaults to (0.0, 0.0, -9.81).
-    floor_height : float, optional
-        Height of the floor in meters. Defaults to 0.0.
     requires_grad : bool, optional
         Whether to enable differentiable mode. Defaults to False.
     use_hydroelastic_contact : bool, optional
@@ -49,7 +47,6 @@ class SimOptions(Options):
     dt: PositiveFloat = 1e-2
     substeps: PositiveInt = 1
     gravity: Vec3FType = (0.0, 0.0, -9.81)
-    floor_height: float = 0.0
     requires_grad: StrictBool = False
 
 
@@ -117,23 +114,54 @@ class SAPCouplerOptions(BaseCouplerOptions):
     Parameters
     ----------
     n_sap_iterations : int, optional
-        Number of iterations for the SAP solver. Defaults to 5.
+        Maximum number of Newton iterations of the SAP solver in each substep, which stops earlier once it converges. A
+        smaller value bounds the cost of a substep, at the risk of returning velocities that do not satisfy the contacts
+        and that inject energy into resting contacts. Defaults to 100.
     n_pcg_iterations : int, optional
         Number of iterations for the Preconditioned Conjugate Gradient solver. Defaults to 100.
     n_linesearch_iterations : int, optional
-        Max number of iterations for the line search solver. Defaults to 10.
+        Maximum number of iterations of the exact line search of each Newton iteration, which stops earlier once it
+        meets its tolerance, usually within a few iterations. A smaller value bounds the cost of a Newton iteration, at
+        the risk of taking a step short of the minimum of the cost along the Newton direction, which can stall the
+        Newton iterations. Defaults to 100.
     sap_convergence_atol : float, optional
-        Absolute tolerance for SAP convergence. Defaults to 1e-6.
+        Absolute tolerance of the SAP solve on the norm of the gradient of its cost, in momentum units, added to the
+        relative one. A larger value stops the solves of scenes moving slowly earlier, at the cost of accuracy near
+        rest. Defaults to None, which leaves the relative tolerance alone.
     sap_convergence_rtol : float, optional
-        Relative tolerance for SAP convergence. Defaults to 1e-5.
+        Tolerance of the SAP solve on the norm of the gradient of its cost relative to the momentum of the scene. A
+        smaller value solves the contacts more accurately, so that resting contacts slip less within a step, at the cost
+        of more Newton iterations per substep. Defaults to None, which takes 1e-4 in double precision and 1e-3 in single
+        precision: single precision with its default runs fastest, while double precision solves about ten times more
+        accurately for a quarter to two thirds more Newton iterations. A solve also stops once its iterations no longer
+        decrease its cost, which bounds the accuracy any value can reach to the precision of the simulation.
     sap_taud : float, optional
         Dissipation time scale for SAP. Defaults to 0.1.
     sap_beta : float, optional
-        Normal regularization parameter for SAP. Defaults to 1.0.
+        Stiffness of the contacts of rigid bodies, as the time a resting body takes to settle on what it rests on, in
+        substeps. A smaller value makes the contacts stiffer, so that bodies sink less into each other and rock less
+        under a push, at the cost of a less robust solve that may take more iterations. A larger value softens them:
+        the penetration grows with the square of this value. On the vertex floor (`rigid_floor_contact_type="vert"`),
+        the fixed stiffness of each vertex also bounds how stiff the contact of a heavy body gets. Defaults to 0.125,
+        which keeps resting bodies less than a tenth of a millimeter deep at usual substeps.
     sap_sigma : float, optional
         Friction regularization parameter for SAP. Defaults to 1e-3.
+    enable_lagged_friction : bool, optional
+        Whether the friction of each contact scales with its normal force of the previous substep rather than with the
+        normal force solved within the substep. Lagged friction keeps sliding bodies on the surface they slide on,
+        decelerating at the rate of Coulomb friction, where SAP friction lifts them off it at a speed growing with
+        their sliding speed. In exchange, the friction lags one substep behind changes of the normal force, so that it
+        grips harder on impact, and sticking contacts under load creep at a speed up to `stiction_tolerance`. Defaults
+        to True.
+    stiction_tolerance : float, optional
+        Sliding speed below which lagged friction holds a contact as sticking, in m/s. A smaller value lets sticking
+        contacts creep less, at the cost of more Newton iterations per substep. Ignored without lagged friction.
+        Defaults to 1e-4.
     pcg_threshold : float, optional
-        Threshold for the Preconditioned Conjugate Gradient solver. Defaults to 1e-6.
+        Threshold of the Preconditioned Conjugate Gradient solver on the squared residual of each Newton step, relative
+        to its initial value. A smaller value takes fewer and more accurate Newton steps, each costing more conjugate
+        gradient iterations, for the same converged result. A value below the square of the precision of the simulation
+        acts as that square. Defaults to 1e-2.
     linesearch_ftol : float, optional
         Line search sufficient value close to zero for exact linesearch. Defaults to 1e-6.
     linesearch_max_step_size : float, optional
@@ -143,7 +171,8 @@ class SAPCouplerOptions(BaseCouplerOptions):
     point_contact_stiffness : float, optional
         Stiffness for point contact. Defaults to 1e8.
     fem_floor_contact_type : str, optional
-        Type of contact against the floor. Defaults to "tet". Can be "tet", "vert", or "none".
+        Type of contact against the floor. Defaults to "tet". Can be "tet", "vert", or "none". The floor is the rigid
+        ground plane of the scene, which must be a single fixed plane facing up. A scene without one has no floor.
         TET would be the default choice for most cases.
         VERT would be preferable when the mesh is very coarse, such as a single cube or a tetrahedron.
     enable_fem_self_tet_contact : bool, optional
@@ -151,22 +180,36 @@ class SAPCouplerOptions(BaseCouplerOptions):
     rigid_rigid_type : str, optional
         Type of contact between rigid bodies. Defaults to "tet". Can be "tet", "vert", or "none".
     rigid_floor_contact_type : str, optional
-        Type of contact against the floor. Defaults to "tet". Can be "tet", "vert", or "none".
+        Type of contact against the floor, as for `fem_floor_contact_type`. Defaults to "tet". Can be "tet", "vert",
+        or "none".
         Tet would be the default choice for most cases.
         Vert would be preferable when the mesh is very coarse, such as a single cube or a tetrahedron.
     enable_rigid_fem_contact : bool, optional
         Whether to enable coupling between rigid and FEM solvers. Defaults to True.
+    max_collision_pairs : int, optional
+        Maximum number of collision pairs of each kind of contact in each environment: the pairs of overlapping bounding
+        boxes the contact detection tests, and the pairs of elements, or of an element and the floor, that may touch. A
+        larger value covers larger or more finely meshed contact patches, at the cost of memory proportional to it and
+        to the number of environments, capped by the most pairs the scene can produce. Exceeding it at runtime halts
+        the simulation with an error naming this option. Defaults to 32768.
+    max_contacts : int, optional
+        Maximum number of contact points of each kind of contact in each environment. A larger value covers larger or
+        more finely meshed contact patches, at the cost of memory proportional to it and to the number of environments,
+        capped by the most contact points the scene can produce. Exceeding it at runtime halts the simulation with an
+        error naming this option. Defaults to 4096.
     """
 
-    n_sap_iterations: PositiveInt = 5
+    n_sap_iterations: PositiveInt = 100
     n_pcg_iterations: PositiveInt = 100
-    n_linesearch_iterations: PositiveInt = 10
-    sap_convergence_atol: PositiveFloat = 1e-6
-    sap_convergence_rtol: PositiveFloat = 1e-5
+    n_linesearch_iterations: PositiveInt = 100
+    sap_convergence_atol: PositiveFloat | None = None
+    sap_convergence_rtol: PositiveFloat | None = None
     sap_taud: PositiveFloat = 0.1
-    sap_beta: PositiveFloat = 1.0
+    sap_beta: PositiveFloat = 0.125
     sap_sigma: PositiveFloat = 1e-3
-    pcg_threshold: PositiveFloat = 1e-6
+    enable_lagged_friction: StrictBool = True
+    stiction_tolerance: PositiveFloat = 1e-4
+    pcg_threshold: PositiveFloat = 1e-2
     linesearch_ftol: PositiveFloat = 1e-6
     linesearch_max_step_size: PositiveFloat = 1.5
     hydroelastic_stiffness: PositiveFloat = 1e8
@@ -176,6 +219,8 @@ class SAPCouplerOptions(BaseCouplerOptions):
     rigid_floor_contact_type: Literal["tet", "vert", "none"] = "tet"
     enable_rigid_fem_contact: StrictBool = True
     rigid_rigid_contact_type: Literal["tet", "vert", "none"] = "tet"
+    max_collision_pairs: NonNegativeInt = 32768
+    max_contacts: NonNegativeInt = 4096
 
 
 class IPCCouplerOptions(BaseCouplerOptions):
@@ -865,8 +910,6 @@ class FEMOptions(GravityMixin, TimeBasedMixin):
     ----------
     damping : float, optional
         Damping factor. Defaults to 0.0.
-    floor_height : float, optional
-        Height of the floor in meters. If none, it will inherit from `SimOptions`. Defaults to None.
     use_implicit_solver : bool, optional
         Whether to use the implicit solver. Defaults to False.
         Implicit solver is a more stable solver for FEM. It can be used with a large time step.
@@ -879,7 +922,9 @@ class FEMOptions(GravityMixin, TimeBasedMixin):
     newton_dx_threshold : float, optional
         Threshold for the Newton solver. Defaults to 1e-6. Only used when `use_implicit_solver` is True.
     pcg_threshold : float, optional
-        Threshold for the PCG solver. Defaults to 1e-6. Only used when `use_implicit_solver` is True.
+        Threshold for the PCG solver. Defaults to 1e-6. Only used when `use_implicit_solver` is True, without
+        `requires_grad`: a differentiable scene solves to the precision of the simulation instead, which its gradients
+        need, at the cost of more iterations.
     linesearch_c : float, optional
         Line search sufficient decrease parameter. Defaults to 1e-4. Only used when `use_implicit_solver` is True.
     linesearch_tau : float, optional
@@ -893,7 +938,6 @@ class FEMOptions(GravityMixin, TimeBasedMixin):
     """
 
     damping: NonNegativeFloat = 0.0
-    floor_height: float | None = None
     use_implicit_solver: StrictBool = False
     n_newton_iterations: PositiveInt = 1
     n_pcg_iterations: PositiveInt = 500
@@ -945,20 +989,3 @@ class RodOptions(GravityMixin, TimeBasedMixin):
     contact_margin: PositiveFloat | None = None
     multiplier_contact_candidates: PositiveInt = 32
 
-
-class SFOptions(TimeBasedMixin):
-    """
-    Options configuring the SFSolver.
-    """
-
-    res: PositiveInt = 128
-    solver_iters: PositiveInt = 500
-    decay: PositiveFloat = 0.99
-
-    T_low: float = 1.0
-    T_high: float = 0.0
-
-    inlet_pos: Vec3FType = (0.6, 0.0, 0.1)
-    inlet_vel: Vec3FType = (0.0, 0.0, 1.0)
-    inlet_quat: UnitVec4FType = (1.0, 0.0, 0.0, 0.0)
-    inlet_s: PositiveFloat = 400.0

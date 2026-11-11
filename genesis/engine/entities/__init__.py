@@ -12,4 +12,3 @@ from .pbd_entity import (
 from .rigid_entity import DroneEntity, KinematicEntity, RigidEntity, TerrainEntity
 from .rod_entity import RodEntity
 from .sph_entity import SPHEntity
-from .sf_entity import SFParticleEntity

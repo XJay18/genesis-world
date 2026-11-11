@@ -6,9 +6,9 @@ import sys
 import tempfile
 import traceback
 import weakref
+from collections.abc import Callable
 from contextlib import redirect_stdout
 from functools import partial
-from typing import Callable
 from warnings import warn
 
 # Import quadrants while collecting its output without printing directly
@@ -144,9 +144,11 @@ def init(
             raise_exception(f"Zero-copy not supported on {backend} backend.")
     use_zerocopy = ZeroCopyMode(_use_zerocopy)
 
-    # Reproducing a rollout means settling the runtime-measured choices the simulation would otherwise keep revisiting
-    # (see prefer_decomposed_solver in rigid_solver.py), at the cost of the throughput they were buying. If None, it is
-    # resolved from the array mode: disabled in performance mode (static arrays), enabled otherwise.
+    # Deterministic algorithms make a rollout repeat bit for bit from one run to the next, and keep environments in the
+    # same state identical. On GPU, they settle the choices the simulation would otherwise measure at runtime and sum in
+    # a fixed order what the threads would add in any order, at the cost of speed and memory, most of all when the
+    # environments drift apart. If None, it is resolved from the array mode: disabled in performance mode (static
+    # arrays), enabled otherwise.
     if use_deterministic_algorithms is None:
         use_deterministic_algorithms = _use_ndarray
     globals()["use_deterministic_algorithms"] = use_deterministic_algorithms
@@ -279,7 +281,8 @@ def init(
     # init quadrants
     qd_debug = debug and (os.environ.get("QD_DEBUG") != "0")
     # The native logger of Quadrants writes to the stderr file descriptor directly, before its Python logger is
-    # redirected to ours below, so what it prints while initializing is collected there as well
+    # redirected to ours below, so what it prints while initializing is collected there as well, except on Windows where
+    # it writes to the standard error handle of the process (see 'redirect_libc_stderr').
     with tempfile.TemporaryFile(mode="w+") as qd_errors:
         with redirect_stdout(_qd_outputs), redirect_libc_stderr(qd_errors), set_environ(qd_init_environ):
             qd.init(

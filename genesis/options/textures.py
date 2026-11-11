@@ -1,15 +1,16 @@
 import os
+from collections.abc import Iterable, Sequence
 from functools import cached_property
-from typing import Annotated, Sequence, Literal, Iterable, cast
+from typing import Annotated, Literal, cast
 
 import numpy as np
+
 from PIL import Image
-from pydantic import model_validator, computed_field, BeforeValidator, Field
+from pydantic import BeforeValidator, Field, computed_field, model_validator
 
 import genesis as gs
 import genesis.utils.mesh as mu
-from genesis.typing import LaxUnitIntervalArrayType, LaxFArrayType, UnitIntervalArrayType, NDArrayType
-
+from genesis.typing import LaxFArrayType, LaxUnitIntervalArrayType, NDArrayType, UnitIntervalArrayType
 from genesis.utils.serialization import Exporting, Loading, SerializationMixin
 
 from .options import Options
@@ -31,7 +32,7 @@ class Texture(Options):
     # Pydantic disables hashing for models with a field-based __eq__; its only opt-in (model_config frozen=True) also
     # forbids the in-place edits done during setup (apply_cutoff, check_dim reassign image_array/color). Restore
     # identity hashing instead: textures are shared by reference and stable once a surface is built, so their identity
-    # is a valid key for caches such as the get_rgba cache.
+    # is a valid key for caches such as the trimesh materials cache (see 'surface_uvs_to_trimesh_visual').
     __hash__ = object.__hash__
 
     def __init__(self, **data):
@@ -288,7 +289,7 @@ class BatchTexture(Texture):
 
     Parameters
     ----------
-    textures : List[Optional[Texture]]
+    textures : list[Texture | None]
         List of textures.
     """
 
@@ -307,13 +308,13 @@ class BatchTexture(Texture):
 
         Parameters
         ----------
-        image_paths : List[str], optional
+        image_paths : list[str], optional
             List of paths to the image files.
         image_folder : str, optional
             Path to the image folder.
-        image_arrays : List[np.ndarray], optional
+        image_arrays : list[np.ndarray], optional
             List of image arrays.
-        image_colors : List[Union[float, List[float]]], optional
+        image_colors : list[float | list[float]], optional
             List of color factors that will be multiplied with the base color, stored as tuple. Default is None.
         encoding : str, optional
             The encoding way of the image. Possible values are ['srgb', 'linear']. Default is 'srgb'.
@@ -349,9 +350,9 @@ class BatchTexture(Texture):
             gs.raise_exception("No images found.")
 
         if image_colors is not None:
-            if isinstance(image_colors[0], float):  # List[float]
+            if isinstance(image_colors[0], float):  # list[float]
                 image_colors = [image_colors for _ in range(num_images)]
-            else:  # List[List[float]]
+            else:  # list[list[float]]
                 if len(image_colors) != num_images:
                     gs.raise_exception("The number of image colors must be the same as the number of images.")
         else:
@@ -377,7 +378,7 @@ class BatchTexture(Texture):
 
         Parameters
         ----------
-        colors : List[List[float]]
+        colors : list[list[float]]
             List of colors.
         """
         return BatchTexture(textures=[ColorTexture(color=color) for color in colors])

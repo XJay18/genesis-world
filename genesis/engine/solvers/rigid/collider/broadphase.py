@@ -10,18 +10,12 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.array_class import (
-    ColliderInfo,
-    ColliderState,
-    ConstraintState,
-    DynInfo,
-    DynState,
-    ErrorCode,
-    GeomsInitAABB,
-    RigidInfo,
-)
+from genesis.engine.solvers.rigid.constraint.data import ConstraintState
+from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidErrorCode, RigidInfo
+from genesis.utils.data import eoa
 
 from .contact import func_collider_clear_env, func_is_link_pair_hibernated
+from .data import ColliderInfo, ColliderState
 from .utils import func_is_geom_boxes_overlap
 
 
@@ -63,7 +57,6 @@ def func_check_links_collision_valid(
 
 @qd.func
 def func_collision_clear(
-    geoms_init_AABB: GeomsInitAABB,
     dyn_state: DynState,
     collider_state: ColliderState,
     dyn_info: DynInfo,
@@ -99,7 +92,7 @@ def func_collision_clear(
             for i_pair_ in range(i_chunk * n_pairs // n_chunks, (i_chunk + 1) * n_pairs // n_chunks):
                 i_ga = collider_state.broad_collision_pairs[i_pair_, i_b][0]
                 i_gb = collider_state.broad_collision_pairs[i_pair_, i_b][1]
-                if not func_is_geom_boxes_overlap(i_ga, i_gb, i_b, geoms_init_AABB, dyn_state, dyn_info, rigid_info):
+                if not func_is_geom_boxes_overlap(i_ga, i_gb, i_b, dyn_state, dyn_info, rigid_info):
                     i_pair = collider_info.collision_pair_idx[i_ga, i_gb]
                     collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
                     collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
@@ -252,7 +245,7 @@ def _func_broad_phase_links_all_vs_all(
     n_valid_link_pairs = collider_info.n_valid_link_pairs[None]
 
     qd.loop_config(name="traverse_valid_links", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_lp, i_b in qd.ndrange(n_valid_link_pairs, _B):
+    for i_lp, i_b in qd.ndrange(n_valid_link_pairs, _B, axes=qd.static(eoa(dyn_state.geoms.pos))):
         # See func_collision_clear. No geom pair is ever a candidate when no link pair is valid.
         if i_lp == 0:
             collider_state.n_broad_pairs[i_b] = 0
@@ -273,7 +266,6 @@ def _func_broad_phase_links_all_vs_all(
 
 @qd.func
 def func_broad_phase_geoms(
-    geoms_init_AABB: GeomsInitAABB,
     dyn_state: DynState,
     collider_state: ColliderState,
     dyn_info: DynInfo,
@@ -287,11 +279,10 @@ def func_broad_phase_geoms(
     Each geom of the outer link of a candidate pair, the link holding the most geoms, is tested against the box of the
     inner link first, then against each geom of the inner link, so the work spreads over the geoms of the larger link.
     """
-    n_geoms = dyn_state.geoms.aabb_min.shape[0]
-    _B = collider_state.n_contacts.shape[0]
-
     qd.loop_config(name="traverse_link_pairs_geoms", serialize=rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
-    for i_g, i_b in qd.ndrange(n_geoms, _B):
+    for i_g, i_b in qd.ndrange(
+        *dyn_state.geoms.aabb_min.shape, axes=qd.static(eoa(collider_state.broad_collision_pairs))
+    ):
         i_l = dyn_info.geoms.link_idx[i_g]
         for i_lp_ in range(collider_state.n_broad_link_pairs[i_b]):
             i_lp = collider_state.broad_link_pairs[i_lp_, i_b]
@@ -312,20 +303,17 @@ def func_broad_phase_geoms(
                             # detection reads it in
                             if dyn_info.geoms.type[i_ga] > dyn_info.geoms.type[i_gb]:
                                 i_ga, i_gb = i_gb, i_ga
-                            if func_is_geom_boxes_overlap(
-                                i_ga, i_gb, i_b, geoms_init_AABB, dyn_state, dyn_info, rigid_info
-                            ):
+                            if func_is_geom_boxes_overlap(i_ga, i_gb, i_b, dyn_state, dyn_info, rigid_info):
                                 n_broad = qd.atomic_add(collider_state.n_broad_pairs[i_b], 1)
                                 if n_broad < collider_info.max_collision_pairs_broad[None]:
                                     collider_state.broad_collision_pairs[n_broad, i_b][0] = i_ga
                                     collider_state.broad_collision_pairs[n_broad, i_b][1] = i_gb
                                 else:
-                                    errno[i_b] = errno[i_b] | ErrorCode.OVERFLOW_CANDIDATE_CONTACTS
+                                    errno[i_b] = errno[i_b] | RigidErrorCode.OVERFLOW_CANDIDATE_CONTACTS
 
 
 @qd.func
 def func_broad_phase(
-    geoms_init_AABB: GeomsInitAABB,
     dyn_state: DynState,
     collider_state: ColliderState,
     constraint_state: ConstraintState,
@@ -337,9 +325,7 @@ def func_broad_phase(
     errno: qd.Tensor,
 ):
     """Run the broad phase, sweeping the links with the traversal the rigid config selects then testing their geoms."""
-    func_collision_clear(
-        geoms_init_AABB, dyn_state, collider_state, dyn_info, rigid_info, collider_info, rigid_config, collider_config
-    )
+    func_collision_clear(dyn_state, collider_state, dyn_info, rigid_info, collider_info, rigid_config, collider_config)
     if qd.static(rigid_config.broadphase_traversal == gs.broadphase_traversal.ALL_VS_ALL):
         _func_broad_phase_links_all_vs_all(
             dyn_state, collider_state, constraint_state, dyn_info, rigid_info, collider_info, rigid_config
@@ -348,6 +334,4 @@ def func_broad_phase(
         _func_broad_phase_links_sap(
             dyn_state, collider_state, constraint_state, dyn_info, rigid_info, collider_info, rigid_config
         )
-    func_broad_phase_geoms(
-        geoms_init_AABB, dyn_state, collider_state, dyn_info, rigid_info, collider_info, rigid_config, errno
-    )
+    func_broad_phase_geoms(dyn_state, collider_state, dyn_info, rigid_info, collider_info, rigid_config, errno)

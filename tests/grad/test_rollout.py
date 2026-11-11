@@ -78,9 +78,12 @@ def test_horizon_truncation_matches_independent_scenes(model_name, request, tol,
 
 
 @pytest.mark.required
-def test_sim_vs_solver_state_grad_parity(show_viewer):
+def test_state_query_grad_parity(show_viewer):
+    DT = 0.01
+
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
+            dt=DT,
             gravity=(0.0, 0.0, 0.0),
             requires_grad=True,
         ),
@@ -103,15 +106,14 @@ def test_sim_vs_solver_state_grad_parity(show_viewer):
     ctrl = torch.tensor(np.random.randn(robot.n_dofs), dtype=gs.tc_float, device=gs.device, requires_grad=True)
 
     grads = []
-    for is_sim_state_source in (False, True):
+    for is_solver_source in (False, True):
         scene.reset()
         robot.set_dofs_velocity(ctrl)
         scene.step()
-        if is_sim_state_source:
-            sim_state = scene.get_state()
-            chassis_pos = sim_state.solvers_state[scene.solvers.index(scene.rigid_solver)].links_pos[:, 0].squeeze()
+        if is_solver_source:
+            chassis_pos = scene.rigid_solver.get_links_pos(links_idx=robot.base_link_idx)
         else:
-            chassis_pos = robot.get_state().pos.squeeze()
+            chassis_pos = robot.get_pos()
         loss = torch.linalg.norm(chassis_pos)
         loss.backward()
         # The backward pass of a step replays it from the state it started from, so the clock follows the physics the
@@ -126,9 +128,18 @@ def test_sim_vs_solver_state_grad_parity(show_viewer):
 
     # A state queried after a setter reflects it, even within the step of an earlier query
     scene.reset()
-    robot.get_state()
+    robot.get_pos()
     robot.set_pos((0.1, -0.2, 0.3))
-    assert_allclose(robot.get_state().pos[0], (0.1, -0.2, 0.3), tol=gs.EPS)
+    assert_allclose(robot.get_pos(), (0.1, -0.2, 0.3), tol=gs.EPS)
+
+    # Starting at rest, a body turns by its angular velocity times the time step, and the imaginary part of its
+    # quaternion by half of that.
+    scene.reset()
+    ang_vel = torch.zeros(3, dtype=gs.tc_float, device=gs.device, requires_grad=True)
+    robot.set_dofs_velocity(ang_vel, dofs_idx_local=[3, 4, 5])
+    scene.step()
+    (ang_vel_grad,) = torch.autograd.grad(robot.get_quat()[1:].sum(), ang_vel)
+    assert_allclose(ang_vel_grad, 0.5 * DT, tol=gs.EPS)
 
 
 @pytest.mark.required
@@ -352,14 +363,11 @@ def test_state_getters_grad_matches_fd(grad_free_with_hinge_ball_slide, precisio
 
 
 @pytest.mark.required
-# The SAP coupler, one of the couplings refused, supports 64 bits precision alone
-@pytest.mark.precision("64")
 def test_reject_non_differentiable_solvers():
     box = gs.morphs.Box(pos=(0.0, 0.0, 0.5), size=(0.1, 0.1, 0.1))
     for materials, options, component_name in (
         ((gs.materials.PBD.Liquid(),), {}, "PBDSolver"),
         ((gs.materials.SPH.Liquid(),), {}, "SPHSolver"),
-        ((gs.materials.FEM.Elastic(),), {"fem_options": gs.options.FEMOptions(use_implicit_solver=True)}, "FEMSolver"),
         ((gs.materials.FEM.Elastic(), gs.materials.Rigid()), {}, "LegacyCoupler"),
         ((gs.materials.Rigid(),), {"coupler_options": gs.options.SAPCouplerOptions()}, "SAPCoupler"),
     ):
