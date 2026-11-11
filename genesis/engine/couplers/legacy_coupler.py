@@ -2653,10 +2653,13 @@ def func_mpm_collide_with_rods(
                                 mass_contact = qd.max(rod_state.edges_mpm_mass[i_e, i_b], mass)
                                 impulse_scale = -(1.0 + restitution) * vel_normal / (1.0 + inv_mass_rod * mass_contact)
                                 vel = vel + impulse_scale * normal
-                                rod_state.verts.dv_mpm[i_v_s, i_b] -= (
-                                    impulse_scale * mass * (1.0 - t) * inv_mass_s * normal
+                                qd.atomic_sub(
+                                    rod_state.verts.dv_mpm[i_v_s, i_b],
+                                    impulse_scale * mass * (1.0 - t) * inv_mass_s * normal,
                                 )
-                                rod_state.verts.dv_mpm[i_v_e, i_b] -= impulse_scale * mass * t * inv_mass_e * normal
+                                qd.atomic_sub(
+                                    rod_state.verts.dv_mpm[i_v_e, i_b], impulse_scale * mass * t * inv_mass_e * normal
+                                )
     return vel
 
 
@@ -2714,7 +2717,7 @@ def kernel_rod_mpm_prepare(
                         # A node at an angle to the relative motion only takes the part of it along its normal
                         cos_sq = vel_normal * vel_normal / qd.max(vel_rel.dot(vel_rel), rod_info.EPS[None])
                         mass = grid_mass / mpm_info.particle_volume_scale[None]
-                        rod_state.edges_mpm_mass[i_e, i_b] += cos_sq * mass
+                        qd.atomic_add(rod_state.edges_mpm_mass[i_e, i_b], cos_sq * mass)
 
     # The boxes are grown in place in the fields rather than carried in locals, which would take an autodiff stack
     for i_run, i_b in qd.ndrange(*rod_state.edges_runs_min.shape, axes=qd.static(eoa(rod_state.edges_runs_min))):

@@ -945,10 +945,10 @@ def func_project_rod_edge_pair(
         inv_mass_eff = (weights * weights).dot(inv_masses)
         if inv_mass_eff > rod_info.EPS[None]:
             impulse = penetration / inv_mass_eff * normal
-            rod_state.verts.dp_contact[i_v_a1, i_b] += inv_masses[0] * weights[0] * impulse
-            rod_state.verts.dp_contact[i_v_a2, i_b] += inv_masses[1] * weights[1] * impulse
-            rod_state.verts.dp_contact[i_v_b1, i_b] -= inv_masses[2] * weights[2] * impulse
-            rod_state.verts.dp_contact[i_v_b2, i_b] -= inv_masses[3] * weights[3] * impulse
+            qd.atomic_add(rod_state.verts.dp_contact[i_v_a1, i_b], inv_masses[0] * weights[0] * impulse)
+            qd.atomic_add(rod_state.verts.dp_contact[i_v_a2, i_b], inv_masses[1] * weights[1] * impulse)
+            qd.atomic_sub(rod_state.verts.dp_contact[i_v_b1, i_b], inv_masses[2] * weights[2] * impulse)
+            qd.atomic_sub(rod_state.verts.dp_contact[i_v_b2, i_b], inv_masses[3] * weights[3] * impulse)
             # Each vertex averages the corrections of its contacts (see 'func_last_projection_correction'), so that the
             # contacts sharing it do not push it further than each asks
             for i_c_v in qd.static(range(4)):
@@ -1109,10 +1109,10 @@ def kernel_finalize_rod_positions(
                     if vel_tangent_norm >= mu_s * vel_normal:
                         dv_tangent = -mu_k * vel_normal / qd.max(vel_tangent_norm, rod_info.EPS[None]) * vel_tangent
                     impulse = dv_tangent / inv_mass_eff
-                    rod_state.verts.dv_friction[i_v_a1, i_b] += inv_masses[0] * weights[0] * impulse
-                    rod_state.verts.dv_friction[i_v_a2, i_b] += inv_masses[1] * weights[1] * impulse
-                    rod_state.verts.dv_friction[i_v_b1, i_b] -= inv_masses[2] * weights[2] * impulse
-                    rod_state.verts.dv_friction[i_v_b2, i_b] -= inv_masses[3] * weights[3] * impulse
+                    qd.atomic_add(rod_state.verts.dv_friction[i_v_a1, i_b], inv_masses[0] * weights[0] * impulse)
+                    qd.atomic_add(rod_state.verts.dv_friction[i_v_a2, i_b], inv_masses[1] * weights[1] * impulse)
+                    qd.atomic_sub(rod_state.verts.dv_friction[i_v_b1, i_b], inv_masses[2] * weights[2] * impulse)
+                    qd.atomic_sub(rod_state.verts.dv_friction[i_v_b2, i_b], inv_masses[3] * weights[3] * impulse)
 
 
 @qd.kernel(fastcache=True)
