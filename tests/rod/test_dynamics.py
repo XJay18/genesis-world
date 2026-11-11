@@ -337,16 +337,21 @@ def test_vertex_constraints_reset_with_state(show_viewer):
     pos_init = [rod.get_verts_pos() for rod in rods]
     box_pos_init = box.get_pos()
     verts_offset = gu.inv_transform_by_trans_quat(pos_init[1][:, 19], box_pos_init, box.get_quat())
+    bending_stiffness_init = rods[0].get_bending_stiffness()
+    rods[0].set_bending_stiffness(2.0 * bending_stiffness_init)
     for _ in range(20):
         scene.step()
     pos_env_0 = [rod.get_verts_pos()[0] for rod in rods]
-    # The constraints are part of the state, which a reset restores as built, the vertices the morphs fix included
+    # The constraints and the stiffness are part of the state, which a reset restores as built, the vertices the morphs
+    # fix included
     scene.reset(envs_idx=[1])
     for rod, pos, pos_0, rod_is_kinematic in zip(rods, pos_init, pos_env_0, is_kinematic):
         assert_allclose(rod.get_verts_pos()[1], pos[1], tol=gs.EPS)
         assert_allclose(rod.get_verts_pos()[0], pos_0, tol=gs.EPS)
         assert_equal(rod.get_verts_kinematic()[0], rod_is_kinematic[0])
         assert_equal(rod.get_verts_kinematic()[1], rod is rods[2])
+    stiffness_scale = torch.tensor((2.0, 1.0), dtype=gs.tc_float, device=gs.device)
+    assert_allclose(rods[0].get_bending_stiffness(), stiffness_scale * bending_stiffness_init, tol=gs.EPS)
 
     scene.reset()
     for rod in rods:
