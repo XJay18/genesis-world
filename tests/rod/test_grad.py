@@ -6,7 +6,7 @@ import genesis as gs
 from genesis.utils.misc import qd_to_numpy
 
 from ..grad.conftest import step_overwrites  # noqa: F401
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 
 pytestmark = [pytest.mark.precision("64")]
 
@@ -460,3 +460,147 @@ def test_mid_rollout_attachment_grad_matches_fd(backend, show_viewer):
         grad_fd = (loss_plus - loss_minus) / (2.0 * eps)
         grad_ad = (inputs_ad[name].grad * direction).sum()
         assert abs(grad_ad - grad_fd) <= tol * abs(grad_fd), name
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+def test_parallel_envs_grad_matches_single_env(backend, show_viewer):
+    n_steps = 10
+
+    def build_scene(n_envs):
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(
+                dt=1e-3,
+                substeps=5,
+                requires_grad=True,
+            ),
+            rod_options=gs.options.RodOptions(
+                damping=10.0,
+                angular_damping=5.0,
+                # A multiplier under the number of possible pairs of edges brings the broadphase in
+                multiplier_contact_candidates=4,
+            ),
+            mpm_options=gs.options.MPMOptions(
+                lower_bound=(-0.1, -0.1, -0.05),
+                upper_bound=(0.1, 0.1, 0.15),
+            ),
+            viewer_options=gs.options.ViewerOptions(
+                camera_pos=(0.0, -1.5, 0.6),
+                camera_lookat=(0.0, 0.0, 0.2),
+            ),
+            show_viewer=show_viewer,
+        )
+        material = gs.materials.Rod.Base(
+            K=1e6,
+            E=1e5,
+            G=1e4,
+            segment_mass=0.02,
+            segment_radius=0.005,
+            restitution=0.3,
+        )
+        # A rod sliding with friction on a free box, which takes the reaction of the contacts
+        box = scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(0.5, 0.0, 0.2),
+                size=(0.4, 0.1, 0.02),
+            ),
+            material=gs.materials.Rigid(
+                rho=0.3 / (0.4 * 0.1 * 0.02),
+                needs_coup=True,
+                coup_friction=0.3,
+                gravity_compensation=1.0,
+            ),
+        )
+        rod_on_box = scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=12,
+                interval=0.01,
+                pos=(0.445, 0.0, 0.215),
+            ),
+            material=material,
+        )
+        # A rod dropped across a fixed one, their pairs of edges found by the broadphase
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=12,
+                interval=0.01,
+                axis="y",
+                pos=(-0.5, -0.055, 0.3),
+                fixed=True,
+            ),
+            material=material,
+        )
+        rod_crossing = scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=12,
+                interval=0.01,
+                pos=(-0.555, 0.0, 0.3105),
+            ),
+            material=material,
+        )
+        # A light rod thrown onto an MPM block
+        block = scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(0.0, 0.0, 0.05),
+                size=(0.04, 0.04, 0.04),
+            ),
+            material=gs.materials.MPM.Elastic(
+                E=1e4,
+                rho=500.0,
+            ),
+        )
+        rod_on_block = scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=6,
+                interval=0.01,
+                pos=(-0.025, 0.003, 0.077),
+            ),
+            material=gs.materials.Rod.Base(
+                E=1e5,
+                G=1e4,
+                segment_mass=0.002,
+                segment_radius=0.005,
+                restitution=0.3,
+            ),
+        )
+        scene.build(n_envs=n_envs)
+        return scene, (rod_on_box, rod_crossing, rod_on_block), box, block
+
+    rng = np.random.default_rng(0)
+    # A velocity per environment for each rod, toward its box, rod or block
+    vels_drift = ((0.3, 0.0, 0.0), (0.0, 0.0, -0.5), (0.1, 0.05, -1.0))
+    vels = [
+        torch.tensor(0.1 * rng.standard_normal((2, n_verts, 3)) + np.array(drift), dtype=gs.tc_float, device=gs.device)
+        for n_verts, drift in zip((12, 12, 6), vels_drift)
+    ]
+    rods_weights = [
+        torch.tensor(rng.standard_normal((n_verts, 3)), dtype=gs.tc_float, device=gs.device) for n_verts in (12, 12, 6)
+    ]
+    box_weights = torch.tensor(rng.standard_normal(3), dtype=gs.tc_float, device=gs.device)
+
+    def rollout(scene, rods, box, block, rods_vel, block_weights):
+        scene.reset()
+        for rod, vel in zip(rods, rods_vel):
+            rod.set_velocity(vel)
+        for _ in range(n_steps):
+            scene.step()
+        loss = (box.get_pos() * box_weights).sum() + (block.get_particles_pos() * block_weights).sum()
+        for rod, weights in zip(rods, rods_weights):
+            loss = loss + (rod.get_verts_pos() * weights).sum()
+        return loss, [rod.get_verts_pos().detach() for rod in rods]
+
+    # The environments of a scene, which hold different inputs, step and reverse as the scenes of one environment do
+    scene, rods, box, block = build_scene(n_envs=2)
+    block_weights = torch.tensor(rng.standard_normal((block.n_particles, 3)), dtype=gs.tc_float, device=gs.device)
+    vels_ad = [vel.clone().requires_grad_() for vel in vels]
+    loss, rods_pos = rollout(scene, rods, box, block, vels_ad, block_weights)
+    loss.backward()
+    scene_single, rods_single, box_single, block_single = build_scene(n_envs=0)
+    for i_b in range(2):
+        vels_single = [vel[i_b].clone().requires_grad_() for vel in vels]
+        loss, rods_pos_single = rollout(scene_single, rods_single, box_single, block_single, vels_single, block_weights)
+        loss.backward()
+        for pos, pos_single, vel_ad, vel_single in zip(rods_pos, rods_pos_single, vels_ad, vels_single):
+            assert_equal(pos_single, pos[i_b])
+            # The atomic sums of the contacts take another order on GPU, which leaves rounding in the gradients
+            assert_allclose(vel_single.grad, vel_ad.grad[i_b], tol=5e-14)
