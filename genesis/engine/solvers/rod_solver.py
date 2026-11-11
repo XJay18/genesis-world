@@ -398,6 +398,9 @@ class RodConfig(Config):
     # Whether the rods collide with the rigid geoms that need coupling, whose projection then ends each substep (see
     # 'LegacyCoupler.project_rod_rigid_contacts')
     has_rigid_contacts: bool
+    # The contacts with the rigid geoms a vertex owns at most, which the kernels of the coupling unroll (see
+    # ROD_RIGID_CONTACTS_PER_VERT)
+    n_rigid_contacts_per_vert: int
 
 
 @qd.func
@@ -1351,6 +1354,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             has_edge_pairs=self._n_edge_pairs > 0,
             has_broadphase=self._has_broadphase,
             has_rigid_contacts=self._rigid_coupler is not None,
+            n_rigid_contacts_per_vert=ROD_RIGID_CONTACTS_PER_VERT,
         )
 
         self.data_manager = RodData(self)

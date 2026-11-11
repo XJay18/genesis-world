@@ -589,6 +589,7 @@ class LegacyCoupler(ErrnoMixin, CheckpointMixin, RBC):
             rigid_solver.dyn_info.geoms,
             self.legacy_coupler_info,
             rigid_solver.rigid_config,
+            self.rod_solver.rod_config,
         )
 
     @property
@@ -1726,11 +1727,12 @@ def kernel_place_fem_sph_ghosts(
 
 
 @qd.func
-def func_rod_rigid_contacts_are_squeezing(i_v: int, i_b: int, n_contacts: int, rod_state: RodState) -> bool:
+def func_rod_rigid_contacts_are_squeezing(
+    i_v: int, i_b: int, n_contacts: int, rod_state: RodState, rod_config: qd.template()
+) -> bool:
     """Whether two contacts of a vertex of the rods with rigid geoms push it from opposite sides (see
     'RodRigidContacts'), their normals opposing."""
-    # The contacts a vertex owns at most (see 'ROD_RIGID_CONTACTS_PER_VERT' in rod_solver.py)
-    N_CONTACTS_MAX = qd.static(4)
+    N_CONTACTS_MAX = qd.static(rod_config.n_rigid_contacts_per_vert)
     is_squeezed = False
     for i_c in qd.static(range(N_CONTACTS_MAX)):
         for j_c in qd.static(range(i_c + 1, N_CONTACTS_MAX)):
@@ -2156,8 +2158,7 @@ def kernel_project_rod_rigid_normal(
     contact on its half of the edge, the record being cleared at the first substep of a step ('is_step_start'), so
     that it holds the contacts of the whole step.
     """
-    # The contacts a vertex owns at most (see 'ROD_RIGID_CONTACTS_PER_VERT' in rod_solver.py)
-    N_CONTACTS_MAX = qd.static(4)
+    N_CONTACTS_MAX = qd.static(rod_config.n_rigid_contacts_per_vert)
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + func_last_projection_correction(
             i_v, i_b, rod_state, rod_config
@@ -2279,7 +2280,7 @@ def kernel_project_rod_rigid_normal(
         if n_contacts > 0:
             # The displacement of the point of each contact along its normal per unit impulse along the normal of
             # each, through the rod alone, an unused contact left out by a unit diagonal
-            is_squeezed = func_rod_rigid_contacts_are_squeezing(i_v, i_b, n_contacts, rod_state)
+            is_squeezed = func_rod_rigid_contacts_are_squeezing(i_v, i_b, n_contacts, rod_state, rod_config)
             coupling = qd.Matrix.zero(gs.qd_float, N_CONTACTS_MAX, N_CONTACTS_MAX)
             for i_c in qd.static(range(N_CONTACTS_MAX)):
                 for j_c in qd.static(range(N_CONTACTS_MAX)):
@@ -2360,6 +2361,7 @@ def kernel_project_rod_rigid_friction(
     geoms_info: GeomsInfo,
     legacy_coupler_info: LegacyCouplerInfo,
     rigid_config: qd.template(),
+    rod_config: qd.template(),
 ):
     """Compute the friction of the contacts of the rods with the rigid geoms, and apply the reaction to the links.
 
@@ -2382,8 +2384,7 @@ def kernel_project_rod_rigid_friction(
     of its contacts alone: corrections of the vertex for the motion of the other vertex of an edge would fight the
     rod at every substep. An anchor taken at another parameter moves with the point, keeping the slip since.
     """
-    # The contacts a vertex owns at most (see 'ROD_RIGID_CONTACTS_PER_VERT' in rod_solver.py)
-    N_CONTACTS_MAX = qd.static(4)
+    N_CONTACTS_MAX = qd.static(rod_config.n_rigid_contacts_per_vert)
     # The Gauss-Seidel sweeps over the contacts of a vertex of the friction impulses and the anchor recovery
     N_SWEEPS = qd.static(2)
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
@@ -2398,7 +2399,7 @@ def kernel_project_rod_rigid_friction(
             inv_mass = func_inverse_mass(i_v, i_b, rod_state, rod_info)
             # The displacement of the point of each contact per unit impulse along the surface, through the rod and
             # the link, and the slip of the point to cancel
-            is_squeezed = func_rod_rigid_contacts_are_squeezing(i_v, i_b, n_contacts, rod_state)
+            is_squeezed = func_rod_rigid_contacts_are_squeezing(i_v, i_b, n_contacts, rod_state, rod_config)
             coupling = qd.Matrix.zero(gs.qd_float, N_CONTACTS_MAX, N_CONTACTS_MAX)
             inv_masses = qd.Vector.zero(gs.qd_float, N_CONTACTS_MAX)
             target = qd.Matrix.zero(gs.qd_float, N_CONTACTS_MAX, 3)
