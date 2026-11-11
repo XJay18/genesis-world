@@ -299,7 +299,8 @@ class RodEntity(Entity):
         if link is not None and not isinstance(link, RigidLink):
             gs.raise_exception("Only RigidLink is supported for vertex constraints.")
         verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True, batched_idx=True)
-        self._solver.set_vertex_constraints(verts_idx, target_poss, -1 if link is None else link.idx, envs_idx)
+        link_idx = -1 if link is None else link.idx
+        self._solver.set_vertex_constraints(verts_idx, target_poss, link_idx, envs_idx)
 
     @gs.assert_built
     def remove_vertex_constraints(self, verts_idx_local=None, envs_idx=None):
@@ -361,7 +362,7 @@ class RodEntity(Entity):
         length : torch.Tensor, shape ([M,])
             The length of the rod, in m, in each environment (see 'get_geodesic_distance').
         """
-        return self.get_geodesic_distance(0, self.n_edges, envs_idx)
+        return self.get_geodesic_distance(verts_idx_start=0, verts_idx_end=self.n_edges, envs_idx=envs_idx)
 
     def get_energy(self, envs_idx=None):
         """
