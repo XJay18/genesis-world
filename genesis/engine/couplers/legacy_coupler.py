@@ -219,7 +219,6 @@ class LegacyCoupler(ErrnoMixin, CheckpointMixin, RBC):
 
         # The particles, the FEM vertices and the rod vertices collide with the rigid geoms through their SDF
         opt_in(SDFInfo, cond=lambda: any(self.rigid_couplings))
-        opt_in(SDFInfo, cond=lambda: any(self.rigid_couplings))
         for field_ref in (
             RodData.rod_state.verts.dp_rigid_normal,
             RodData.rod_state.verts.dp_rigid_overlap,
