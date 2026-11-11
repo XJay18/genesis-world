@@ -159,9 +159,6 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
 
     pos: qd.Tensor = field((float, 3), grad=True)
     vel: qd.Tensor = field((float, 3), grad=True)
-    # The position of the vertex when the broadphase ran, compared with the projections of the substep against its
-    # margin (see 'kernel_project_rod_contacts')
-    pos_broadphase: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, labels=ROD_BROADPHASE)
     # A fixed vertex keeps its position and velocity, and its inverse mass is zero in every projection
     is_fixed: qd.Tensor = field(bool)
     # A constrained vertex is placed at its target at the end of every substep with zero velocity. The target is given
@@ -188,6 +185,9 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
     dv_mpm: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     # The rigid geom the vertex penetrated deepest at the latest substep of the step with a penetration, -1 for none
     contact_geom_idx: qd.Tensor = field(int, kind=DataKind.DERIVED, opt_in=True)
+    # The position of the vertex when the broadphase ran, compared with the projections of the substep against its
+    # margin (see 'kernel_project_rod_contacts')
+    pos_broadphase: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, labels=ROD_BROADPHASE)
 
 
 class RodEdgesState(Data, kind=DataKind.STATE, shape=(ROD_EDGES, ENVS)):
