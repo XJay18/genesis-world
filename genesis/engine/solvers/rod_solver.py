@@ -267,7 +267,7 @@ class RodBroadphase(Data, kind=DataKind.SCRATCH):
     n_envs_fallback: qd.Tensor = field(int, shape=(), labels=ROD_BROADPHASE)
 
 
-# The most contacts with the rigid geoms a vertex of the rods owns (see 'RodRigidContacts')
+# The most contacts with the rigid geoms a vertex of the rods takes, one per geom (see 'RodRigidContacts')
 ROD_RIGID_CONTACTS_PER_VERT = 4
 
 
@@ -275,16 +275,20 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     """The contacts of each free vertex of the rods with the rigid geoms that need coupling in each environment, found
     once per substep (see 'kernel_project_rod_rigid_normal' in legacy_coupler.py).
 
-    A contact is the sphere of a vertex or the deepest point of the capsule of an edge in a geom, owned by the vertex,
-    or by the nearer vertex of the edge, the first vertex at its middle. A vertex keeps the first contacts it owns, the
-    geoms in their order and the edges before its sphere.
+    A vertex has at most one contact with each geom: of the sphere of the vertex and the deepest points of the
+    capsules of its two edges in the geom, the one pressing the vertex deepest, its penetration weighted by the weight
+    of the vertex in its point along the edge. A point inside an edge is thus a contact of both vertices of the edge,
+    each resolving its share of it (see 'func_rod_rigid_contact_share' in legacy_coupler.py), and no vertex owns it. A
+    vertex keeps its first contacts, the geoms in their order.
     """
 
     n_contacts: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))
-    # The number of contacts of the rods with each link, which share its motion
-    links_n_contacts: qd.Tensor = field(int, shape=(ROD_RIGID_LINKS, ENVS))
+    # The contacts of the rods with each link, which share its motion in the normal impulses, each counted by the
+    # weight of its vertex in its point, so that a point inside an edge counts once
+    links_contacts_weight: qd.Tensor = field(float, shape=(ROD_RIGID_LINKS, ENVS))
     geom_idx: qd.Tensor = field(int)
-    # The vertices of the edge of the point, the vertex twice for its sphere, and the parameter of the point along it
+    # The vertices of the edge of the point, the vertex twice for its sphere, and the parameter of the point along it,
+    # which give the weight of the vertex in the point
     verts_idx: qd.Tensor = field((int, 2))
     t: qd.Tensor = field(float, grad=True)
     # The outward normal of the geom, the penetration, and the penetration at the start of the substep, the penetration
@@ -294,29 +298,28 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     penetration_start: qd.Tensor = field(float, grad=True)
     # The bound of the inverse mass of the link of the geom at the point along the normal
     inv_mass_link: qd.Tensor = field(float, grad=True)
-    # The point of the geom the contact sticks to, moved with its link to the end of the substep, and the parameter of
-    # the point of the edge sticking to it (see 'RodRigidAnchors')
+    # The point of the geom the vertex sticks to, moved with its link to the end of the substep (see 'RodRigidAnchors')
     anchor: qd.Tensor = field((float, 3), grad=True)
-    anchor_t: qd.Tensor = field(float, grad=True)
     # The normal impulse of the contact over the substep (in kg m, the change of momentum times the substep), and the
     # one of its share of the move of the rod alone out of the geoms, which bound the friction of the contact
     impulse_normal: qd.Tensor = field(float, grad=True)
     impulse_overlap: qd.Tensor = field(float, grad=True)
+    # The contacts of the rods with each link, which share its motion in the friction impulses, each vertex counted once
+    links_n_contacts: qd.Tensor = field(int, shape=(ROD_RIGID_LINKS, ENVS))
 
 
 class RodRigidAnchors(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ROD_RIGID_CONTACTS_PER_VERT, ENVS)):
     """The points of the rigid geoms the contacts of each free vertex of the rods stick to in each environment, from one
     substep to the next (see 'kernel_project_rod_rigid_friction' in legacy_coupler.py).
 
-    A contact sticks to the point of the geom its point of the edge (or vertex) was at when it last slid or started, so
-    that the friction cancels the slip it accumulates while it sticks, and not only that of the last substep. A contact
-    of a later substep with the same geom and edge (or vertex) takes it over.
+    The contact of a vertex with a geom sticks to the point of the geom the vertex was at when it last slid or
+    started touching the geom, so that the friction cancels the slip it accumulates while it sticks, and not only that
+    of the last substep. The contact of the vertex with the same geom at a later substep takes it over, whether its
+    point is the sphere of the vertex or a point of either of its edges.
     """
 
     n_anchors: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))
     geom_idx: qd.Tensor = field(int)
-    verts_idx: qd.Tensor = field((int, 2))
-    t: qd.Tensor = field(float, grad=True)
     # The point in the frame of the link of the geom
     pos: qd.Tensor = field((float, 3), grad=True)
 
@@ -398,7 +401,7 @@ class RodConfig(Config):
     # Whether the rods collide with the rigid geoms that need coupling, whose projection then ends each substep (see
     # 'LegacyCoupler.project_rod_rigid_contacts')
     has_rigid_contacts: bool
-    # The contacts with the rigid geoms a vertex owns at most, which the kernels of the coupling unroll (see
+    # The contacts with the rigid geoms a vertex takes at most, which the kernels of the coupling unroll (see
     # ROD_RIGID_CONTACTS_PER_VERT)
     n_rigid_contacts_per_vert: int
 

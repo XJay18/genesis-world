@@ -1,5 +1,6 @@
 import math
 import os
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pytest
@@ -938,7 +939,7 @@ def test_rod_length_and_rigid_contacts(show_viewer):
 @pytest.mark.required
 def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_viewer):
     radius, interval, friction, post_radius, squeeze_force = 0.01, 0.02, 0.5, 0.0075, 5.0
-    n_close_steps, n_lift_steps = 50, 100
+    n_close_steps, n_lift_steps, n_yaw_steps = 50, 100, 150
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1e-3,
@@ -997,6 +998,25 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
         ),
         material=rod_material,
     )
+    # A rod dropped onto a post across the middle of an edge, which both vertices of the edge stop
+    scene.add_entity(
+        morph=gs.morphs.Cylinder(
+            radius=post_radius,
+            height=0.1,
+            pos=(0.45, 0.0, 0.1),
+            euler=(90.0, 0.0, 0.0),
+            fixed=True,
+        ),
+        material=material,
+    )
+    rod_dropped = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=4,
+            interval=interval,
+            pos=(0.45 - 1.5 * interval, 0.0, 0.1 + post_radius + radius + 1e-5),
+        ),
+        material=rod_material,
+    )
     # Rods lying on slopes below and above the friction angle
     slopes_angle = (0.6 * math.atan(friction), 1.4 * math.atan(friction))
     rods_on_slope = []
@@ -1020,26 +1040,50 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
                 material=rod_material,
             )
         )
-    # A rod grasped in its middle by two pads squeezing it, then lifted
-    gripper = scene.add_entity(
-        morph=gs.morphs.MJCF(
-            file=two_pad_gripper,
-            pos=(0.6, 0.0, 0.3),
-        ),
-        material=gs.materials.Rigid(
-            needs_coup=True,
-            coup_friction=friction,
-            gravity_compensation=1.0,
-        ),
-    )
-    rod_grasped = scene.add_entity(
-        morph=gs.morphs.ParameterizedRod(
-            n_vertices=5,
-            interval=interval,
-            pos=(0.6 - 2 * interval, 0.0, 0.3),
-        ),
-        material=rod_material,
-    )
+    # Rods grasped by two pads squeezing them, then lifted and turned about the vertical, the pads at different places
+    # along the rods: at a vertex in the middle of a rod; at the middle of an edge longer than the pads, whose contacts
+    # lie inside the edge next to the rims of the pads; off the middle of such an edge, a vertex at the rim of the pads;
+    # and at the middle of an edge between round pads, which touch it at its middle
+    mjcf_box = ET.fromstring(two_pad_gripper)
+    mjcf_box.find("worldbody/body").insert(1, ET.Element("joint", name="yaw", type="hinge", axis="0 0 1"))
+    mjcf_round = ET.fromstring(ET.tostring(mjcf_box))
+    for geom in mjcf_round.iter("geom"):
+        if geom.get("contype") is None:
+            geom.attrib.clear()
+            geom.attrib.update(type="capsule", fromto="0 0 -0.02 0 0 0.02", size="0.005", mass="0.1")
+    grippers, rods_grasped, held_weights = [], [], []
+    for x, mjcf, interval_grasped, n_verts_grasped, offset, held_weight in (
+        (0.6, mjcf_box, interval, 5, 0.0, (0, 0, 1, 0, 0)),
+        (0.9, mjcf_box, 0.04, 6, 0.0, (0, 0, 0.5, 0.5, 0, 0)),
+        (1.2, mjcf_box, 0.04, 6, 0.004, (0, 0, 1, 0, 0, 0)),
+        (1.5, mjcf_round, interval, 6, 0.0, (0, 0, 0.5, 0.5, 0, 0)),
+    ):
+        grippers.append(
+            scene.add_entity(
+                morph=gs.morphs.MJCF(
+                    file=ET.tostring(mjcf, encoding="unicode"),
+                    pos=(x, 0.0, 0.3),
+                ),
+                material=gs.materials.Rigid(
+                    needs_coup=True,
+                    coup_friction=friction,
+                    gravity_compensation=1.0,
+                ),
+            )
+        )
+        rods_grasped.append(
+            scene.add_entity(
+                morph=gs.morphs.ParameterizedRod(
+                    n_vertices=n_verts_grasped,
+                    interval=interval_grasped,
+                    pos=(x + offset - 0.5 * (n_verts_grasped - 1) * interval_grasped, 0.0, 0.3),
+                ),
+                material=rod_material,
+            )
+        )
+        # The point of the rod the pads hold, by its weights on the vertices: the vertex at the rim of the pads for the
+        # rod off the middle of its edge, the only point of the rod they touch, which the rod turns about
+        held_weights.append(np.array(held_weight))
     scene.build(n_envs=2)
 
     slopes_tangent = []
@@ -1050,44 +1094,78 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
         rod.set_position(surface_pos + (np.arange(6) - 2.5)[:, None] * interval * tangent)
         slopes_tangent.append(tangent)
     slopes_pos_init = [rod.get_verts_pos() for rod in rods_on_slope]
-    lift_dof = gripper.get_joint("lift").dofs_idx_local
-    pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
-    carriage = gripper.get_link("carriage")
-    gripper.control_dofs_force(squeeze_force, pads_dof)
+    rod_dropped.set_velocity((0.0, 0.0, -1.0))
+    lift_dof, yaw_dof = grippers[0].get_joint("lift").dofs_idx_local, grippers[0].get_joint("yaw").dofs_idx_local
+    pads_dof = [grippers[0].get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
+    carriage = grippers[0].get_link("carriage")
+    for gripper in grippers:
+        gripper.control_dofs_force(squeeze_force, pads_dof)
 
-    for i_step in range(n_close_steps + n_lift_steps):
+    held_pos = []
+    for i_step in range(n_close_steps + n_lift_steps + n_yaw_steps):
+        lift_vel, yaw_vel = 0.0, 0.0
+        if n_close_steps <= i_step < n_close_steps + n_lift_steps:
+            lift_vel = min(i_step - n_close_steps, 30) / 30 * 0.3
+        if i_step >= n_close_steps + n_lift_steps:
+            yaw_vel = min(i_step - n_close_steps - n_lift_steps, 30) / 30 * 3.0
         if i_step >= n_close_steps:
-            gripper.set_dofs_velocity(min(i_step - n_close_steps, 30) / 30 * 0.3, lift_dof)
+            for gripper in grippers:
+                gripper.set_dofs_velocity([lift_vel, yaw_vel], [*lift_dof, *yaw_dof])
         scene.step()
-        # The capsules rest on the edge of the plate and on the post, the axis of the rods a radius away from them
-        for rod, center, clearance in (
-            (rod_on_plate, (0.0, 0.2), radius),
-            (rod_on_post, (0.3, 0.1), radius + post_radius),
+        # The held points in the frame of their left pads
+        held_pos.append(
+            [
+                gu.inv_transform_by_trans_quat(
+                    held_weight @ tensor_to_array(rod.get_verts_pos()),
+                    tensor_to_array(gripper.get_link("left_pad").get_pos()),
+                    tensor_to_array(gripper.get_link("left_pad").get_quat()),
+                )
+                for gripper, rod, held_weight in zip(grippers, rods_grasped, held_weights)
+            ]
+        )
+        # The capsules rest on the edge of the plate and on the post, the axis of the rods a radius away from them, and
+        # the rod dropped at 1 m/s onto the other post is stopped at its surface
+        for rod, center, clearance, penetration_max in (
+            (rod_on_plate, (0.0, 0.2), radius, 1e-4),
+            (rod_on_post, (0.3, 0.1), radius + post_radius, 1e-4),
+            (rod_dropped, (0.45, 0.1), radius + post_radius, 5e-5),
         ):
             verts_pos = tensor_to_array(rod.get_verts_pos())
             t = np.linspace(0.0, 1.0, 101)[:, None]
             axis_pos = verts_pos[:, :-1, None] + t * (verts_pos[:, 1:, None] - verts_pos[:, :-1, None])
             axis_pos = axis_pos[..., ::2]
-            assert np.linalg.norm(axis_pos - center, axis=-1).min() > clearance - 1e-4
+            assert np.linalg.norm(axis_pos - center, axis=-1).min() > clearance - penetration_max
         # The pads stop at the surface of the rod
-        assert (gripper.get_dofs_position(pads_dof).sum(dim=-1) < 0.03 - (2.0 * radius - 1e-3)).all()
+        assert (grippers[0].get_dofs_position(pads_dof).sum(dim=-1) < 0.03 - (2.0 * radius - 1e-3)).all()
         if i_step == n_close_steps - 1:
-            grasp_offset = rod_grasped.get_verts_pos()[:, 2] - carriage.get_pos()
-    # The grasped rod follows the carriage
-    assert_allclose(rod_grasped.get_verts_pos()[:, 2] - carriage.get_pos(), grasp_offset, atol=5e-4)
-    assert (carriage.get_pos()[:, 2] > 0.3 + 0.02).all()
+            grasp_offset = rods_grasped[0].get_verts_pos()[:, 2] - carriage.get_pos()
+        if i_step == n_close_steps + n_lift_steps - 1:
+            # The grasped rod follows the carriage
+            assert_allclose(rods_grasped[0].get_verts_pos()[:, 2] - carriage.get_pos(), grasp_offset, atol=5e-4)
+            assert (carriage.get_pos()[:, 2] > 0.3 + 0.02).all()
+            slopes_pos = [rod.get_verts_pos() for rod in rods_on_slope]
+    # The held points do not slip along the pads in the lift and the turn, wherever the pads touch the rod: a contact
+    # keeps the point of the pad it sticks to while its point moves along the rod. The slip is the motion along the
+    # face of a pad, its local axes x and z: the pads are free to slide together along their axis under a load across
+    # them, and their squeeze changes as the rod turns between them
+    held_pos = np.array(held_pos)
+    held_slip = held_pos[n_close_steps:] - held_pos[n_close_steps - 1]
+    held_slip = held_slip[..., [0, 2]]
+    assert np.linalg.norm(held_slip, axis=-1).max() < 2e-4
+    for gripper in grippers:
+        assert (gripper.get_dofs_position(yaw_dof) > math.radians(15.0)).all()
 
     # A rod stays on a slope below the friction angle, and slides down the other with the acceleration of Coulomb
     # friction, its positions integrated by symplectic Euler over the substeps
     n_substeps, substep_dt = 5 * (n_close_steps + n_lift_steps), 2e-4
     slope_acc = 9.81 * (math.sin(slopes_angle[1]) - friction * math.cos(slopes_angle[1]))
-    for rod, pos_init, tangent, slide in zip(
-        rods_on_slope,
+    for pos, pos_init, tangent, slide in zip(
+        slopes_pos,
         slopes_pos_init,
         slopes_tangent,
         (0.0, 0.5 * slope_acc * substep_dt**2 * n_substeps * (n_substeps + 1)),
     ):
-        assert_allclose(tensor_to_array(rod.get_verts_pos() - pos_init) @ tangent, slide, atol=1e-6)
+        assert_allclose(tensor_to_array(pos - pos_init) @ tangent, slide, atol=1e-6)
 
 
 @pytest.mark.required
@@ -1195,20 +1273,101 @@ def test_rod_rigid_friction_conserves_momentum(show_viewer):
             segment_radius=radius,
         ),
     )
+    # A rod turning about the vertical on a capsule free to turn about it, across the middle of an edge, turns it along
+    spin_center, spin_rate, capsule_radius, spinning_radius = np.array([0.5, 0.0]), 5.0, 0.0075, 0.01
+    mjcf = ET.Element("mujoco", model="turntable")
+    turntable_body = ET.SubElement(ET.SubElement(mjcf, "worldbody"), "body", name="turntable", pos="0.5 0.0 0.1")
+    ET.SubElement(turntable_body, "joint", name="spin", type="hinge", axis="0 0 1")
+    ET.SubElement(
+        turntable_body, "geom", type="capsule", fromto="0 -0.05 0 0 0.05 0", size=str(capsule_radius), mass="0.02"
+    )
+    turntable = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=ET.tostring(mjcf, encoding="unicode"),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.5,
+            gravity_compensation=1.0,
+        ),
+    )
+    rod_spinning = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=4,
+            interval=0.02,
+            pos=(0.5 - 1.5 * 0.02, 0.0, 0.1 + capsule_radius + spinning_radius + 1e-5),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.005,
+            segment_radius=spinning_radius,
+        ),
+    )
+    # A rod starting to slide along a light bar free to slide along it, which it touches inside an edge off its middle,
+    # sticks to it: the friction of both vertices of the edge moves the bar once, wherever the point lies along the edge
+    bar_point_t, bar_interval, bar_slip_vel = 0.15, 0.04, 1e-3
+    mjcf = ET.Element("mujoco", model="bar")
+    bar_body = ET.SubElement(ET.SubElement(mjcf, "worldbody"), "body", name="bar", pos="1.0 0.0 0.1")
+    ET.SubElement(bar_body, "joint", name="slide", type="slide", axis="0 1 0")
+    ET.SubElement(bar_body, "geom", type="capsule", fromto="0 -0.05 0 0 0.05 0", size=str(capsule_radius), mass="0.001")
+    bar = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=ET.tostring(mjcf, encoding="unicode"),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=1.0,
+            gravity_compensation=1.0,
+        ),
+    )
+    rod_on_bar = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=4,
+            interval=bar_interval,
+            pos=(1.0 - (1.0 + bar_point_t) * bar_interval, 0.0, 0.1 + capsule_radius + spinning_radius - 2e-5),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.005,
+            segment_radius=spinning_radius,
+        ),
+    )
     scene.build()
+    # The bar moves as light as the inverse mass the contacts see, its slide joint without the default armature
+    bar.set_dofs_armature([0.0])
     rod.set_velocity((rod_vel, 0.0, 0.0))
+    rod_on_bar.set_velocity((0.0, bar_slip_vel, 0.0))
+    arm = tensor_to_array(rod_spinning.get_verts_pos())[:, :2] - spin_center
+    rod_spinning.set_velocity(spin_rate * np.stack([-arm[:, 1], arm[:, 0], np.zeros(len(arm))], axis=-1))
     verts_mass = qd_to_numpy(scene.sim.rod_solver.rod_info.verts.mass)
     box_mass = float(box.get_mass())
 
     def momentum_x():
-        return (verts_mass * tensor_to_array(rod.get_verts_vel())[:, 0]).sum(), box_mass * float(box.get_vel()[0])
+        mass = verts_mass[rod.v_start : rod.v_start + rod.n_verts]
+        return (mass * tensor_to_array(rod.get_verts_vel())[:, 0]).sum(), box_mass * float(box.get_vel()[0])
+
+    def angular_momentum_z():
+        arm = tensor_to_array(rod_spinning.get_verts_pos())[:, :2] - spin_center
+        vel = tensor_to_array(rod_spinning.get_verts_vel())
+        mass = verts_mass[rod_spinning.v_start : rod_spinning.v_start + rod_spinning.n_verts]
+        rod_momentum = (mass * (arm[:, 0] * vel[:, 1] - arm[:, 1] * vel[:, 0])).sum()
+        return rod_momentum, float(tensor_to_array(turntable.get_mass_mat() @ turntable.get_dofs_velocity())[0])
 
     momentum_init = sum(momentum_x())
+    angular_momentum_init = sum(angular_momentum_z())
+    bar_slip_vel_max = 0.0
     for _ in range(n_steps):
         scene.step()
+        vel = tensor_to_array(rod_on_bar.get_verts_vel())[1:3, 1]
+        point_vel = (1.0 - bar_point_t) * vel[0] + bar_point_t * vel[1]
+        bar_slip_vel_max = max(bar_slip_vel_max, abs(point_vel - float(tensor_to_array(bar.get_dofs_velocity())[0])))
     rod_momentum, box_momentum = momentum_x()
     assert box_momentum > 0.1 * momentum_init
     assert_allclose(rod_momentum + box_momentum, momentum_init, rtol=1e-3)
+    # The friction of the rod turns the capsule, the link taking the angular momentum the rod loses
+    rod_angular_momentum, turntable_angular_momentum = angular_momentum_z()
+    assert turntable_angular_momentum > 0.1 * angular_momentum_init
+    assert_allclose(rod_angular_momentum + turntable_angular_momentum, angular_momentum_init, rtol=2e-2)
+    # The rod and the bar move together, the friction cancelling their slip without reversing it
+    assert bar_slip_vel_max < 0.5 * bar_slip_vel
 
 
 @pytest.mark.required
