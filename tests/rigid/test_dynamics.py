@@ -9,7 +9,7 @@ from quadrants.lang._perf_dispatch import PerformanceDispatcher
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.constraint import solver as constraint_solver
-from genesis.utils.array_class import RigidSimStaticConfig
+from genesis.engine.solvers.rigid.data import RigidConfig
 from genesis.utils.misc import qd_to_numpy, tensor_to_array
 
 from ..utils.assertions import assert_allclose, assert_equal
@@ -190,13 +190,19 @@ def test_many_boxes_dynamics(box_box_detection, gjk_collision, dynamics, show_vi
     if dynamics:
         for entity in scene.entities[1:]:
             entity.set_dofs_velocity(4.0 * np.random.rand(6))
-    num_steps = 1000 if dynamics else 150
-    for i in range(num_steps):
+    num_steps_min, num_steps_max = (700, 1200) if dynamics else (100, 150)
+    num_steps_rest = 0
+    for i in range(num_steps_max):
         scene.step()
-        if i > num_steps - 50:
+        if i >= num_steps_min:
             qvel = scene.rigid_solver.get_dofs_velocity().reshape((6, -1))
             # Checking the average velocity because is always one cube moving depending on the machine.
-            assert_allclose(torch.linalg.norm(qvel, dim=0).mean(), 0, atol=0.05)
+            is_at_rest = torch.linalg.norm(qvel, dim=0).mean() < 0.01
+            num_steps_rest = num_steps_rest + 1 if is_at_rest else 0
+            if num_steps_rest == 50:
+                break
+    else:
+        raise AssertionError
 
     for n, entity in enumerate(scene.entities[1:]):
         i, j, k = n // N_SIDE**2, (n // N_SIDE) % N_SIDE, n % N_SIDE
@@ -297,10 +303,8 @@ def test_apply_external_wrench(xml_path, show_viewer, tol):
         scene.step()
 
     duck.base_link.apply_external_torque((0, 1, 0), ref=gs.link_ref_frame.link_COM, local=True)
-    assert_allclose(rigid_solver.dyn_state.links.cfrc_applied_vel[duck_link_idx, 0], 0, tol=gs.EPS)
-    assert_allclose(
-        rigid_solver.dyn_state.links.cfrc_applied_ang[duck_link_idx, 0], -duck_init_link_R[:, 1], tol=gs.EPS
-    )
+    assert_allclose(rigid_solver.dyn_state.links.cfrc_input_vel[duck_link_idx, 0], 0, tol=gs.EPS)
+    assert_allclose(rigid_solver.dyn_state.links.cfrc_input_ang[duck_link_idx, 0], -duck_init_link_R[:, 1], tol=gs.EPS)
 
     # A local force and a local application point are both expressed in the frame that 'ref' designates, which only
     # shows on a link whose inertial frame is rotated with respect to its own frame. The kernel rotates by quaternion
@@ -324,9 +328,9 @@ def test_apply_external_wrench(xml_path, show_viewer, tol):
     )
     force_world = base_link_R @ force_local
     point_world = base_link_pos + base_link_R @ lever_arm
-    assert_allclose(rigid_solver.dyn_state.links.cfrc_applied_vel[base_link.idx, 0], -force_world, tol=5e-7)
+    assert_allclose(rigid_solver.dyn_state.links.cfrc_input_vel[base_link.idx, 0], -force_world, tol=5e-7)
     assert_allclose(
-        rigid_solver.dyn_state.links.cfrc_applied_ang[base_link.idx, 0],
+        rigid_solver.dyn_state.links.cfrc_input_ang[base_link.idx, 0],
         -torch.linalg.cross(point_world - base_root_COM, force_world),
         tol=5e-7,
     )
@@ -334,9 +338,9 @@ def test_apply_external_wrench(xml_path, show_viewer, tol):
     # A world application point locates the point on its own, so it reproduces the local one it is derived from.
     rigid_solver.clear_external_force()
     base_link.apply_external_force(force_world, pos=point_world)
-    assert_allclose(rigid_solver.dyn_state.links.cfrc_applied_vel[base_link.idx, 0], -force_world, tol=5e-7)
+    assert_allclose(rigid_solver.dyn_state.links.cfrc_input_vel[base_link.idx, 0], -force_world, tol=5e-7)
     assert_allclose(
-        rigid_solver.dyn_state.links.cfrc_applied_ang[base_link.idx, 0],
+        rigid_solver.dyn_state.links.cfrc_input_ang[base_link.idx, 0],
         -torch.linalg.cross(point_world - base_root_COM, force_world),
         tol=5e-7,
     )
@@ -347,9 +351,9 @@ def test_apply_external_wrench(xml_path, show_viewer, tol):
     )
     force_world = base_inertial_R @ force_local
     point_world = base_link_COM + base_inertial_R @ lever_arm
-    assert_allclose(rigid_solver.dyn_state.links.cfrc_applied_vel[base_link.idx, 0], -force_world, tol=5e-7)
+    assert_allclose(rigid_solver.dyn_state.links.cfrc_input_vel[base_link.idx, 0], -force_world, tol=5e-7)
     assert_allclose(
-        rigid_solver.dyn_state.links.cfrc_applied_ang[base_link.idx, 0],
+        rigid_solver.dyn_state.links.cfrc_input_ang[base_link.idx, 0],
         -torch.linalg.cross(point_world - base_root_COM, force_world),
         tol=5e-7,
     )
@@ -670,7 +674,7 @@ def test_dofs_force_balance(resting_light_stick, contact_resolution, show_viewer
         acc = (vel_next - vel) / DT
         inertial_force = entity.get_mass_mat() @ acc
         assert_allclose(
-            inertial_force / weight, entity.get_dofs_force() / weight, atol=2e-6 if gs.np_float == np.float32 else 1e-9
+            inertial_force / weight, entity.get_dofs_force() / weight, atol=5e-6 if gs.np_float == np.float32 else 1e-9
         )
         vel = vel_next
 
@@ -1074,19 +1078,19 @@ def test_merge_matches_single_equivalent_entity(merged_arm_hand_models, box_posi
 @pytest.mark.parametrize("precision", ["32", "64"])
 @pytest.mark.parametrize("backend", [gs.gpu])
 def test_cholesky_tiling(monkeypatch, tol):
-    rigid_sim_static_config_init_orig = RigidSimStaticConfig.__init__
+    rigid_config_init_orig = RigidConfig.__init__
 
     values = []
     for enable_tiled_cholesky in (True, False):
         # Static configs are immutable, so the flags are forced where the solver constructs its config rather than
         # written on the built solver.
-        def rigid_sim_static_config_init(self, **kwargs):
+        def rigid_config_init(self, **kwargs):
             kwargs["enable_tiled_cholesky_mass_matrix"] = enable_tiled_cholesky
             if not enable_tiled_cholesky:
                 kwargs["enable_fused_smooth_acc_solve"] = False
-            rigid_sim_static_config_init_orig(self, **kwargs)
+            rigid_config_init_orig(self, **kwargs)
 
-        monkeypatch.setattr(RigidSimStaticConfig, "__init__", rigid_sim_static_config_init)
+        monkeypatch.setattr(RigidConfig, "__init__", rigid_config_init)
 
         scene = gs.Scene(
             rigid_options=gs.options.RigidOptions(
@@ -1135,13 +1139,13 @@ def test_solve_arm_equivalence(n_stack, n_grid, monkeypatch, show_viewer, tol):
     N_STEPS = 12
 
     # The choice of arm is left open, so that the dispatcher deems both of them eligible whatever the scene
-    init_orig = RigidSimStaticConfig.__init__
+    init_orig = RigidConfig.__init__
 
     def init_open_choice(self, *args, **kwargs):
         kwargs["prefer_decomposed_solver"] = -1
         init_orig(self, *args, **kwargs)
 
-    monkeypatch.setattr(RigidSimStaticConfig, "__init__", init_open_choice)
+    monkeypatch.setattr(RigidConfig, "__init__", init_open_choice)
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(

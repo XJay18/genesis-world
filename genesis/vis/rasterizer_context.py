@@ -579,9 +579,11 @@ class RasterizerContext:
             yield self.sim.kinematic_solver
 
     def on_rigid(self):
-        # Reuse a single pyrender material per genesis surface so that geoms sharing one surface (e.g. the many
-        # textured submeshes of a GLB, which are kept separate to preserve baked convex decompositions) expose the
-        # same Texture instances. The renderer then keeps a single host copy and GPU upload instead of one per geom.
+        # Reuse a single pyrender material per genesis surface, and per trimesh material among the textured geoms (see
+        # 'surface_uvs_to_trimesh_visual'), so that geoms sharing either one (e.g. the many textured submeshes of a GLB,
+        # kept separate to preserve baked convex decompositions) expose the same Texture instances. The renderer then
+        # keeps a single host copy and GPU upload instead of one per geom. A surface keys its textured geoms and its
+        # untextured ones (without uvs) apart, since each kind is drawn with a material of its own.
         vis_materials = {}
         for solver in self._rigid_solvers():
             # One conversion of the geom poses per visual mode in use
@@ -594,16 +596,22 @@ class RasterizerContext:
                 geoms_T = geoms_T_by_mode[is_visual]
 
                 for geom in geoms:
-                    surface_key = id(geom.surface)
-                    mesh_node = self.add_geom_node(geom, geoms_T, material=vis_materials.get(surface_key))
+                    is_textured = is_visual and isinstance(geom.trimesh.visual, trimesh.visual.TextureVisuals)
+                    material_keys = [("surface", is_textured, id(geom.surface))]
+                    if is_textured:
+                        material_keys.append(("material", id(geom.trimesh.visual.material)))
+                    materials = [vis_materials[key] for key in material_keys if key in vis_materials]
+                    material = materials[0] if materials else None
+                    mesh_node = self.add_geom_node(geom, geoms_T, material=material)
                     if mesh_node is not None:
-                        vis_materials.setdefault(surface_key, mesh_node.primitives[0].material)
+                        for key in material_keys:
+                            vis_materials.setdefault(key, mesh_node.primitives[0].material)
 
         if self.sim.rigid_solver.is_active and any(link.visualize_contact for link in self.sim.rigid_solver.links):
             # Scale contact arrows by the parent link's overall size rather than the individual contacting geom, so
             # they stay legible on links built from many small convex-decomposition pieces. The per-geom init AABBs
             # are in each geom's local frame, so offset their corners by the geom pose to get the link-frame extent.
-            geoms_aabb = qd_to_numpy(self.sim.rigid_solver.geoms_init_AABB)
+            geoms_aabb = qd_to_numpy(self.sim.rigid_solver.rigid_info.geoms_init_AABB)
             self.links_init_AABB_size = np.zeros(self.sim.rigid_solver.n_links, dtype=gs.np_float)
             for link in self.sim.rigid_solver.links:
                 if link.n_geoms == 0:
@@ -775,7 +783,7 @@ class RasterizerContext:
                         pyrender.Mesh.from_trimesh(
                             mu.create_box(
                                 bounds=np.array(
-                                    [self.sim.mpm_solver.boundary.lower, self.sim.mpm_solver.boundary.upper],
+                                    [self.sim.mpm_solver.boundary_lower, self.sim.mpm_solver.boundary_upper],
                                     dtype=np.float32,
                                 ),
                                 wireframe=True,
@@ -807,7 +815,7 @@ class RasterizerContext:
         Returns one (env_idx, mesh, seg_key) triple per mesh (see TrackedNodeList).
         """
         particles_all = qd_to_numpy(self.sim.mpm_solver.particles_render.pos)
-        active_all = qd_to_numpy(self.sim.mpm_solver.particles_render.active).astype(dtype=np.bool_, copy=False)
+        active_all = qd_to_numpy(self.sim.mpm_solver.particles_render.is_active).astype(dtype=np.bool_, copy=False)
         vverts_all = qd_to_numpy(self.sim.mpm_solver.vverts_render.pos)
         meshes = []
         for mpm_entity in self.sim.mpm_solver.entities:
@@ -858,7 +866,7 @@ class RasterizerContext:
                         pyrender.Mesh.from_trimesh(
                             mu.create_box(
                                 bounds=np.array(
-                                    [self.sim.sph_solver.boundary.lower, self.sim.sph_solver.boundary.upper],
+                                    [self.sim.sph_solver.boundary_lower, self.sim.sph_solver.boundary_upper],
                                     dtype=np.float32,
                                 ),
                                 wireframe=True,
@@ -890,7 +898,7 @@ class RasterizerContext:
         Returns one (env_idx, mesh, seg_key) triple per mesh (see TrackedNodeList).
         """
         particles_all = qd_to_numpy(self.sim.sph_solver.particles_render.pos)
-        active_all = qd_to_numpy(self.sim.sph_solver.particles_render.active).astype(dtype=np.bool_, copy=False)
+        active_all = qd_to_numpy(self.sim.sph_solver.particles_render.is_active).astype(dtype=np.bool_, copy=False)
         meshes = []
         for sph_entity in self.sim.sph_solver.entities:
             if sph_entity.surface.vis_mode != "recon":
@@ -965,7 +973,7 @@ class RasterizerContext:
                     pyrender.Mesh.from_trimesh(
                         mu.create_box(
                             bounds=np.array(
-                                [self.sim.pbd_solver.boundary.lower, self.sim.pbd_solver.boundary.upper],
+                                [self.sim.pbd_solver.boundary_lower, self.sim.pbd_solver.boundary_upper],
                                 dtype=np.float32,
                             ),
                             wireframe=True,
@@ -1024,7 +1032,7 @@ class RasterizerContext:
         Returns one (env_idx, mesh, seg_key) triple per mesh (see TrackedNodeList).
         """
         particles_all = qd_to_numpy(self.sim.pbd_solver.particles_render.pos)
-        active_all = qd_to_numpy(self.sim.pbd_solver.particles_render.active).astype(dtype=np.bool_, copy=False)
+        active_all = qd_to_numpy(self.sim.pbd_solver.particles_render.is_active).astype(dtype=np.bool_, copy=False)
         meshes = []
         for pbd_entity in self.sim.pbd_solver.entities:
             if pbd_entity.surface.vis_mode != "recon":
@@ -1045,7 +1053,7 @@ class RasterizerContext:
 
     def on_fem(self):
         if self.sim.fem_solver.is_active:
-            vverts_pos, _, _ = self.sim.fem_solver.get_state_render(self.sim.cur_substep_local)
+            vverts_pos, _, _ = self.sim.fem_solver.get_state_render()
             vverts_all = qd_to_numpy(vverts_pos, self.rendered_envs_idx, transpose=True)
 
             for fem_entity in self.sim.fem_solver.entities:
@@ -1068,7 +1076,7 @@ class RasterizerContext:
 
     def update_fem(self):
         if self.sim.fem_solver.is_active:
-            vverts_pos, _, _ = self.sim.fem_solver.get_state_render(self.sim.cur_substep_local)
+            vverts_pos, _, _ = self.sim.fem_solver.get_state_render()
             vverts_all = qd_to_numpy(vverts_pos, self.rendered_envs_idx, transpose=True)
 
             for fem_entity in self.sim.fem_solver.entities:

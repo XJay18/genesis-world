@@ -10,8 +10,9 @@ import sys
 import weakref
 import zipfile
 from collections import Counter
+from collections.abc import Callable, Iterable
 from functools import cached_property
-from typing import BinaryIO, Callable, Iterable, Literal, NamedTuple, TYPE_CHECKING, overload
+from typing import TYPE_CHECKING, BinaryIO, Literal, NamedTuple, overload
 
 import numpy as np
 import torch
@@ -24,10 +25,9 @@ import genesis.utils.mesh as mu
 from genesis.engine.entities.base_entity import Entity, EntityDescription
 from genesis.engine.entities.rigid_entity import KinematicEntity
 from genesis.engine.force_fields import ForceField
-from genesis.engine.materials.base import EntityT, Material
+from genesis.engine.materials.base import Material
 from genesis.engine.states.solvers import SimState, SimulatorCheckpoint
 from genesis.options import (
-    SceneOptions,
     BaseCouplerOptions,
     FEMOptions,
     KinematicOptions,
@@ -36,7 +36,7 @@ from genesis.options import (
     ProfilingOptions,
     RigidOptions,
     RodOptions,
-    SFOptions,
+    SceneOptions,
     SimOptions,
     SPHOptions,
     ViewerOptions,
@@ -50,7 +50,7 @@ from genesis.recorders import RecorderManager
 from genesis.recorders.trajectory import Trajectory, save_checkpoint
 from genesis.repr_base import RBC
 from genesis.utils import serialization
-from genesis.utils.data import DataItem, Namespace, check_data, namespace
+from genesis.utils.data import Namespace, namespace
 from genesis.utils.misc import sanitize_index, tensor_to_array
 from genesis.utils.serialization import ARRAY_MEMBER, MANIFEST_NAME, pixel_less_textures
 from genesis.utils.tools import RunningMean
@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from genesis.engine.entities.rigid_entity import RigidEntity
     from genesis.engine.sensors.base_sensor import Sensor
     from genesis.engine.simulator import Simulator
-    from genesis.options.sensors.options import SensorOptions, SensorT
+    from genesis.options.sensors.options import SensorOptions
     from genesis.recorders import Recorder
 
 
@@ -156,8 +156,6 @@ class Scene(RBC):
         The options configuring the sph_solver (``scene.sim.SPHSolver``).
     fem_options : gs.options.FEMOptions
         The options configuring the fem_solver (``scene.sim.FEMSolver``).
-    sf_options : gs.options.SFOptions
-        The options configuring the sf_solver (``scene.sim.SFSolver``).
     pbd_options : gs.options.PBDOptions
         The options configuring the pbd_solver (``scene.sim.PBDSolver``).
     rod_options : gs.options.RodOptions
@@ -187,7 +185,6 @@ class Scene(RBC):
         mpm_options: MPMOptions | None = None,
         sph_options: SPHOptions | None = None,
         fem_options: FEMOptions | None = None,
-        sf_options: SFOptions | None = None,
         pbd_options: PBDOptions | None = None,
         rod_options: RodOptions | None = None,
         coupler_options: BaseCouplerOptions | None = None,
@@ -209,7 +206,6 @@ class Scene(RBC):
             mpm_options,
             sph_options,
             fem_options,
-            sf_options,
             pbd_options,
             rod_options,
             coupler_options,
@@ -230,7 +226,6 @@ class Scene(RBC):
                 mpm=mpm_options,
                 sph=sph_options,
                 fem=fem_options,
-                sf=sf_options,
                 pbd=pbd_options,
                 rod=rod_options,
                 coupler=coupler_options,
@@ -325,7 +320,7 @@ class Scene(RBC):
     ) -> "RigidEntity": ...
 
     @overload
-    def add_entity(
+    def add_entity[EntityT: "Entity"](
         self,
         morph: Morph | Iterable[Morph],
         material: Material[EntityT] = ...,
@@ -429,15 +424,6 @@ class Scene(RBC):
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['particle', 'recon']."
                 )
 
-        elif isinstance(material, gs.materials.SF.Smoke):
-            if surface.vis_mode is None:
-                surface.vis_mode = "particle"
-
-            if surface.vis_mode not in ("particle",):
-                gs.raise_exception(
-                    f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['particle', 'recon']."
-                )
-
         elif isinstance(material, (gs.materials.PBD.Base, gs.materials.MPM.Base, gs.materials.SPH.Base)):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
@@ -510,7 +496,7 @@ class Scene(RBC):
 
         Returns
         -------
-        entities : List[genesis.Entity]
+        entities : list[genesis.Entity]
             The created entities.
         """
         if not isinstance(morph, gs.morphs.USD):
@@ -608,7 +594,7 @@ class Scene(RBC):
         self.visualizer.add_light(pos, dir, color, intensity, directional, castshadow, cutoff, attenuation)
 
     @gs.assert_unbuilt
-    def add_sensor(self, sensor_options: "SensorOptions[SensorT]") -> "SensorT":
+    def add_sensor[SensorT: "Sensor"](self, sensor_options: "SensorOptions[SensorT]") -> SensorT:
         """
         Add a sensor to the scene.
 
@@ -637,7 +623,7 @@ class Scene(RBC):
 
         Returns
         -------
-        dict[Type[Sensor], torch.Tensor]
+        dict[type[Sensor], torch.Tensor]
             For each sensor class present in the scene, a tensor of shape (B, [history,] class_cache_size).
         """
         return self._sim._sensor_manager.read_sensors(entity_idx=None, envs_idx=envs_idx)
@@ -1007,7 +993,7 @@ class Scene(RBC):
                     self._init_state = state
             self._sim.reset(state, envs_idx)
         else:
-            self._init_state = self._get_state()
+            self._init_state = self._sim.get_state()
         self._restart()
 
     def _restart(self, refresh_viewer=True):
@@ -1048,7 +1034,7 @@ class Scene(RBC):
         """
         # Snapshot the current state before the backward pass rewinds the physics. The clocks go with it: the backward
         # pass of each step winds them down, and the restore below puts the physics back where they were.
-        snapshot = self._get_state()
+        snapshot = self._sim.get_state()
         steps = self._sim._steps.clone()
         # The autograd nodes of the steps unroll the rollout within this backward pass (see genesis.grad.bridge).
         torch.autograd.backward(loss, *args, **kwargs)
@@ -1058,17 +1044,13 @@ class Scene(RBC):
         self._sim._steps[:] = steps
         return snapshot
 
-    def _get_state(self):
-        # The scene keeps this state for itself, outside of the autograd graph of a differentiable rollout
-        with torch.no_grad():
-            return self._sim.get_state()
-
     @gs.assert_built
     def get_state(self):
         """
-        Returns the current state of the scene.
+        Returns the current state of the scene, which 'reset' restores.
 
-        In a differentiable scene, the state tracks gradients, as the getters of the entities do.
+        It holds what every solver steps from, as a copy outside of the autograd graph of a differentiable rollout. The
+        getters of the entities query the state with gradients.
 
         Returns
         -------
@@ -1604,7 +1586,7 @@ class Scene(RBC):
         # callback. Every solver holds the same force fields, so one solver names them all.
         rejected_kinds = Counter(type(entity).__name__ for entity in self.entities if entity.desc is None)
         rejected_kinds.update(type(emitter).__name__ for emitter in self._emitters)
-        rejected_kinds.update(type(force_field).__name__ for force_field in self._sim.solvers[0].force_fields)
+        rejected_kinds.update(type(force_field).__name__ for force_field in self._sim.solvers[0].force_fields.fields)
         omitted_kinds = Counter(type(sensor).__name__ for sensor in self._sim._sensor_manager.sensors)
         if self._visualizer is not None:
             omitted_kinds.update(type(camera).__name__ for camera in self._visualizer.cameras)
@@ -1865,17 +1847,9 @@ class Scene(RBC):
             )
         if state.digest != self._desc_digest:
             gs.raise_exception("The state was read from another scene: its entities or physics options differ.")
-        # Every solver checks its record before anything is touched, so a record from another scene leaves this one as
-        # it was, the recorders included
-        solvers = {type(solver).__name__: solver for solver in self._sim.active_solvers}
-        if set(state.sim.solvers) != set(solvers):
-            gs.raise_exception(
-                f"The checkpoint holds {sorted(state.sim.solvers)} where this scene simulates {sorted(solvers)}."
-            )
-        for name, solver in solvers.items():
-            record = state.sim.solvers[name]
-            items = (item for item in solver.data if isinstance(item, DataItem) and item.kind in record.kinds)
-            check_data(items, record.arrays)
+        # The record is checked before anything is touched, so a record from another scene leaves this one as it was,
+        # the recorders included
+        self._sim.check_checkpoint(state.sim)
         # The recorders finish the run first (see 'reset'), and the restart follows the state, so the visualizer draws
         # the state put back.
         self._recorder_manager.record(self._sim.cur_step_global)
@@ -1989,11 +1963,6 @@ class Scene(RBC):
     def solvers(self):
         """All the solvers managed by the scene's simulator."""
         return self._sim.solvers
-
-    @property
-    def active_solvers(self):
-        """All the active solvers managed by the scene's simulator."""
-        return self._sim.active_solvers
 
     @property
     def entities(self) -> list["Entity"]:

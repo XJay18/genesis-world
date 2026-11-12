@@ -84,7 +84,7 @@ def test_morphs_fall_freely_at_rest_shape(asset_tmp_path, show_viewer):
     n_verts_rod = np.array([rod.n_verts for rod in rods])[edges_rod[i_a]]
     gap = np.where(is_loop, np.minimum(gap, n_verts_rod - gap), gap)
     assert scene.rod_solver.n_edge_pairs == np.count_nonzero((edges_rod[i_a] != edges_rod[i_b]) | (gap >= 3))
-    pos_init = [rod.get_state().pos for rod in rods]
+    pos_init = [rod.get_verts_pos() for rod in rods]
     for rod in rods:
         assert_allclose(rod.get_energy(), 0.0, tol=gs.EPS)
 
@@ -97,7 +97,7 @@ def test_morphs_fall_freely_at_rest_shape(asset_tmp_path, show_viewer):
         vel = vel * math.exp(-substep_dt * damping) + substep_dt * gravity
         fall += substep_dt * vel
     for rod, pos in zip(rods, pos_init):
-        assert_allclose(rod.get_state().pos - pos, (0.0, 0.0, fall), tol=1e-10)
+        assert_allclose(rod.get_verts_pos() - pos, (0.0, 0.0, fall), tol=1e-10)
 
 
 @pytest.mark.required
@@ -196,9 +196,9 @@ def test_inextensible_edge_lengths_and_checkpoint(show_viewer):
     length_errors = []
     for _ in range(150):
         scene.step()
-        pos = rod.get_state().pos
+        pos = rod.get_verts_pos()
         length_errors.append((torch.linalg.norm(pos.diff(dim=1), dim=-1) / interval - 1.0).abs().max())
-    pos = rod.get_state().pos
+    pos = rod.get_verts_pos()
     # The rod swings down from its fixed end
     assert (pos[:, -1, 2] < 0.5 - 0.05).all()
     # FIXME: the bound on the edge length error is measured. Replace with a bound derived from the projection residual.
@@ -210,11 +210,11 @@ def test_inextensible_edge_lengths_and_checkpoint(show_viewer):
     checkpoint = scene.sim.__getstate__()
     for _ in range(10):
         scene.step()
-    pos = rod.get_state().pos
+    pos = rod.get_verts_pos()
     scene.sim.__setstate__(checkpoint)
     for _ in range(10):
         scene.step()
-    assert_equal(rod.get_state().pos, pos)
+    assert_equal(rod.get_verts_pos(), pos)
 
 
 @pytest.mark.required
@@ -258,7 +258,7 @@ def test_straight_rest_state(show_viewer):
     assert energy_straight[1] > 1e-6
 
     def end_to_end_distance(rod):
-        pos = rod.get_state().pos[0]
+        pos = rod.get_verts_pos()
         return torch.linalg.norm(pos[-1] - pos[0])
 
     distances_init = [end_to_end_distance(rod) for rod in rods]
@@ -334,19 +334,24 @@ def test_vertex_constraints_reset_with_state(show_viewer):
     for rod, rod_is_kinematic in zip(rods, is_kinematic):
         assert_equal(rod.get_verts_kinematic(), rod_is_kinematic)
 
-    pos_init = [rod.get_state().pos for rod in rods]
+    pos_init = [rod.get_verts_pos() for rod in rods]
     box_pos_init = box.get_pos()
     verts_offset = gu.inv_transform_by_trans_quat(pos_init[1][:, 19], box_pos_init, box.get_quat())
+    bending_stiffness_init = rods[0].get_bending_stiffness()
+    rods[0].set_bending_stiffness(2.0 * bending_stiffness_init)
     for _ in range(20):
         scene.step()
-    pos_env_0 = [rod.get_state().pos[0] for rod in rods]
-    # The constraints are part of the state, which a reset restores as built, the vertices the morphs fix included
+    pos_env_0 = [rod.get_verts_pos()[0] for rod in rods]
+    # The constraints and the stiffness are part of the state, which a reset restores as built, the vertices the morphs
+    # fix included
     scene.reset(envs_idx=[1])
     for rod, pos, pos_0, rod_is_kinematic in zip(rods, pos_init, pos_env_0, is_kinematic):
-        assert_allclose(rod.get_state().pos[1], pos[1], tol=gs.EPS)
-        assert_allclose(rod.get_state().pos[0], pos_0, tol=gs.EPS)
+        assert_allclose(rod.get_verts_pos()[1], pos[1], tol=gs.EPS)
+        assert_allclose(rod.get_verts_pos()[0], pos_0, tol=gs.EPS)
         assert_equal(rod.get_verts_kinematic()[0], rod_is_kinematic[0])
         assert_equal(rod.get_verts_kinematic()[1], rod is rods[2])
+    stiffness_scale = torch.tensor((2.0, 1.0), dtype=gs.tc_float, device=gs.device)
+    assert_allclose(rods[0].get_bending_stiffness(), stiffness_scale * bending_stiffness_init, tol=gs.EPS)
 
     scene.reset()
     for rod in rods:
@@ -358,13 +363,13 @@ def test_vertex_constraints_reset_with_state(show_viewer):
     rods[1].set_verts_pos(pos_init[1] + shift)
     for _ in range(20):
         scene.step()
-    assert_allclose(rods[0].get_state().pos[:, :2], pos_init[0][:, :2], tol=gs.EPS)
-    assert_allclose(rods[1].get_state().pos[1, 2], pos_init[1][1, 2] + shift, tol=gs.EPS)
-    assert_allclose(rods[2].get_state().pos, pos_init[2], tol=gs.EPS)
+    assert_allclose(rods[0].get_verts_pos()[:, :2], pos_init[0][:, :2], tol=gs.EPS)
+    assert_allclose(rods[1].get_verts_pos()[1, 2], pos_init[1][1, 2] + shift, tol=gs.EPS)
+    assert_allclose(rods[2].get_verts_pos(), pos_init[2], tol=gs.EPS)
     # The constrained vertex follows the box as it falls
     assert (box.get_pos()[:, 2] < box_pos_init[:, 2] - 1e-3).all()
     verts_pos = gu.transform_by_trans_quat(verts_offset, box.get_pos(), box.get_quat())
-    assert_allclose(rods[1].get_state().pos[:, 19], verts_pos, tol=gs.EPS)
+    assert_allclose(rods[1].get_verts_pos()[:, 19], verts_pos, tol=gs.EPS)
 
 
 @pytest.mark.required
@@ -423,11 +428,11 @@ def test_rod_contacts_match_reference(contact_margin, show_viewer):
         rod.set_verts_fixed(True, verts_idx)
     assert_equal([(rod.v_start, rod.n_verts, rod.e_start, rod.n_edges) for rod in rods], ref["rod_ranges"])
 
-    pos = [torch.cat([rod.get_state().pos for rod in rods], dim=1)]
+    pos = [torch.cat([rod.get_verts_pos() for rod in rods], dim=1)]
     for _ in range(ref["step"][-1] // 10):
         for _ in range(10):
             scene.step()
-        pos.append(torch.cat([rod.get_state().pos for rod in rods], dim=1))
+        pos.append(torch.cat([rod.get_verts_pos() for rod in rods], dim=1))
     assert_allclose(torch.stack(pos), ref["pos"], atol=1e-3)
 
 
@@ -512,9 +517,9 @@ def test_rod_contacts_resolve_at_any_precision(precision, show_viewer):
         material=material,
     )
     scene.build()
-    pos_init = rod.get_state().pos
+    pos_init = rod.get_verts_pos()
     scene.step()
-    lift = (rod.get_state().pos - pos_init)[0, :, 2]
+    lift = (rod.get_verts_pos() - pos_init)[:, 2]
     # The two vertices of the crossing edge share the correction equally, and the overlap is resolved without overshoot
     assert_allclose(lift[4], lift[5], atol=1e-7)
     assert_allclose(lift[4], penetration, atol=2e-6)
@@ -556,12 +561,12 @@ def test_rod_contact_at_immovable_vertices_does_not_lever_free_vertex(show_viewe
     )
     scene.build()
     rod.set_verts_fixed(True, [0])
-    pos_init = rod.get_state().pos
+    pos_init = rod.get_verts_pos()
     for _ in range(10):
         scene.step()
     # The overlap is at immovable points of both rods: removing it would turn the free edge about its fixed vertex,
     # moving its free vertex by the penetration over its weight in the point (20 mm), so it stays
-    assert_allclose(rod.get_state().pos, pos_init, atol=1e-9)
+    assert_allclose(rod.get_verts_pos(), pos_init, atol=1e-9)
 
 
 @pytest.mark.required
@@ -639,8 +644,8 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
     for _ in range(250):
         scene.step()
         block_top = block.get_particles_pos()[..., 2].max(dim=-1).values
-        rod_bottom = rod.get_state().pos[..., 2].min(dim=-1).values
-        heights_landing.append([rod_landing.get_state().pos[..., 2].mean(dim=-1) for rod_landing in rods_landing])
+        rod_bottom = rod.get_verts_pos()[..., 2].min(dim=-1).values
+        heights_landing.append([rod_landing.get_verts_pos()[..., 2].mean(dim=-1) for rod_landing in rods_landing])
         # The coupled rod rests on the block, while the uncoupled one falls through it
         if rod_mpm:
             assert (rod_bottom > block_top).all()
@@ -661,7 +666,7 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
             sink_rate = (heights[-n_steps_settled] - heights[-1]) / (n_steps_settled * 1e-3)
             assert (sink_rate.abs() < 5e-3).all()
     # The impulses of the grid nodes on a vertex add up through atomics, whose order varies
-    assert_allclose(rod.get_state().pos[0], rod.get_state().pos[1], tol=1e-9)
+    assert_allclose(rod.get_verts_pos()[0], rod.get_verts_pos()[1], tol=1e-9)
 
 
 @pytest.mark.required
@@ -714,7 +719,7 @@ def test_rod_mpm_contact_does_not_overshoot_at_any_mass(show_viewer):
 
     scene.step()
     for rod in rods:
-        vel_z = rod.get_state().vel[0, :, 2]
+        vel_z = rod.get_verts_vel()[:, 2]
         assert (vel_z < 0.0).all()
         assert vel_z.max() > -0.99
 
@@ -784,7 +789,7 @@ def test_rod_mpm_contact_ignores_unrelated_material(show_viewer):
         scene.build()
         for _ in range(200):
             scene.step()
-        heights.append(rod.get_state().pos[0, :, 2].mean())
+        heights.append(rod.get_verts_pos()[:, 2].mean())
     assert_allclose(heights[1], heights[0], atol=1e-5)
 
 
@@ -836,12 +841,12 @@ def test_rod_mpm_coupling_conserves_momentum(show_viewer):
     for _ in range(30):
         scene.step()
         momentum.append(
-            rod_mass * rod.get_state().vel.sum(dim=-2) + (particle_mass * block.get_particles_vel()).sum(dim=-2)
+            rod_mass * rod.get_verts_vel().sum(dim=-2) + (particle_mass * block.get_particles_vel()).sum(dim=-2)
         )
     assert_allclose(torch.stack(momentum), momentum[0][None], atol=1e-12)
     # The rod stays behind the block it pushed, restitution being zero, instead of rebounding off it
     assert (block.get_particles_vel()[..., 2].mean(dim=-1) < -0.1).all()
-    assert (rod.get_state().vel[..., 2].mean(dim=-1) < 0.0).all()
+    assert (rod.get_verts_vel()[..., 2].mean(dim=-1) < 0.0).all()
 
 
 @pytest.mark.required
@@ -925,7 +930,7 @@ def test_rod_length_and_rigid_contacts(show_viewer):
         assert_equal(loop.get_verts_contact_geom_idx(), -1)
         # A contact is reported over the whole step it happens in, and cleared by the next step
         assert_equal(rod_leaving.get_verts_contact_geom_idx(), box.geoms[0].idx if i_step == 0 else -1)
-    verts_pos = rod.get_state().pos
+    verts_pos = rod.get_verts_pos()
     edges_length = torch.linalg.norm(verts_pos[:, 1:] - verts_pos[:, :-1], dim=-1)
     assert_allclose(rod.get_total_length(), edges_length.sum(dim=-1), tol=gs.EPS)
 
@@ -1044,7 +1049,7 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
         surface_pos = np.array([0.0, y, 0.2]) + (0.01 + radius) * normal
         rod.set_position(surface_pos + (np.arange(6) - 2.5)[:, None] * interval * tangent)
         slopes_tangent.append(tangent)
-    slopes_pos_init = [rod.get_state().pos for rod in rods_on_slope]
+    slopes_pos_init = [rod.get_verts_pos() for rod in rods_on_slope]
     lift_dof = gripper.get_joint("lift").dofs_idx_local
     pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
     carriage = gripper.get_link("carriage")
@@ -1059,7 +1064,7 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
             (rod_on_plate, (0.0, 0.2), radius),
             (rod_on_post, (0.3, 0.1), radius + post_radius),
         ):
-            verts_pos = tensor_to_array(rod.get_state().pos)
+            verts_pos = tensor_to_array(rod.get_verts_pos())
             t = np.linspace(0.0, 1.0, 101)[:, None]
             axis_pos = verts_pos[:, :-1, None] + t * (verts_pos[:, 1:, None] - verts_pos[:, :-1, None])
             axis_pos = axis_pos[..., ::2]
@@ -1067,9 +1072,9 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
         # The pads stop at the surface of the rod
         assert (gripper.get_dofs_position(pads_dof).sum(dim=-1) < 0.03 - (2.0 * radius - 1e-3)).all()
         if i_step == n_close_steps - 1:
-            grasp_offset = rod_grasped.get_state().pos[:, 2] - carriage.get_pos()
+            grasp_offset = rod_grasped.get_verts_pos()[:, 2] - carriage.get_pos()
     # The grasped rod follows the carriage
-    assert_allclose(rod_grasped.get_state().pos[:, 2] - carriage.get_pos(), grasp_offset, atol=5e-4)
+    assert_allclose(rod_grasped.get_verts_pos()[:, 2] - carriage.get_pos(), grasp_offset, atol=5e-4)
     assert (carriage.get_pos()[:, 2] > 0.3 + 0.02).all()
 
     # A rod stays on a slope below the friction angle, and slides down the other with the acceleration of Coulomb
@@ -1082,7 +1087,7 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
         slopes_tangent,
         (0.0, 0.5 * slope_acc * substep_dt**2 * n_substeps * (n_substeps + 1)),
     ):
-        assert_allclose(tensor_to_array(rod.get_state().pos - pos_init) @ tangent, slide, atol=1e-6)
+        assert_allclose(tensor_to_array(rod.get_verts_pos() - pos_init) @ tangent, slide, atol=1e-6)
 
 
 @pytest.mark.required
@@ -1133,7 +1138,7 @@ def test_rod_rigid_squeeze_conserves_momentum(two_pad_gripper, show_viewer):
     verts_mass = qd_to_numpy(scene.sim.rod_solver.rod_info.verts.mass)
 
     def momentum_z():
-        rod_momentum = (verts_mass * tensor_to_array(rod.get_state().vel)[0, :, 2]).sum()
+        rod_momentum = (verts_mass * tensor_to_array(rod.get_verts_vel())[:, 2]).sum()
         # The generalized momentum along the slide of the carriage, the armature of the slide included
         gripper_momentum = tensor_to_array(gripper.get_mass_mat() @ gripper.get_dofs_velocity())[lift_dof[0]]
         return rod_momentum + gripper_momentum
@@ -1149,7 +1154,7 @@ def test_rod_rigid_squeeze_conserves_momentum(two_pad_gripper, show_viewer):
     # The weight of the rod is the only vertical force on the rod and the gripper
     assert_allclose(momentum_z() - momentum_init, -verts_mass.sum() * 9.81 * n_hold_steps * 1e-3, rtol=2e-2)
     # The rod is held, its vertices between the pads moving with the carriage (its ends bend freely)
-    assert_allclose(rod.get_state().vel[0, 1:4, 2], gripper.get_dofs_velocity(lift_dof)[0], atol=2e-3)
+    assert_allclose(rod.get_verts_vel()[1:4, 2], gripper.get_dofs_velocity(lift_dof)[0], atol=2e-3)
 
 
 @pytest.mark.required
@@ -1196,7 +1201,7 @@ def test_rod_rigid_friction_conserves_momentum(show_viewer):
     box_mass = float(box.get_mass())
 
     def momentum_x():
-        return (verts_mass * tensor_to_array(rod.get_state().vel)[0, :, 0]).sum(), box_mass * float(box.get_vel()[0])
+        return (verts_mass * tensor_to_array(rod.get_verts_vel())[:, 0]).sum(), box_mass * float(box.get_vel()[0])
 
     momentum_init = sum(momentum_x())
     for _ in range(n_steps):
@@ -1253,13 +1258,13 @@ def test_rod_rigid_grip_holds_twice_the_friction(two_pad_gripper, show_viewer):
     gripper.control_dofs_force(squeeze_force.repeat(2, axis=1), pads_dof)
     for _ in range(10):
         scene.step()
-    pos_start = rod.get_state().pos[..., 0].mean(dim=-1)
-    vel_start = rod.get_state().vel[..., 0].mean(dim=-1)
+    pos_start = rod.get_verts_pos()[..., 0].mean(dim=-1)
+    vel_start = rod.get_verts_vel()[..., 0].mean(dim=-1)
     for _ in range(n_steps):
         scene.step()
     # Twice the friction of one pad holds, less slides with the acceleration of Coulomb friction
-    assert abs(rod.get_state().pos[1, :, 0].mean() - pos_start[1]) < 1e-4
-    acc_slip = (rod.get_state().vel[0, :, 0].mean() - vel_start[0]) / (n_steps * 1e-3)
+    assert abs(rod.get_verts_pos()[1, :, 0].mean() - pos_start[1]) < 1e-4
+    acc_slip = (rod.get_verts_vel()[0, :, 0].mean() - vel_start[0]) / (n_steps * 1e-3)
     assert_allclose(acc_slip, -gravity * (1.0 - 0.8), rtol=0.05)
 
 
@@ -1305,8 +1310,8 @@ def test_rod_rests_on_supported_rigid_link(show_viewer):
     for _ in range(n_steps):
         scene.step()
     # The rod rests, the velocity of the vertices zero to the share of the substep its contacts leave to the link
-    assert_allclose(rod.get_state().vel, 0.0, atol=5e-4)
-    assert_allclose(rod.get_state().pos[..., 2], beam.get_pos()[..., 2] + 0.005 + radius, atol=1e-5)
+    assert_allclose(rod.get_verts_vel(), 0.0, atol=5e-4)
+    assert_allclose(rod.get_verts_pos()[..., 2], beam.get_pos()[..., 2] + 0.005 + radius, atol=1e-5)
 
 
 @pytest.mark.required
@@ -1367,19 +1372,18 @@ def test_rod_rigid_friction_holds_rod_between_tilted_pads(two_pad_gripper, reque
         gripper.control_dofs_force([squeeze_force, squeeze_force], pads_dof)
     for _ in range(n_settle_steps):
         scene.step()
-    z_start = [float(rod.get_state().pos[0, :, 2].mean()) for rod in rods]
+    z_start = [float(rod.get_verts_pos()[:, 2].mean()) for rod in rods]
     vel_error = 0.0
-    pos_prev = tensor_to_array(rods[0].get_state().pos[0])
+    pos_prev = tensor_to_array(rods[0].get_verts_pos())
     for _ in range(n_steps):
         scene.step()
-        state = rods[0].get_state()
-        pos = tensor_to_array(state.pos[0])
+        pos = tensor_to_array(rods[0].get_verts_pos())
         # The velocity of the vertices between the pads against the motion of the step
         vel_fd = (pos - pos_prev) / 1e-3
-        vel = tensor_to_array(state.vel[0])
+        vel = tensor_to_array(rods[0].get_verts_vel())
         vel_error = max(vel_error, float(np.linalg.norm(vel[1:4] - vel_fd[1:4], axis=-1).max()))
         pos_prev = pos
-    drift = [float(rod.get_state().pos[0, :, 2].mean()) - z for rod, z in zip(rods, z_start)]
+    drift = [float(rod.get_verts_pos()[:, 2].mean()) - z for rod, z in zip(rods, z_start)]
     # Friction above the tangent of the tilt holds the rod, below it the rod slides down out of the pads
     assert abs(drift[0]) < 5e-4
     assert drift[1] < -1e-2
@@ -1390,10 +1394,10 @@ def test_rod_rigid_friction_holds_rod_between_tilted_pads(two_pad_gripper, reque
     assert vel_error < 5e-3
     # Opened, the pads let the rod fall freely, their tilted faces pushing it down as they leave (9 mm/s at 9 deg)
     grippers[0].control_dofs_force([-squeeze_force, -squeeze_force], pads_dof_held)
-    vel_start = tensor_to_array(rods[0].get_state().vel[0, :, 2]).mean()
+    vel_start = tensor_to_array(rods[0].get_verts_vel()[:, 2]).mean()
     for _ in range(n_release_steps):
         scene.step()
-    vel_fall = tensor_to_array(rods[0].get_state().vel[0, :, 2]).mean() - vel_start
+    vel_fall = tensor_to_array(rods[0].get_verts_vel()[:, 2]).mean() - vel_start
     assert_allclose(vel_fall, -9.81 * n_release_steps * 1e-3, atol=1e-2)
 
 
@@ -1458,10 +1462,10 @@ def test_rod_rigid_slow_grip_lifts_rod_from_ground(two_pad_gripper, show_viewer)
         gripper.control_dofs_position([lifting], lift_dof)
         scene.step()
         if i_step == n_close_steps - 1:
-            grasp_offset = rod.get_state().pos[0, :, 2] - carriage.get_pos()[2]
-        speed_max = max(speed_max, float(torch.linalg.norm(rod.get_state().vel, dim=-1).max()))
+            grasp_offset = rod.get_verts_pos()[:, 2] - carriage.get_pos()[2]
+        speed_max = max(speed_max, float(torch.linalg.norm(rod.get_verts_vel(), dim=-1).max()))
         pads_speed_max = max(pads_speed_max, float(torch.linalg.norm(gripper.get_dofs_velocity(), dim=-1)))
     # The rod is lifted with the carriage, and never moves faster than the pads plus a margin
     assert carriage.get_pos()[2] > 0.0215 + 0.09
-    assert_allclose(rod.get_state().pos[0, :, 2] - carriage.get_pos()[2], grasp_offset, atol=2e-3)
+    assert_allclose(rod.get_verts_pos()[:, 2] - carriage.get_pos()[2], grasp_offset, atol=2e-3)
     assert speed_max < pads_speed_max + 0.1

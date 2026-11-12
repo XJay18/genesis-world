@@ -214,12 +214,9 @@ def test_hanging_rigid_cable(show_viewer, tol):
     assert_allclose(links_quat_err, 0.0, tol=1e-3)
 
 
+@pytest.mark.required("sparse")
 @pytest.mark.parametrize("primitive_type", ["box", "sphere"])
-@pytest.mark.parametrize("precision", ["64"])
 def test_franka_panda_grasp_fem_entity(primitive_type, show_viewer):
-    if gs.use_ndarray:
-        pytest.skip("SAPCoupler does not support ndarray yet.")
-
     GRAPPER_POS_START = (0.65, 0.0, 0.13)
     GRAPPER_POS_END = (0.65, 0.0, 0.18)
 
@@ -233,14 +230,8 @@ def test_franka_panda_grasp_fem_entity(primitive_type, show_viewer):
         ),
         fem_options=gs.options.FEMOptions(
             use_implicit_solver=True,
-            pcg_threshold=1e-10,
         ),
-        coupler_options=gs.options.SAPCouplerOptions(
-            sap_convergence_atol=1e-10,
-            sap_convergence_rtol=1e-10,
-            pcg_threshold=1e-10,
-            linesearch_ftol=1e-10,
-        ),
+        coupler_options=gs.options.SAPCouplerOptions(),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(1.3, 0.0, 0.15),
             camera_lookat=(0.65, 0.0, 0.15),
@@ -249,6 +240,9 @@ def test_franka_panda_grasp_fem_entity(primitive_type, show_viewer):
         show_FPS=False,
     )
 
+    scene.add_entity(
+        gs.morphs.Plane(),
+    )
     franka = scene.add_entity(
         gs.morphs.MJCF(
             file="xml/franka_emika_panda/panda.xml",
@@ -297,7 +291,7 @@ def test_franka_panda_grasp_fem_entity(primitive_type, show_viewer):
 
     # init
     franka.set_qpos((-1.0124, 1.5559, 1.3662, -1.6878, -1.5799, 1.7757, 1.4602, 0.04, 0.04))
-    box_pos_0 = obj.get_state().pos.mean(dim=-2)
+    box_pos_0 = obj.get_verts_pos().mean(dim=-2)
 
     # hold
     qpos = franka.inverse_kinematics(link=end_effector, pos=GRAPPER_POS_START, quat=(0, 1, 0, 0))
@@ -313,17 +307,20 @@ def test_franka_panda_grasp_fem_entity(primitive_type, show_viewer):
     # lift and wait for while to give enough time for the robot to stop shaking
     qpos = franka.inverse_kinematics(link=end_effector, pos=GRAPPER_POS_END, quat=(0, 1, 0, 0))
     franka.control_dofs_position(qpos[motors_dof], motors_dof)
-    for i in range(65):
+    for i in range(40):
         franka.control_dofs_force(np.array([-1.0, -1.0]), fingers_dof)
         scene.step()
 
     # Check that the box has moved by the expected delta, without slipping
-    box_pos_f = obj.get_state().pos.mean(dim=-2)
+    box_pos_f = obj.get_verts_pos().mean(dim=-2)
     assert_allclose(box_pos_f - box_pos_0, np.array(GRAPPER_POS_END) - np.array(GRAPPER_POS_START), tol=5e-3)
+    # The fingers rest on the sides of the object, its deformation and the compliance of the contact aside
+    obj_verts_y = obj.get_verts_pos()[..., 1]
+    assert_allclose(franka.get_qpos()[fingers_dof], 0.5 * (obj_verts_y.max() - obj_verts_y.min()), atol=1e-3)
 
     # wait for a while
-    for i in range(25):
+    for i in range(10):
         franka.control_dofs_force(np.array([-1.0, -1.0]), fingers_dof)
         scene.step()
-    box_pos_post = obj.get_state().pos.mean(dim=-2)
+    box_pos_post = obj.get_verts_pos().mean(dim=-2)
     assert_allclose(box_pos_f, box_pos_post, atol=1e-3)

@@ -4,18 +4,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-import igl
 import trimesh
-
-import quadrants as qd
 
 import genesis as gs
 import genesis.utils.element as eu
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
-from genesis.engine.couplers import SAPCoupler
 from genesis.engine.entities.rigid_entity import RigidLink
-from genesis.engine.states.entities import FEMEntityState
 from genesis.repr_base import RBC
 from genesis.utils.misc import broadcast_tensor, tensor_to_array, unique_rows
 
@@ -118,7 +113,6 @@ def assert_muscle(method):
     return wrapper
 
 
-@qd.data_oriented
 class FEMEntity(Entity):
     """
     A finite element method (FEM)-based entity for deformable simulation.
@@ -213,9 +207,6 @@ class FEMEntity(Entity):
             tri2el = np.repeat(np.arange(self.elems.shape[0], dtype=gs.np_int)[:, np.newaxis], 4, axis=1)
             unique_el = tri2el.flat[unique_idcs]
             self._surface_el_np = unique_el[cnt == 1]
-
-        if isinstance(self.sim.coupler, SAPCoupler):
-            self.compute_pressure_field()
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- basic entity ops -------------------------------
@@ -321,13 +312,6 @@ class FEMEntity(Entity):
             assert ((1.0 - muscle_direction.norm(dim=-1)).abs() < gs.EPS).all()
 
             self.set_muscle_direction(muscle_direction)
-
-    def get_state(self):
-        solver_state = self._solver.get_state(self._sim.cur_substep_local)
-        verts_slice = slice(self._v_start, self._v_start + self.n_vertices)
-        return FEMEntityState(
-            self, self._sim.cur_step_global, solver_state.pos[:, verts_slice], solver_state.vel[:, verts_slice]
-        )
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- instantiation ----------------------------------
@@ -435,21 +419,16 @@ class FEMEntity(Entity):
 
         if isinstance(self.material, gs.materials.FEM.Cloth):
             self._solver.add_cloth(
-                f=self._sim.cur_substep_local,
                 v_start=self._v_start,
                 s_start=self._s_start,
                 verts=verts_numpy,
                 tri2v=self._surface_tri_np,
+                tri2el=self._surface_el_np,
             )
         else:
             elems_np = self.elems.astype(gs.np_int, copy=False)
             self._solver.add_elements(
-                f=self._sim.cur_substep_local,
-                mat_idx=self._material.idx,
-                mat_mu=self._material.mu,
-                mat_lam=self._material.lam,
-                mat_rho=self._material.rho,
-                mat_friction_mu=self._material.friction_mu,
+                material=self._material,
                 v_start=self._v_start,
                 el_start=self._el_start,
                 s_start=self._s_start,
@@ -472,31 +451,6 @@ class FEMEntity(Entity):
                 uvs=uvs,
                 vfaces=vgeom.vmesh.faces.astype(gs.np_int, copy=False),
             )
-
-    def compute_pressure_field(self):
-        """
-        Compute the pressure field for the FEM entity based on its tetrahedral elements.
-
-        For hydroelastic contact: https://drake.mit.edu/doxygen_cxx/group__hydroelastic__user__guide.html
-
-        Notes
-        -----
-        https://github.com/RobotLocomotion/drake/blob/master/geometry/proximity/make_mesh_field.cc
-        TODO: Add margin support
-        Drake's implementation of margin seems buggy.
-        """
-        init_positions = tensor_to_array(self.init_positions)
-        unsigned_distance, *_ = igl.signed_distance(
-            init_positions, init_positions, self._surface_tri_np, sign_type=igl.SIGNED_DISTANCE_TYPE_UNSIGNED
-        )
-        unsigned_distance = unsigned_distance.astype(gs.np_float, copy=False)
-        max_distance = np.max(unsigned_distance)
-        if max_distance < gs.EPS:
-            gs.raise_exception(
-                f"Pressure field max distance is too small: {max_distance}. "
-                "This might be due to a mesh having no internal vertices."
-            )
-        self.pressure_field_np = unsigned_distance / max_distance * self.material.hydroelastic_modulus  # normalize
 
     # ------------------------------------------------------------------------------------
     # ---------------------------- interfacing with solver -------------------------------
@@ -536,6 +490,40 @@ class FEMEntity(Entity):
         """
         verts_idx = self._get_global_idx(verts_idx_local, self.n_vertices, self._v_start, unsafe=True, batched_idx=True)
         self._solver.set_verts_vel(vels, verts_idx, envs_idx)
+
+    @gs.assert_built
+    def get_verts_pos(self, verts_idx_local=None, envs_idx=None):
+        """
+        Get the position of some vertices.
+
+        Parameters
+        ----------
+        verts_idx_local : None | int | array_like, shape (N,)
+            Index of the vertices relative to this entity, the same in every environment. If None, all vertices will be
+            considered. Defaults to None.
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to get. If None, all environments will be considered. Defaults to None.
+
+        Returns
+        -------
+        poss : torch.Tensor, shape ([M,] N, 3)
+            The position of each vertex.
+        """
+        verts_idx = self._get_global_idx(verts_idx_local, self.n_vertices, self._v_start, unsafe=True)
+        return self._solver.get_verts_pos(verts_idx, envs_idx)
+
+    @gs.assert_built
+    def get_verts_vel(self, verts_idx_local=None, envs_idx=None):
+        """
+        Get the velocity of some vertices (see 'get_verts_pos').
+
+        Returns
+        -------
+        vels : torch.Tensor, shape ([M,] N, 3)
+            The velocity of each vertex.
+        """
+        verts_idx = self._get_global_idx(verts_idx_local, self.n_vertices, self._v_start, unsafe=True)
+        return self._solver.get_verts_vel(verts_idx, envs_idx)
 
     @assert_muscle
     def set_muscle_group(self, muscle_group):
@@ -579,9 +567,11 @@ class FEMEntity(Entity):
                 Optional rigid link for the vertices to follow, maintaining relative position.
             is_soft_constraint: bool
                 By default, use a hard constraint directly sets position and zero velocity.
-                A soft constraint uses a spring force to pull the vertex towards the target position.
+                A soft constraint pulls the vertices toward their targets with critically damped springs under the
+                explicit solver, while the implicit solver holds them at their targets (see
+                'FEMSolver.set_vertex_constraints').
             stiffness : float
-                Specify a spring stiffness for a soft constraint. Critical damping is applied.
+                Stiffness of the springs of a soft constraint, in N/m.
             envs_idx : array_like, optional
                 List of environment indices to apply the constraints to. If None, applies to all environments.
         """

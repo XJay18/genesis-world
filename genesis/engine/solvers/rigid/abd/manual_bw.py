@@ -10,7 +10,8 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.array_class import DynInfo, DynState, RigidInfo
+from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo
+from genesis.utils.data import eoa
 
 
 @qd.func
@@ -93,7 +94,7 @@ def func_forward_kinematics_link_bw(
             axis = dyn_info.dofs.motion_ang[I_d]
             angle = rigid_info.qpos[q_start, i_b] - rigid_info.qpos0[q_start, i_b]
             rotvec = axis * angle
-            qloc = gu.qd_rotvec_to_quat(rotvec, rigid_info.EPS[None])
+            qloc = gu.qd_rotvec_to_quat(rotvec)
             # quat_out = transform_quat_by_quat(qloc, quat_in) = quat_mul(quat_in, qloc)
             quat_out = gu.qd_transform_quat_by_quat(qloc, quat_in)
 
@@ -102,7 +103,7 @@ def func_forward_kinematics_link_bw(
             gq_out = g_quat - gu.qd_transform_by_quat_grad_quat(joint_pos_off, quat_out, g_pos)
             g_qloc = gu.qd_quat_mul_grad_rhs(quat_in, qloc, gq_out)
             g_quat_in_apply = gu.qd_quat_mul_grad_lhs(quat_in, qloc, gq_out)
-            rotvec_grad = gu.qd_rotvec_to_quat_grad_rotvec(rotvec, rigid_info.EPS[None], g_qloc)
+            rotvec_grad = gu.qd_rotvec_to_quat_grad_rotvec(rotvec, g_qloc)
             angle_grad = axis[0] * rotvec_grad[0] + axis[1] * rotvec_grad[1] + axis[2] * rotvec_grad[2]
             # The forward also publishes the angle as dofs.pos[dof_start] = qpos - qpos0, whose grad (accumulated by the
             # force-stage reverses) folds back linearly.
@@ -248,7 +249,9 @@ def kernel_manual_forward_kinematics_bw(
     # Leaf to root: a child's grad on its parent lands before the parent's own iteration consumes it, so each root walks
     # its span descending, static links and trees together (see func_update_kinematics_root in forward_kinematics.py)
     qd.loop_config(name="manual_fk_only_bw", serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_r, i_b in qd.ndrange(rigid_info.roots_link_idx.shape[0], dyn_state.links.pos.shape[1]):
+    for i_r, i_b in qd.ndrange(
+        rigid_info.roots_link_idx.shape[0], dyn_state.links.pos.shape[1], axes=qd.static(eoa(dyn_state.links.pos))
+    ):
         i_l_root = rigid_info.roots_link_idx[i_r]
         i_l_end = rigid_info.links_root_end[i_l_root]
         for i_l_ in range(i_l_end - i_l_root):
@@ -415,7 +418,9 @@ def kernel_manual_forward_velocity_bw(
     qd.loop_config(
         name="manual_forward_velocity_bw", serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL)
     )
-    for i_r, i_b in qd.ndrange(rigid_info.roots_link_idx.shape[0], dyn_state.links.pos.shape[1]):
+    for i_r, i_b in qd.ndrange(
+        rigid_info.roots_link_idx.shape[0], dyn_state.links.pos.shape[1], axes=qd.static(eoa(dyn_state.links.pos))
+    ):
         i_l_root = rigid_info.roots_link_idx[i_r]
         i_l_end = rigid_info.links_root_end[i_l_root]
         for i_l_ in range(i_l_end - i_l_root):
@@ -446,11 +451,15 @@ def kernel_manual_compute_qacc_bw(dyn_state: DynState, rigid_info: RigidInfo, ri
     backward path populates it, and kernel_forward_dynamics_without_qacc.grad then reverses it into link poses.
 
     Like func_solve_mass_block, the triangular solves and the IFT outer product are restricted to the mass blocks of
-    each kinematic tree (see dofs_mass_block_start in array_class.py): elimination never crosses a block, and
+    each kinematic tree (see dofs_mass_block_start in rigid/data.py): elimination never crosses a block, and
     cross-block mass entries are structural zeros whose grads must stay zero.
     """
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
-    for i_t, i_b in qd.ndrange(rigid_info.trees_root_idx.shape[0], dyn_state.dofs.force.shape[1]):
+    for i_t, i_b in qd.ndrange(
+        rigid_info.trees_root_idx.shape[0],
+        dyn_state.dofs.force.shape[1],
+        axes=qd.static(eoa(dyn_state.dofs.acc_smooth_bw)),
+    ):
         blocks_dof_start = rigid_info.trees_dof_start[i_t]
         blocks_dof_end = blocks_dof_start + rigid_info.trees_n_dofs[i_t]
 

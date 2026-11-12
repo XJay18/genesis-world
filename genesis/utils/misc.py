@@ -10,12 +10,12 @@ import os
 import random
 import sys
 import weakref
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import field
 from importlib import import_module
 from itertools import combinations
-from typing import Any, NoReturn, Optional, Sequence
+from typing import Any, NoReturn
 
 import numpy as np
 import torch
@@ -31,6 +31,7 @@ from quadrants.lang._fast_caching import args_hasher, src_hasher
 from quadrants.lang._perf_dispatch import PerformanceDispatcher
 from quadrants.lang._template_mapper import TemplateMapper
 from quadrants.lang.kernel import Kernel
+from quadrants.lang.util import to_pytorch_type
 from quadrants.types.enums import AutodiffMode
 
 import genesis as gs
@@ -38,6 +39,9 @@ from genesis.typing import is_sequence
 
 
 LOGGER = logging.getLogger(__name__)
+
+_WIN_STD_ERROR_HANDLE = -12
+_WIN_HANDLE_FLAG_PROTECT_FROM_CLOSE = 0x2
 
 
 class DeprecationError(Exception):
@@ -57,13 +61,18 @@ class redirect_libc_stderr:
     Context-manager that temporarily redirects C / C++ std::cerr (i.e. the C `stderr` file descriptor 2) to a given
     Python file-like object's fd.
 
-    Works on macOS, Linux (glibc / musl), and Windows (MSVCRT / Universal CRT ≥ VS2015).
+    Works on macOS, Linux (glibc / musl) and Windows (Universal C Runtime). On Windows, native code writing to the
+    standard error handle of the process rather than to descriptor 2 (e.g. the logger of Quadrants) still writes to the
+    original stream.
     """
 
     def __init__(self, fd):
         self.fd = fd
         self.stderr_fileno = None
         self.original_stderr_fileno = None
+        self.original_sys_stderr = None
+        self.stderr_handle = None
+        self.stderr_handle_flags = None
 
     def __enter__(self):
         try:
@@ -80,18 +89,32 @@ class redirect_libc_stderr:
             libc.fflush(None)
             libc.dup2(self.fd.fileno(), self.stderr_fileno)
         elif os.name == "nt":  # Windows
-            # FIXME: Do not redirect stderr on Windows OS when running pytest, otherwise it will raise this exception:
-            # "OSError: [WinError 6] The handle is invalid"
-            if "PYTEST_VERSION" not in os.environ:
-                msvcrt = ctypes.CDLL("msvcrt")
-                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetStdHandle.restype = ctypes.c_void_p
 
-                msvcrt.fflush(None)
-                msvcrt._dup2(self.fd.fileno(), self.stderr_fileno)
+            # Native code caches the standard error handle of the process (the logger of Quadrants does). Descriptor 2
+            # owns that handle, so redirecting it closes the handle and makes the file the standard error handle. The
+            # handle is protected from closing during the swap and restored afterward, otherwise writes through the
+            # cached value go to whichever file reuses it.
+            self.stderr_handle = ctypes.c_void_p(kernel32.GetStdHandle(_WIN_STD_ERROR_HANDLE))
+            stderr_handle_flags = ctypes.c_ulong()
+            kernel32.GetHandleInformation(self.stderr_handle, ctypes.byref(stderr_handle_flags))
+            self.stderr_handle_flags = stderr_handle_flags.value
+            kernel32.SetHandleInformation(
+                self.stderr_handle, _WIN_HANDLE_FLAG_PROTECT_FROM_CLOSE, _WIN_HANDLE_FLAG_PROTECT_FROM_CLOSE
+            )
 
-                STDERR_HANDLE = -12
-                new_os_handle = msvcrt._get_osfhandle(self.fd.fileno())
-                kernel32.SetStdHandle(STDERR_HANDLE, new_os_handle)
+            # Python links the Universal C Runtime, so 'os.dup2' acts on the descriptor table native extensions share
+            ctypes.CDLL("ucrtbase").fflush(None)
+            os.dup2(self.fd.fileno(), self.stderr_fileno)
+            kernel32.SetStdHandle(_WIN_STD_ERROR_HANDLE, self.stderr_handle)
+
+            # A console stream of Python looks up the handle of its descriptor at every write and fails once that handle
+            # is a file, so Python writes go through a plain stream on the same descriptor meanwhile, as on POSIX.
+            self.original_sys_stderr = sys.stderr
+            sys.stderr = open(
+                self.stderr_fileno, "w", buffering=1, errors=self.original_sys_stderr.errors, closefd=False
+            )
         else:
             gs.logger.warning(f"Unsupported platform for redirecting libc stderr: {sys.platform}")
 
@@ -101,23 +124,25 @@ class redirect_libc_stderr:
         if self.stderr_fileno is None:
             return
 
+        sys.stderr.flush()
         if os.name == "posix":
             libc = ctypes.CDLL(None)
-            sys.stderr.flush()
             libc.fflush(None)
             libc.dup2(self.original_stderr_fileno, self.stderr_fileno)
         elif os.name == "nt":
-            if "PYTEST_VERSION" not in os.environ:
-                msvcrt = ctypes.CDLL("msvcrt")
-                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
-                sys.stderr.flush()
-                msvcrt.fflush(None)
-                msvcrt._dup2(self.original_stderr_fileno, self.stderr_fileno)
-
-                STDERR_HANDLE = -12
-                orig_os_handle = msvcrt._get_osfhandle(self.original_stderr_fileno)
-                kernel32.SetStdHandle(STDERR_HANDLE, orig_os_handle)
+            sys.stderr.close()
+            sys.stderr = self.original_sys_stderr
+            ctypes.CDLL("ucrtbase").fflush(None)
+            os.dup2(self.original_stderr_fileno, self.stderr_fileno)
+            kernel32.SetStdHandle(_WIN_STD_ERROR_HANDLE, self.stderr_handle)
+            kernel32.SetHandleInformation(
+                self.stderr_handle, _WIN_HANDLE_FLAG_PROTECT_FROM_CLOSE, self.stderr_handle_flags
+            )
+            self.original_sys_stderr = None
+            self.stderr_handle = None
+            self.stderr_handle_flags = None
 
         os.close(self.original_stderr_fileno)
         self.stderr_fileno = None
@@ -227,7 +252,7 @@ def set_random_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def get_device(backend: gs.constants.backend, device_idx: Optional[int] = None):
+def get_device(backend: gs.constants.backend, device_idx: int | None = None):
     if backend == gs.gpu:
         if torch.cuda.is_available():
             if torch.version.hip:
@@ -718,7 +743,12 @@ def has_display() -> bool:
 
 
 def indices_to_mask(
-    *indices: Any, keepdim: bool = True, to_torch: bool = True, boolean_mask: bool = True, raise_if_fancy: bool = False
+    *indices: Any,
+    keepdim: bool = True,
+    to_torch: bool = True,
+    boolean_mask: bool = True,
+    raise_if_fancy: bool = False,
+    pair_rows: bool = False,
 ) -> tuple[slice | int | torch.Tensor, ...]:
     """Converts a sequence of slice-like objects into a multi-dimensional mask corresponding to their cross-product.
 
@@ -738,6 +768,9 @@ def indices_to_mask(
         once is always converted, because the cross-product needs one index per axis.
         raise_if_fancy (bool): Whether to raise if the resulting mask requires advanced indexing (aka. fancy
         indexing), which would make extracting a slice copy.
+        pair_rows (bool): Whether an index of two dimensions selects one row of entries per entry of the index before
+        it, such as one row of items per environment, instead of taking part in the cross-product. A single row is
+        shared by all of them. Defaults to False.
     """
     mask: list[slice | int | torch.Tensor] = []
 
@@ -773,7 +806,7 @@ def indices_to_mask(
                         is_scalar_ = arg.size == 1
                         is_numpy_ = True
                     else:
-                        is_scalar_ = len(arg) == 1
+                        is_scalar_ = len(arg) == 1 and not isinstance(arg[0], (list, tuple, np.ndarray, torch.Tensor))
                     if is_scalar_:
                         idx = arg.item() if is_torch_ or is_numpy_ else arg[0]
                         arg = slice(idx, idx + 1 if idx != -1 else None)
@@ -796,6 +829,31 @@ def indices_to_mask(
                     if keepdim:
                         arg = slice(arg, arg + 1 if arg != -1 else None)
         mask.insert(0, arg)
+
+    # A row of entries per entry of the previous index pairs both indices, the previous one broadcast along the rows
+    for i in range(1, len(mask) if pair_rows else 0):
+        if is_tensor[i] and np.ndim(mask[i]) == 2:
+            rows = mask[i] if isinstance(mask[i], torch.Tensor) else np.asarray(mask[i])
+            if len(rows) == 1:
+                mask[i] = rows[0]
+                continue
+            prev = mask[i - 1]
+            if isinstance(prev, slice):
+                start, step = prev.start or 0, prev.step or 1
+                prev = range(start, start + len(rows) * step, step)
+            elif isinstance(prev, int):
+                prev = (prev,)
+            if isinstance(rows, torch.Tensor):
+                prev = torch.as_tensor(prev, device=rows.device)
+                if prev.dtype == torch.bool:
+                    prev = prev.nonzero()[:, 0]
+            else:
+                prev = np.asarray(prev)
+                if prev.dtype == np.bool_:
+                    prev = prev.nonzero()[0]
+            assert num_tensors == 1 + is_tensor[i - 1]
+            mask[i - 1], mask[i] = prev.reshape((-1, 1)), rows
+            num_tensors = 0
 
     if num_tensors > 1:
         tensor_idx = 0
@@ -1063,6 +1121,8 @@ def _kernel_reset_with_template_args(kernel):
     kernel.used_py_dataclass_parameters_by_key_enforcing = {}
     kernel._struct_ndarray_launch_info_by_key = {}
     kernel._struct_primitive_launch_info_by_key = {}
+    kernel._mutable_nd_cached_key = None
+    kernel._mutable_nd_cached_val = []
 
 
 # FIXME: quadrants#1038 - a performance dispatcher keeps the arguments of its last call for the lifetime of the process,
@@ -1088,8 +1148,9 @@ PerformanceDispatcher.__init__ = _perf_dispatcher_init_released_on_reset
 def qd_from_torch(value: qd.Tensor | qd.Field | qd.Ndarray, tensor: torch.Tensor) -> None:
     """Write a torch tensor into a Quadrants field / ndarray, in the native layout of the latter (see qd_to_torch).
 
-    On Metal, call `torch.mps.synchronize()` once after a batch of writes, before the next quadrants kernel reads the
-    values (see qd_zero_grad).
+    The values are cast to the dtype of the field / ndarray, whatever the backend. On Metal, call
+    `torch.mps.synchronize()` once after a batch of writes, before the next quadrants kernel reads the values (see
+    qd_zero_grad).
     """
     if isinstance(value, qd.Tensor):
         value = value._unwrap()
@@ -1097,7 +1158,7 @@ def qd_from_torch(value: qd.Tensor | qd.Field | qd.Ndarray, tensor: torch.Tensor
         view = qd_to_torch(value, copy=False)
         view.copy_(tensor)
     else:
-        value.from_torch(tensor)
+        value.from_torch(tensor.to(to_pytorch_type(value.dtype)))
 
 
 @qd.func
@@ -1115,59 +1176,56 @@ def qd_isfinite(x):
         return qd.abs(x) < qd.math.inf
 
 
-def qd_add_grad(value: qd.Tensor, grad: torch.Tensor, row: int | None = None) -> None:
+def qd_add_grad(value: qd.Tensor, grad: torch.Tensor) -> None:
     """Add a gradient to the adjoint of a Quadrants tensor, given in the layout of its getters (see 'qd_to_torch').
 
-    `row` selects one entry of the first axis, such as a frame of a solver holding its state in frames, the gradient
-    then covering that entry alone. On Metal, call `torch.mps.synchronize()` once after a batch of additions, before the
-    next quadrants kernel reads the adjoint.
+    On Metal, call `torch.mps.synchronize()` once after a batch of additions, before the next quadrants kernel reads the
+    adjoint.
     """
     value_grad = value.grad
     if gs.use_zerocopy.is_supported:
-        if row is None:
-            view = qd_to_torch(value_grad, transpose=True, copy=False)
-        else:
-            view = qd_to_torch(value_grad, row_mask=row, keepdim=False, copy=False)
+        view = qd_to_torch(value_grad, transpose=True, copy=False)
         view += grad
     else:
         # Without zero-copy views, the adjoint is read and written back whole, in its native layout
         n_dims = len(value_grad.shape)
         data = qd_to_torch(value_grad, copy=True)
-        if row is not None:
-            data[row] += grad
-        else:
-            data += grad.movedim(0, n_dims - 1) if n_dims > 1 else grad
+        data += grad.movedim(0, n_dims - 1) if n_dims > 1 else grad
         qd_from_torch(value_grad, data)
 
 
 def qd_zero_grad(value) -> None:
-    """Zero the `.grad` buffers of a Quadrants field/ndarray, or every grad-bearing slot of a `dataclass` /
-    `@qd.data_oriented` struct-of-arrays.
+    """Zero the `.grad` buffers of a Quadrants field/ndarray, of every member of a struct field, or of every
+    grad-bearing slot of a `dataclass` / `@qd.data_oriented` struct-of-arrays.
 
     Reverse-mode accumulation in Genesis writes through `qd.atomic_add`, so adjoint buffers must start at zero between
     consecutive `loss.backward()` calls. Solvers call this from `reset_grad` to clear all owned adjoint storage without
     enumerating fields by name. Zeroing goes through an in-place `zero_()` on the zero-copy torch view of each grad
-    buffer, a contiguous memset on the underlying device memory. The writes are left unsynchronized so a caller can
-    batch many calls under a single flush: on Metal, call `torch.mps.synchronize()` after the batch and before the
-    next quadrants kernel reads the buffers (see set_base_links_quat).
+    buffer, a contiguous memset on the underlying device memory, and through `.fill` without zero-copy. The writes are
+    left unsynchronized so a caller can batch many calls under a single flush: on Metal, call `torch.mps.synchronize()`
+    after the batch and before the next quadrants kernel reads the buffers (see set_base_links_quat).
     """
     if value is None:
         return
 
+    if isinstance(value, qd.StructField):
+        for key in value.keys:
+            qd_zero_grad(value.get_member_field(key))
+        return
+
     if isinstance(value, (qd.Tensor, qd.Field, qd.Ndarray)):
         if value.has_grad():
-            grad = value.grad
             if gs.use_zerocopy.is_supported:
                 try:
-                    grad_view = qd_to_torch(grad, copy=False)
-                    grad_view.zero_()
+                    grad_view = qd_to_torch(value.grad, copy=False)
                 except ValueError:
-                    # No zero-copy view for this buffer (e.g. an interleaved AOS struct member, or a field whose
-                    # in-tree byte offset the installed torch cannot carry through DLPack); fill it in place through
-                    # quadrants instead.
-                    grad.fill(0.0)
+                    # A member of an AOS struct field is interleaved with the others, so it has no zero-copy view, and
+                    # Quadrants exposes no layout to test beforehand (see 'fill_data' in genesis/utils/data.py)
+                    value.grad.fill(0.0)
+                else:
+                    grad_view.zero_()
             else:
-                grad.fill(0.0)
+                value.grad.fill(0.0)
         return
 
     cls = type(value)

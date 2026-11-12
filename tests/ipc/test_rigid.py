@@ -1,4 +1,5 @@
 import math
+from importlib.util import find_spec
 from itertools import permutations
 from typing import TYPE_CHECKING, cast
 
@@ -7,9 +8,7 @@ import pytest
 
 from ..conftest import SKIP_NO_IPC, TOL_SINGLE
 
-try:
-    import uipc
-except ImportError:
+if find_spec("uipc") is None:
     pytest.skip(SKIP_NO_IPC, allow_module_level=True)
 
 from uipc import builtin
@@ -118,6 +117,8 @@ def test_objects_freefall(n_envs, n_substeps, show_viewer):
     scene.build(n_envs=n_envs)
     assert scene.sim is not None
     assert scene.sim.substeps == n_substeps
+    with pytest.raises(gs.GenesisException, match="not available with the IPC coupler"):
+        scene.sim.fem_solver.get_forces()
     coupler = cast("IPCCoupler", scene.sim.coupler)
 
     envs_idx = range(max(scene.n_envs, 1))
@@ -178,7 +179,7 @@ def test_objects_freefall(n_envs, n_substeps, show_viewer):
     for obj in objs_kwargs.keys():
         # Validate centroid consistency
         ipc_centroid = p_prev[obj].mean(axis=-2)
-        gs_centroid = obj.get_state().pos.mean(axis=-2)
+        gs_centroid = obj.get_pos() if obj is box else obj.get_verts_pos().mean(axis=-2)
         assert_allclose(ipc_centroid, gs_centroid, atol=TOL_SINGLE)
 
         # Validate centroidal total displacement: 0.5 * GRAVITY * t * (t + DT)

@@ -12,7 +12,6 @@ from .solvers import (
     RigidOptions,
     RodOptions,
     SAPCouplerOptions,
-    SFOptions,
     SimOptions,
     SPHOptions,
 )
@@ -33,7 +32,6 @@ __all__ = [
     "RodOptions",
     "SAPCouplerOptions",
     "SceneOptions",
-    "SFOptions",
     "SimOptions",
     "SPHOptions",
     "ViewerOptions",

@@ -4,22 +4,26 @@ import weakref
 import xml.etree.ElementTree as ET
 
 import pytest
-import torch
 
-import quadrants as qd
+from ..conftest import lazy_imports
 
-import genesis as gs
-from genesis.grad.bridge import LaunchRecorder
-from genesis.utils.misc import qd_to_torch
+# Imported on first use (see pytest_sessionstart in tests/conftest.py)
+with lazy_imports():
+    import torch
+
+    import quadrants as qd
+
+    import genesis as gs
+    from genesis.grad.bridge import LaunchRecorder
+    from genesis.utils.misc import qd_to_torch
 
 
 @pytest.fixture(autouse=True)
 def step_overwrites(backend, monkeypatch):
     # Check that the backward pass of a recorded rollout saves every overwrite it needs (see LaunchRecorder): before
     # each entry of a recorder, copy the arrays its launches use that an earlier entry used, and report those the entry
-    # changed without the recorder saving them. The arrays a kernel reaches through the solver it is a method of, such
-    # as the frames of the particle solvers, are outside of its reach. The arrays a kernel writes follow from its source
-    # alone, the same on every backend, so it runs on CPU alone.
+    # changed without the recorder saving them. The arrays a kernel writes follow from its source alone, the same on
+    # every backend, so it runs on CPU alone.
     if isinstance(backend, str):
         backend = getattr(gs.constants.backend, backend)
     if backend != gs.cpu:
