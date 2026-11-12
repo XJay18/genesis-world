@@ -601,6 +601,10 @@ def test_parallel_envs_grad_matches_single_env(backend, show_viewer):
         loss, rods_pos_single = rollout(scene_single, rods_single, box_single, block_single, vels_single, block_weights)
         loss.backward()
         for pos, pos_single, vel_ad, vel_single in zip(rods_pos, rods_pos_single, vels_ad, vels_single):
-            assert_equal(pos_single, pos[i_b])
-            # The atomic sums of the contacts take another order on GPU, which leaves rounding in the gradients
+            # The atomic sums of the contacts, of the rod-MPM transfers and of the rigid corrections may take another
+            # order on GPU, which leaves rounding in the positions and the gradients. The CPU runs them in a fixed order
+            if gs.backend == gs.cpu:
+                assert_equal(pos_single, pos[i_b])
+            else:
+                assert_allclose(pos_single, pos[i_b], tol=5e-14)
             assert_allclose(vel_single.grad, vel_ad.grad[i_b], tol=5e-14)
