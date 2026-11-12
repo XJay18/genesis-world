@@ -1857,20 +1857,23 @@ def func_rod_geom_signed_distance(
     narrow phase bounds the distance there from above by much more than the radius of a rod, which would let the
     capsule of a rod sink into the geom unseen.
     """
-    g_pos = geoms_state.pos[i_g, i_b]
-    g_quat = geoms_state.quat[i_g, i_b]
     EPS = rigid_info.EPS[None]
     signed_dist = gs.qd_float(0.0)
     normal = qd.Vector.zero(gs.qd_float, 3)
+    # FIXME: Quadrants autodiff issue 5 (see 'MV-quadrants-autodiff-issues.md', DLO-Solver progress) - in a runtime
+    # loop, a local read under a runtime branch leaks its adjoint into earlier iterations: each branch reads the pose.
     if geoms_info.type[i_g] == gs.GEOM_TYPE.SPHERE:
+        g_pos = geoms_state.pos[i_g, i_b]
         signed_dist = (pos - g_pos).norm() - geoms_info.data[i_g][0]
         normal = qd_normalize(v=pos - g_pos, eps=EPS)
     elif geoms_info.type[i_g] == gs.GEOM_TYPE.PLANE:
         geom_data = geoms_info.data[i_g]
-        normal = qd_transform_by_quat(v=gs.qd_vec3([geom_data[0], geom_data[1], geom_data[2]]), quat=g_quat)
-        signed_dist = (pos - g_pos).dot(normal)
+        normal = qd_transform_by_quat(
+            v=gs.qd_vec3([geom_data[0], geom_data[1], geom_data[2]]), quat=geoms_state.quat[i_g, i_b]
+        )
+        signed_dist = (pos - geoms_state.pos[i_g, i_b]).dot(normal)
     else:
-        pos_mesh = qd_inv_transform_by_trans_quat(pos, g_pos, g_quat)
+        pos_mesh = qd_inv_transform_by_trans_quat(pos, geoms_state.pos[i_g, i_b], geoms_state.quat[i_g, i_b])
         pos_sdf = qd_transform_by_T(pos_mesh, sdf_info.geoms_info.T_mesh_to_sdf[i_g])
         sdf_upper = qd.cast(sdf_info.geoms_info.sdf_res[i_g] - 1, gs.qd_float)
         pos_sdf_grid = qd.math.clamp(pos_sdf, 0.0, sdf_upper)
@@ -1889,7 +1892,7 @@ def func_rod_geom_signed_distance(
                 offset = (pos_sdf - pos_sdf_grid) * sdf_info.geoms_info.sdf_cell_size[i_g] + signed_dist * normal_mesh
                 signed_dist = offset.norm()
                 normal_mesh = qd_normalize(offset, EPS)
-            normal = qd_transform_by_quat(normal_mesh, g_quat)
+            normal = qd_transform_by_quat(normal_mesh, geoms_state.quat[i_g, i_b])
     return signed_dist, normal
 
 
