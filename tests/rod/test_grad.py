@@ -15,7 +15,17 @@ pytestmark = [pytest.mark.precision("64")]
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
 @pytest.mark.parametrize(
     "case",
-    ["constrained", "inextensible", "contact", "contact_broadphase", "contact_stale", "plane", "box", "free_box"],
+    [
+        "constrained",
+        "inextensible",
+        "contact",
+        "contact_broadphase",
+        "contact_stale",
+        "plane",
+        "box",
+        "free_box",
+        "post",
+    ],
 )
 def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer):
     n_verts, n_steps = 20, 50
@@ -69,6 +79,21 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
                 coup_friction=0.1,
             ),
         )
+    if case == "post":
+        # A free rod lying across a fixed post, which touches it inside the edge in its middle
+        scene.add_entity(
+            morph=gs.morphs.Cylinder(
+                radius=0.0075,
+                height=0.1,
+                pos=(0.0, 0.0, 0.2),
+                euler=(90.0, 0.0, 0.0),
+                fixed=True,
+            ),
+            material=gs.materials.Rigid(
+                needs_coup=True,
+                coup_friction=0.3,
+            ),
+        )
     if case in ("box", "free_box"):
         # A free rod sliding on a box, along the whole substep in the kinetic regime of its friction. The free box,
         # lighter than the rod and only carrying it, takes the reaction of the contacts, normal and tangential
@@ -92,6 +117,7 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
         "plane": (-0.5 * length, 0.0, 0.005),
         "box": (-0.5 * length, 0.0, 0.215),
         "free_box": (-0.5 * length, 0.0, 0.215),
+        "post": (-0.5 * length, 0.0, 0.2 + 0.0075 + 0.005 + 1e-4),
     }.get(case, (0.0, 0.0, 0.5))
     rod = scene.add_entity(
         morph=gs.morphs.ParameterizedRod(
@@ -146,21 +172,22 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, show_viewer)
     # Directional derivatives along a random direction, each with the step and the tolerance (relative to the finite
     # difference) its measured floor sets. The stretching stiffness makes the rollout so sensitive to the positions that
     # they take the smallest step. An inextensible rod hardly feels its stretching stiffness, whose derivative takes a
-    # larger step. The contacts with the plane and the box make the rollout piecewise smooth in the positions and stiffnesses,
-    # whose finite differences do not converge there, and take smaller steps for the velocities and the bending stiffness.
+    # larger step. The contacts with the plane, the box and the post make the rollout piecewise smooth in the positions
+    # and stiffnesses, whose finite differences do not converge there, and take smaller steps for the velocities and the
+    # bending stiffness. The post touches the rod inside an edge, which both vertices of the edge share.
     steps_and_tols = {
         "pos": (1e-7, 5e-5),
         "vel": (
-            {"free_box": 1e-7, "box": 1e-6, "plane": 1e-6}.get(case, 1e-5),
-            5e-6 if case == "free_box" else 2e-6,
+            {"free_box": 1e-7, "box": 1e-6, "plane": 1e-6, "post": 1e-6}.get(case, 1e-5),
+            {"free_box": 5e-6, "post": 1e-6}.get(case, 2e-6),
         ),
         "theta": (1e-5, 1e-8),
-        "E": ({"free_box": 1e-6, "box": 1e-5, "plane": 1e-5}.get(case, 1e-4), 5e-6),
+        "E": ({"free_box": 1e-6, "box": 1e-5, "plane": 1e-5}.get(case, 1e-4), 5e-7 if case == "post" else 5e-6),
         "K": (1e-3 if case == "inextensible" else 1e-4, 5e-5),
         "G": (1e-3, 2e-6),
     }
     for name, value in inputs.items():
-        if case in ("plane", "box", "free_box") and name not in ("vel", "E"):
+        if case in ("plane", "box", "free_box", "post") and name not in ("vel", "E"):
             continue
         direction = torch.tensor(rng.standard_normal(value.shape), dtype=gs.tc_float, device=gs.device)
         step, tol = steps_and_tols[name]

@@ -282,8 +282,9 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     """
 
     n_contacts: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))
-    # The number of contacts of the rods with each link, which share its motion
-    links_n_contacts: qd.Tensor = field(int, shape=(ROD_RIGID_LINKS, ENVS))
+    # The contacts of the rods with each link, which share its motion, each counted by the share of its vertex in its
+    # point, so that a point inside an edge counts once
+    links_contacts_share: qd.Tensor = field(float, shape=(ROD_RIGID_LINKS, ENVS))
     geom_idx: qd.Tensor = field(int)
     # The vertices of the edge of the point, the vertex twice for its sphere, and the parameter of the point along it,
     # which give the share of the vertex in the point
