@@ -2117,9 +2117,9 @@ def kernel_project_rod_rigid_normal(
     its two edges (see 'func_rod_rigid_contact'), the one pressing it deepest, its penetration weighted by the weight of
     the vertex in the point along the edge. A point inside an edge is thus a contact of both vertices, each resolving
     its share of the point (see 'func_rod_rigid_contact_share'), so that the two resolve the whole point between them
-    where they move, and the shares change continuously as the point moves along the edge. The contact takes over the anchor of the
-    contact of the vertex with the same geom at the last substep (see 'RodRigidAnchors'), whichever of its sphere and
-    edges the point was on.
+    where they move, and the shares change continuously as the point moves along the edge. The contact takes over the
+    anchor of the contact of the vertex with the same geom at the last substep (see 'RodRigidAnchors'), whichever of its
+    sphere and edges the point was on.
 
     Each vertex takes the impulses of its contacts alone, as if their points were at the vertex, and its contacts are
     solved together, each impulse non-negative (see 'func_solve_nonnegative'). A vertex pressed by two geoms from
