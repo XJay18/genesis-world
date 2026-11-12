@@ -276,18 +276,19 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     once per substep (see 'kernel_project_rod_rigid_normal' in legacy_coupler.py).
 
     A vertex has at most one contact with each geom: of the sphere of the vertex and the deepest points of the
-    capsules of its two edges in the geom, the one pressing the vertex deepest, its penetration weighted by the share
-    of the vertex in its point. A point inside an edge is thus a contact of both vertices of the edge, each taking its
-    share, and no vertex owns it. A vertex keeps its first contacts, the geoms in their order.
+    capsules of its two edges in the geom, the one pressing the vertex deepest, its penetration weighted by the weight
+    of the vertex in its point along the edge. A point inside an edge is thus a contact of both vertices of the edge,
+    each resolving its share of it (see 'func_rod_rigid_contact_share' in legacy_coupler.py), and no vertex owns it. A
+    vertex keeps its first contacts, the geoms in their order.
     """
 
     n_contacts: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))
-    # The contacts of the rods with each link, which share its motion, each counted by the share of its vertex in its
-    # point, so that a point inside an edge counts once
-    links_contacts_share: qd.Tensor = field(float, shape=(ROD_RIGID_LINKS, ENVS))
+    # The contacts of the rods with each link, which share its motion in the normal impulses, each counted by the
+    # weight of its vertex in its point, so that a point inside an edge counts once
+    links_contacts_weight: qd.Tensor = field(float, shape=(ROD_RIGID_LINKS, ENVS))
     geom_idx: qd.Tensor = field(int)
     # The vertices of the edge of the point, the vertex twice for its sphere, and the parameter of the point along it,
-    # which give the share of the vertex in the point
+    # which give the weight of the vertex in the point
     verts_idx: qd.Tensor = field((int, 2))
     t: qd.Tensor = field(float, grad=True)
     # The outward normal of the geom, the penetration, and the penetration at the start of the substep, the penetration
@@ -303,6 +304,8 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     # one of its share of the move of the rod alone out of the geoms, which bound the friction of the contact
     impulse_normal: qd.Tensor = field(float, grad=True)
     impulse_overlap: qd.Tensor = field(float, grad=True)
+    # The contacts of the rods with each link, which share its motion in the friction impulses, each vertex counted once
+    links_n_contacts: qd.Tensor = field(int, shape=(ROD_RIGID_LINKS, ENVS))
 
 
 class RodRigidAnchors(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ROD_RIGID_CONTACTS_PER_VERT, ENVS)):

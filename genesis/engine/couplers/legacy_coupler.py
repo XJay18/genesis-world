@@ -1747,40 +1747,56 @@ def func_rod_rigid_contacts_are_squeezing(
 
 @qd.func
 def func_rod_rigid_contact_link_inverse_mass(
-    i_v: int, i_c: int, i_b: int, rod_state: RodState, geoms_info: GeomsInfo
+    i_v: int, i_c: int, i_b: int, rod_state: RodState, geoms_info: GeomsInfo, is_friction: qd.template()
 ) -> float:
     """Return the inverse mass of the link of a contact of a vertex of the rods with a rigid geom (see
-    'RodRigidContacts') as the contact sees it: the bound of the inverse mass of the link, times the number of contacts
-    of the rods with it, over the part of the motion of the point the vertex makes (see 'func_rod_rigid_contact_share').
+    'RodRigidContacts') as the contact sees it, the bound of the inverse mass of the link scaled by the contacts of the
+    rods that share its motion.
 
     The contacts of the vertices are solved apart, each seeing the link move by its own impulse alone, while the
-    impulses of all of them move it. Their count makes them share its motion, so that a link pressed onto many vertices
-    is moved back once by the penetration rather than once per vertex, and a free link meeting a free rod at many
-    vertices takes the impulse of two free bodies. A point inside an edge counts once, each of its two vertices by its
-    share, and each vertex sees the link as heavy as it sees the point, so that the impulses of the two vertices move
-    the point and the link as the impulse of two free bodies would.
+    impulses of all of them move it. Counting them makes them share its motion, so that a link pressed onto many
+    vertices is moved back once by the penetration rather than once per vertex. The normal impulses resolve points:
+    their link counts its contacts by the weights of their vertices, a point inside an edge once, and each vertex sees
+    the link as heavy as it sees the point, over the sum of the squared weights of the edge (see
+    'func_rod_rigid_contact_share'), so that two vertices that both move resolve the point and the link as one impulse
+    at the point would. The friction impulses act on the vertices, each cancelling the slip of its own vertex: their link
+    counts each vertex once, so that two vertices sticking to it together cancel their slip once, wherever the point
+    lies along their edge.
     """
     i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
     i_l = geoms_info.link_idx[i_g]
-    t = rod_state.rigid_contacts.t[i_v, i_c, i_b]
-    return (
-        rod_state.rigid_contacts.inv_mass_link[i_v, i_c, i_b]
-        * rod_state.rigid_contacts.links_contacts_share[i_l, i_b]
-        / ((1.0 - t) ** 2 + t**2)
-    )
+    inv_mass = gs.qd_float(0.0)
+    if qd.static(is_friction):
+        inv_mass = (
+            rod_state.rigid_contacts.inv_mass_link[i_v, i_c, i_b] * rod_state.rigid_contacts.links_n_contacts[i_l, i_b]
+        )
+    else:
+        t = rod_state.rigid_contacts.t[i_v, i_c, i_b]
+        inv_mass = (
+            rod_state.rigid_contacts.inv_mass_link[i_v, i_c, i_b]
+            * rod_state.rigid_contacts.links_contacts_weight[i_l, i_b]
+            / ((1.0 - t) ** 2 + t**2)
+        )
+    return inv_mass
 
 
 @qd.func
 def func_rod_rigid_contact_share(i_v: int, i_c: int, i_b: int, is_squeezed: bool, rod_state: RodState) -> float:
     """Return the share of a vertex of the rods in resolving the point of one of its contacts with a rigid geom (see
-    'RodRigidContacts'): its weight in the point over the sum of the squares of the weights of the two vertices, or its
-    weight alone for a vertex squeezed between geoms (see 'func_rod_rigid_contacts_are_squeezing').
+    'RodRigidContacts'): its weight in the point over the sum of the squared weights of the two vertices of the edge,
+    or its weight alone for a vertex squeezed between geoms (see 'func_rod_rigid_contacts_are_squeezing').
 
     A vertex the impulses move moves by its share of the correction of the point, so that the point, which each vertex
-    moves by its weight, moves by the whole correction: the sum of the weights times the shares is one. It is one for
-    the sphere of a vertex, and at most two, at the middle of an edge. A squeezed vertex does not move, its impulses
-    pushing the links back instead: its share is then its weight, which presses the links of a squeeze through an edge
-    no harder than the squeeze itself, the links resolving the point over the substeps.
+    moves by its weight, moves by the whole correction: the sum of the weights times the shares is one. The share is
+    one for the sphere of a vertex and at the middle of an edge, and at most about 1.21, near a parameter of 0.29.
+
+    A squeezed vertex does not move, its impulses pushing the links back instead, and its share is its weight. This is
+    a stop-gap, not a resolution of the point: a point inside an edge next to a squeezed vertex is resolved by the
+    links over the substeps. With the share over the sum of the squared weights there, the grasps of the DLO-Bench
+    hold probe crept along the fingers of a Franka hand, the grip staying closed: an edge contact counts only once
+    deeper than the spheres of the edge, so that it appears at a squeezed vertex with a penetration well above the one
+    of the sphere it replaces, the larger share of the point raised the normal impulse of the vertex further, and the
+    contacts of the grasp then slid by their friction bounds.
     """
     verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
     t = rod_state.rigid_contacts.t[i_v, i_c, i_b]
@@ -2134,7 +2150,7 @@ def kernel_project_rod_rigid_normal(
     'func_rod_rigid_contact_link_inverse_mass'). The rod takes each impulse along the normal at the vertex, and the link
     the opposite one at the surface of the rod next to the vertex (applied in 'kernel_project_rod_rigid_friction'): a
     vertex squeezed between two geoms pushes both back by the impulse that stops them, while a free rod and a free link
-    meeting take the impulses of two free bodies.
+    meeting at the sphere of a vertex take the impulses of two free bodies.
 
     The geom each free vertex penetrates deepest is recorded where it penetrates one, through its sphere or an edge
     contact on its half of the edge, the record being cleared at the first substep of a step ('is_step_start'), so
@@ -2145,8 +2161,9 @@ def kernel_project_rod_rigid_normal(
         rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + func_last_projection_correction(
             i_v, i_b, rod_state, rod_config
         )
-    for i_l, i_b in qd.ndrange(rod_state.rigid_contacts.links_contacts_share.shape[0], rod_state.verts.pos.shape[1]):
-        rod_state.rigid_contacts.links_contacts_share[i_l, i_b] = 0.0
+    for i_l, i_b in qd.ndrange(rod_state.rigid_contacts.links_contacts_weight.shape[0], rod_state.verts.pos.shape[1]):
+        rod_state.rigid_contacts.links_contacts_weight[i_l, i_b] = 0.0
+        rod_state.rigid_contacts.links_n_contacts[i_l, i_b] = 0
 
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         n_contacts = 0
@@ -2254,7 +2271,8 @@ def kernel_project_rod_rigid_normal(
                                             links_state.quat[i_l, i_b],
                                         )
                             rod_state.rigid_contacts.anchor[i_v, n_contacts, i_b] = anchor
-                            qd.atomic_add(rod_state.rigid_contacts.links_contacts_share[i_l, i_b], contact_weight)
+                            qd.atomic_add(rod_state.rigid_contacts.links_contacts_weight[i_l, i_b], contact_weight)
+                            qd.atomic_add(rod_state.rigid_contacts.links_n_contacts[i_l, i_b], 1)
                             n_contacts += 1
         rod_state.rigid_contacts.n_contacts[i_v, i_b] = n_contacts
         if contact_geom_idx >= 0:
@@ -2308,7 +2326,7 @@ def kernel_project_rod_rigid_normal(
             for i_c in qd.static(range(N_CONTACTS_MAX)):
                 if i_c < n_contacts:
                     system[i_c, i_c] = system[i_c, i_c] + func_rod_rigid_contact_link_inverse_mass(
-                        i_v, i_c, i_b, rod_state, geoms_info
+                        i_v, i_c, i_b, rod_state, geoms_info, is_friction=False
                     )
                     target[i_c, 0] = shares[i_c] * (
                         rod_state.rigid_contacts.penetration[i_v, i_c, i_b]
@@ -2354,8 +2372,10 @@ def kernel_project_rod_rigid_friction(
     the others), each bounded by the friction coefficient of its geom ('coup_friction') times its normal impulse. A
     vertex squeezed from two sides thus holds against twice the friction of one, and no combination of contacts moves
     the rod further than their bounds allow. The link takes the opposite of the normal and tangential impulses of the
-    contact over the substep, as a force on the surface of the rod next to the vertex, where the rod takes them, so that
-    the rod and the link exchange momentum and angular momentum alike.
+    contact over the substep, as a force on the surface of the rod next to the vertex, where the rod takes them: the rod
+    and the link exchange momentum, and the angular momentum about the normal of the contact that the friction of the
+    vertices carries. The force acts a radius from the vertex, along the normal, so that the friction also turns the
+    link about the tangent of the surface, which the rod, its vertices bearing no torque, does not take.
 
     Friction at the vertices also acts against a rod turning in place on a geom about the normal of a contact inside one
     of its edges, which a single point of contact would let it do freely: the two vertices of the edge slip in
@@ -2393,7 +2413,7 @@ def kernel_project_rod_rigid_friction(
             for i_c in qd.static(range(N_CONTACTS_MAX)):
                 if i_c < n_contacts:
                     inv_masses[i_c] = inv_mass + func_rod_rigid_contact_link_inverse_mass(
-                        i_v, i_c, i_b, rod_state, geoms_info
+                        i_v, i_c, i_b, rod_state, geoms_info, is_friction=True
                     )
                     normal = rod_state.rigid_contacts.normal[i_v, i_c, i_b]
                     i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
