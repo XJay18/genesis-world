@@ -1771,17 +1771,23 @@ def func_rod_rigid_contact_link_inverse_mass(
 
 
 @qd.func
-def func_rod_rigid_contact_share(i_v: int, i_c: int, i_b: int, rod_state: RodState) -> float:
+def func_rod_rigid_contact_share(i_v: int, i_c: int, i_b: int, is_squeezed: bool, rod_state: RodState) -> float:
     """Return the share of a vertex of the rods in resolving the point of one of its contacts with a rigid geom (see
-    'RodRigidContacts'): its weight in the point over the sum of the squares of the weights of the two vertices.
+    'RodRigidContacts'): its weight in the point over the sum of the squares of the weights of the two vertices, or its
+    weight alone for a vertex squeezed between geoms (see 'func_rod_rigid_contacts_are_squeezing').
 
-    Each vertex moves by its share of the correction of the point, so that the point, which each vertex moves by its
-    weight, moves by the whole correction: the sum of the weights times the shares is one. It is one for the sphere of
-    a vertex, and at most two, at the middle of an edge.
+    A vertex the impulses move moves by its share of the correction of the point, so that the point, which each vertex
+    moves by its weight, moves by the whole correction: the sum of the weights times the shares is one. It is one for
+    the sphere of a vertex, and at most two, at the middle of an edge. A squeezed vertex does not move, its impulses
+    pushing the links back instead: its share is then its weight, which presses the links of a squeeze through an edge
+    no harder than the squeeze itself, the links resolving the point over the substeps.
     """
     verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
     t = rod_state.rigid_contacts.t[i_v, i_c, i_b]
-    return qd.select(i_v == verts_idx[0], 1.0 - t, t) / ((1.0 - t) ** 2 + t**2)
+    share = qd.select(i_v == verts_idx[0], 1.0 - t, t)
+    if not is_squeezed:
+        share = share / ((1.0 - t) ** 2 + t**2)
+    return share
 
 
 @qd.func
@@ -2110,8 +2116,8 @@ def kernel_project_rod_rigid_normal(
     A vertex has at most one contact with each geom (see 'RodRigidContacts'): of its sphere and the deepest points of
     its two edges (see 'func_rod_rigid_contact'), the one pressing it deepest, its penetration weighted by the weight of
     the vertex in the point along the edge. A point inside an edge is thus a contact of both vertices, each resolving
-    its share of the point (see 'func_rod_rigid_contact_share'), so that the two resolve the whole point between them,
-    and the shares change continuously as the point moves along the edge. The contact takes over the anchor of the
+    its share of the point (see 'func_rod_rigid_contact_share'), so that the two resolve the whole point between them
+    where they move, and the shares change continuously as the point moves along the edge. The contact takes over the anchor of the
     contact of the vertex with the same geom at the last substep (see 'RodRigidAnchors'), whichever of its sphere and
     edges the point was on.
 
@@ -2270,7 +2276,7 @@ def kernel_project_rod_rigid_normal(
             shares = qd.Vector.zero(gs.qd_float, N_CONTACTS_MAX)
             for i_c in qd.static(range(N_CONTACTS_MAX)):
                 if i_c < n_contacts:
-                    shares[i_c] = func_rod_rigid_contact_share(i_v, i_c, i_b, rod_state)
+                    shares[i_c] = func_rod_rigid_contact_share(i_v, i_c, i_b, is_squeezed, rod_state)
                     for j_c in qd.static(range(N_CONTACTS_MAX)):
                         if j_c < n_contacts:
                             coupling[i_c, j_c] = inv_mass * rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(
