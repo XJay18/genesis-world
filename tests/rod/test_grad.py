@@ -606,5 +606,5 @@ def test_parallel_envs_grad_matches_single_env(backend, show_viewer):
             if gs.backend == gs.cpu:
                 assert_equal(pos_single, pos[i_b])
             else:
-                assert_allclose(pos_single, pos[i_b], tol=5e-14)
-            assert_allclose(vel_single.grad, vel_ad.grad[i_b], tol=5e-14)
+                assert_allclose(pos_single, pos[i_b], tol=1e-15)
+            assert_allclose(vel_single.grad, vel_ad.grad[i_b], tol=1e-15)
