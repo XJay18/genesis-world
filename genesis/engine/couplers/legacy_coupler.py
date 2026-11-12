@@ -1759,9 +1759,9 @@ def func_rod_rigid_contact_link_inverse_mass(
     their link counts its contacts by the weights of their vertices, a point inside an edge once, and each vertex sees
     the link as heavy as it sees the point, over the sum of the squared weights of the edge (see
     'func_rod_rigid_contact_share'), so that two vertices that both move resolve the point and the link as one impulse
-    at the point would. The friction impulses act on the vertices, each cancelling the slip of its own vertex: their link
-    counts each vertex once, so that two vertices sticking to it together cancel their slip once, wherever the point
-    lies along their edge.
+    at the point would. The friction impulses act on the vertices, each cancelling the slip of its own vertex: their
+    link counts each vertex once, so that two vertices sticking to it together cancel their slip once, wherever the
+    point lies along their edge.
     """
     i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
     i_l = geoms_info.link_idx[i_g]
@@ -1790,13 +1790,14 @@ def func_rod_rigid_contact_share(i_v: int, i_c: int, i_b: int, is_squeezed: bool
     moves by its weight, moves by the whole correction: the sum of the weights times the shares is one. The share is
     one for the sphere of a vertex and at the middle of an edge, and at most about 1.21, near a parameter of 0.29.
 
-    A squeezed vertex does not move, its impulses pushing the links back instead, and its share is its weight. This is
-    a stop-gap, not a resolution of the point: a point inside an edge next to a squeezed vertex is resolved by the
-    links over the substeps. With the share over the sum of the squared weights there, the grasps of the DLO-Bench
-    hold probe crept along the fingers of a Franka hand, the grip staying closed: an edge contact counts only once
-    deeper than the spheres of the edge, so that it appears at a squeezed vertex with a penetration well above the one
-    of the sphere it replaces, the larger share of the point raised the normal impulse of the vertex further, and the
-    contacts of the grasp then slid by their friction bounds.
+    A squeezed vertex does not move, its impulses pushing the links back instead, and its share is its weight, so that
+    the links resolve a point inside an edge next to it over the substeps. An edge contact counts only once it is
+    deeper than the spheres of its edge (see 'func_rod_rigid_contact'), so that it appears at a squeezed vertex with a
+    penetration well above the one of the sphere it replaces. A share above the weight raises the normal impulse of
+    the vertex further on that jump, and a squeezing grip then slides along the rod by the friction bounds of its
+    contacts while staying closed.
+
+    FIXME: the share of a squeezed vertex is a stop-gap until edge contacts appear without that jump in penetration.
     """
     verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
     t = rod_state.rigid_contacts.t[i_v, i_c, i_b]
