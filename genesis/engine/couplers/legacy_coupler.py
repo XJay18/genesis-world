@@ -1860,8 +1860,8 @@ def func_rod_geom_signed_distance(
     EPS = rigid_info.EPS[None]
     signed_dist = gs.qd_float(0.0)
     normal = qd.Vector.zero(gs.qd_float, 3)
-    # FIXME: Quadrants autodiff issue 5 (see 'MV-quadrants-autodiff-issues.md', DLO-Solver progress) - in a runtime
-    # loop, a local read under a runtime branch leaks its adjoint into earlier iterations: each branch reads the pose.
+    # FIXME: quadrants - in a loop of runtime length, the adjoint of a local read before a runtime branch and used under
+    # it leaks into the earlier iterations of the loop, so each branch reads the pose of the geom itself.
     if geoms_info.type[i_g] == gs.GEOM_TYPE.SPHERE:
         g_pos = geoms_state.pos[i_g, i_b]
         signed_dist = (pos - g_pos).norm() - geoms_info.data[i_g][0]
