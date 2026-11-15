@@ -2093,17 +2093,20 @@ def func_rod_rigid_contact(
     )
     penetration = radius - signed_dist
     if i_slot < 2:
-        # The end of the edge the search found deeper, evaluated again so that the gradient flows through it
-        t_end = qd.select(dist_e < dist_s, 1.0, 0.0)
-        pos_end = (1.0 - t_end) * rod_state.verts.pos[i_v_s, i_b] + t_end * rod_state.verts.pos[i_v_e, i_b]
-        radius_end = (1.0 - t_end) * rod_info.verts.radius[i_v_s] + t_end * rod_info.verts.radius[i_v_e]
-        signed_dist_end, _ = func_rod_geom_signed_distance(
-            i_g, i_b, pos_end, geoms_state, geoms_info, rigid_info, sdf_info, collider_config, compute_normal=False
-        )
-        radius_mean = 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e])
-        penetration_onset = qd.max(
-            legacy_coupler_info.rod_edge_contact_rel_depth[None] * radius_mean + radius_end - signed_dist_end, 0.0
-        )
+        # A point at an end of the edge, or one that does not penetrate, makes no contact whatever its onset depth
+        penetration_onset = gs.qd_float(0.0)
+        if is_interior and penetration > 0.0:
+            # The end of the edge the search found deeper, evaluated again so that the gradient flows through it
+            t_end = qd.select(dist_e < dist_s, 1.0, 0.0)
+            pos_end = (1.0 - t_end) * rod_state.verts.pos[i_v_s, i_b] + t_end * rod_state.verts.pos[i_v_e, i_b]
+            radius_end = (1.0 - t_end) * rod_info.verts.radius[i_v_s] + t_end * rod_info.verts.radius[i_v_e]
+            signed_dist_end, _ = func_rod_geom_signed_distance(
+                i_g, i_b, pos_end, geoms_state, geoms_info, rigid_info, sdf_info, collider_config, compute_normal=False
+            )
+            radius_mean = 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e])
+            penetration_onset = qd.max(
+                legacy_coupler_info.rod_edge_contact_rel_depth[None] * radius_mean + radius_end - signed_dist_end, 0.0
+            )
         penetration = qd.select(is_interior, penetration - penetration_onset, 0.0)
     is_contact = penetration > 0.0
     weight = 1.0 - t if i_v == i_v_s else t
