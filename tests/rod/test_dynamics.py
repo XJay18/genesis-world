@@ -1198,7 +1198,7 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
     # The contacts of the edges of the drooping rope with the rims set in as the edges sink in, without pushing them
     # back out at once: their penetration changes by the motion of the rope from one step to the next
     rims_penetration = np.array(rims_penetration)
-    assert np.abs(np.diff(rims_penetration[n_close_steps:], axis=0)).max() < 5e-5
+    assert np.abs(np.diff(rims_penetration[n_close_steps:], axis=0)).max() < 1e-5
 
     # A rod stays on a slope below the friction angle, and slides down the other with the acceleration of Coulomb
     # friction, its positions integrated by symplectic Euler over the substeps
