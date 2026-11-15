@@ -145,9 +145,9 @@ class LegacyCouplerInfo(Data, kind=DataKind.CONSTANT):
     # middle points, then five pairs of steps (see 'func_rod_rigid_contact')
     rod_edge_contact_n_evals: qd.Tensor = field(int, shape=())
     # How much deeper than the spheres of its two vertices, relative to the radius, the deepest point inside an edge
-    # must be to make a contact of its own, which keeps the rounding of a face parallel to the edge, or of the corner of
-    # a pad across it, from making one: such a contact, met on one side of a rod squeezed between two pads, would push
-    # the edge into the other pad, then back
+    # must be to make a contact of its own, its penetration counting from that depth, which keeps the rounding of a face
+    # parallel to the edge, or of the corner of a pad across it, from making one: such a contact, met on one side of a
+    # rod squeezed between two pads, would push the edge into the other pad, then back
     rod_edge_contact_rel_depth: qd.Tensor = field(float, shape=())
     # The fraction of the penetration of a rod into rigid geoms at the start of a substep, of the part the rod cannot
     # leave alone (squeezed between two geoms), that the impulses of the contacts push the links back by at each
@@ -1990,7 +1990,6 @@ def func_rod_rigid_contact(
     i_slot: int,
     i_g: int,
     i_b: int,
-    is_covered: bool,
     rod_state: RodState,
     links_state: LinksState,
     geoms_state: GeomsState,
@@ -2008,18 +2007,18 @@ def func_rod_rigid_contact(
     Slots 0 and 1 are the edges ending and starting at the vertex, slot 2 the sphere of the vertex. The contact of
     an edge is the deepest point of its capsule, where the penetration (the radius interpolated along the edge minus
     the signed distance of the axis) is largest. It is searched among five points evenly spread along the edge, then
-    refined around the deepest one by pattern steps of halving size, a fixed number of evaluations. An edge contact
-    counts only inside the edge and deeper than the spheres of both its vertices, which carry the others: a face
-    parallel to an edge, deepest everywhere along it, is met by the spheres alone. An edge contact on the half of
-    the edge next to the vertex covers its sphere, which is then left out ('is_covered' tells whether one did, the
-    slots of the edges coming first). The search only compares values, so the parameter it returns is piecewise
-    constant, and the gradient of the contact flows through its last evaluation at that parameter alone.
+    refined around the deepest one by pattern steps of halving size, a fixed number of evaluations. A point inside
+    the edge is a contact once it is deeper than the spheres of both vertices by 'rod_edge_contact_rel_depth' (see
+    LegacyCouplerInfo), and its penetration counts from that depth, so that the contact sets in at zero penetration
+    as the point deepens: a face parallel to an edge, no deeper inside it than at its ends, is met by the spheres
+    alone. The search only compares values, so the parameter it returns is piecewise constant, and the gradient of
+    the contact flows through its evaluations at that parameter and at the deeper end of the edge alone.
 
-    Returns whether it is a contact, whether a contact covers the sphere of the vertex, the first and second vertex
-    of the edge (the vertex twice for its sphere), the parameter of the point along the edge, the weight of the
-    vertex in it, the outward normal of the geom, the penetration, the slip of the point of the axis relative to the
-    geom over the substep (its displacement minus the one of the point of the geom), and the bound of the inverse
-    mass of the link there (see 'func_link_inverse_mass_bound').
+    Returns whether it is a contact, the first and second vertex of the edge (the vertex twice for its sphere), the
+    parameter of the point along the edge, the weight of the vertex in it, the outward normal of the geom, the
+    penetration, the slip of the point of the axis relative to the geom over the substep (its displacement minus the
+    one of the point of the geom), and the bound of the inverse mass of the link there (see
+    'func_link_inverse_mass_bound').
     """
     i_v_s, i_v_e = i_v, i_v
     n_evals = 0
@@ -2091,27 +2090,28 @@ def func_rod_rigid_contact(
     signed_dist, normal = func_rod_geom_signed_distance(
         i_g, i_b, pos, geoms_state, geoms_info, rigid_info, sdf_info, collider_config, compute_normal=True
     )
-    dist = signed_dist - radius
-    penetration = -dist
-    is_contact = penetration > 0.0
+    penetration = radius - signed_dist
     if i_slot < 2:
+        # The end of the edge the search found deeper, evaluated again so that the gradient flows through it
+        t_end = qd.select(dist_e < dist_s, 1.0, 0.0)
+        pos_end = (1.0 - t_end) * rod_state.verts.pos[i_v_s, i_b] + t_end * rod_state.verts.pos[i_v_e, i_b]
+        radius_end = (1.0 - t_end) * rod_info.verts.radius[i_v_s] + t_end * rod_info.verts.radius[i_v_e]
+        signed_dist_end, _ = func_rod_geom_signed_distance(
+            i_g, i_b, pos_end, geoms_state, geoms_info, rigid_info, sdf_info, collider_config, compute_normal=False
+        )
         radius_mean = 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e])
-        if (
-            not is_interior
-            or dist > qd.min(dist_s, dist_e) - legacy_coupler_info.rod_edge_contact_rel_depth[None] * radius_mean
-        ):
-            is_contact = False
-    elif is_covered:
-        is_contact = False
+        penetration_onset = qd.max(
+            legacy_coupler_info.rod_edge_contact_rel_depth[None] * radius_mean + radius_end - signed_dist_end, 0.0
+        )
+        penetration = qd.select(is_interior, penetration - penetration_onset, 0.0)
+    is_contact = penetration > 0.0
     weight = 1.0 - t if i_v == i_v_s else t
-    if is_contact and i_slot < 2 and weight >= 0.5:
-        is_covered = True
 
     i_l = geoms_info.link_idx[i_g]
     pos_prev = (1.0 - t) * rod_state.verts.pos_prev[i_v_s, i_b] + t * rod_state.verts.pos_prev[i_v_e, i_b]
     slip = pos - pos_prev - func_vel_at_point(i_l, i_b, pos, links_state) * rod_info.substep_dt[None]
     inv_mass_link = func_link_inverse_mass_bound(i_l, i_b, pos, normal, links_state, links_info, rigid_config)
-    return is_contact, is_covered, i_v_s, i_v_e, t, weight, normal, penetration, slip, inv_mass_link
+    return is_contact, i_v_s, i_v_e, t, weight, normal, penetration, slip, inv_mass_link
 
 
 @qd.kernel
@@ -2191,7 +2191,6 @@ def kernel_project_rod_rigid_normal(
                     ):
                         # The contact of the vertex with the geom, of its sphere and its edges the one pressing it
                         # deepest, its penetration weighted by the weight of the vertex in the point
-                        is_covered = False
                         is_found = False
                         penetration_share_max = gs.qd_float(0.0)
                         contact_verts_idx = qd.Vector([i_v, i_v], dt=gs.qd_int)
@@ -2207,7 +2206,6 @@ def kernel_project_rod_rigid_normal(
                         for i_slot in qd.static(range(3)):
                             (
                                 is_contact,
-                                is_covered,
                                 i_v_s,
                                 i_v_e,
                                 t,
@@ -2221,7 +2219,6 @@ def kernel_project_rod_rigid_normal(
                                 i_slot,
                                 i_g,
                                 i_b,
-                                is_covered,
                                 rod_state,
                                 links_state,
                                 geoms_state,

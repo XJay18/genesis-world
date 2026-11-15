@@ -291,8 +291,9 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     # which give the weight of the vertex in the point
     verts_idx: qd.Tensor = field((int, 2))
     t: qd.Tensor = field(float, grad=True)
-    # The outward normal of the geom, the penetration, and the penetration at the start of the substep, the penetration
-    # less the approach of the point to the geom over the substep, zero if they were apart
+    # The outward normal of the geom, the penetration (for a point inside an edge, beyond the depth its contact sets in
+    # at, see 'func_rod_rigid_contact' in legacy_coupler.py), and the penetration at the start of the substep, the
+    # penetration less the approach of the point to the geom over the substep, zero if they were apart
     normal: qd.Tensor = field((float, 3), grad=True)
     penetration: qd.Tensor = field(float, grad=True)
     penetration_start: qd.Tensor = field(float, grad=True)
