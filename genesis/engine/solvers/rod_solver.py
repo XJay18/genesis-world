@@ -275,11 +275,12 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     """The contacts of each free vertex of the rods with the rigid geoms that need coupling in each environment, found
     once per substep (see 'kernel_project_rod_rigid_normal' in legacy_coupler.py).
 
-    A vertex has at most one contact with each geom: of the sphere of the vertex and the deepest points of the
-    capsules of its two edges in the geom, the one pressing the vertex deepest, its penetration weighted by the weight
-    of the vertex in its point along the edge. A point inside an edge is thus a contact of both vertices of the edge,
-    each resolving its share of it (see 'func_rod_rigid_contact_share' in legacy_coupler.py), and no vertex owns it. A
-    vertex keeps its first contacts, the geoms in their order.
+    A vertex has at most one contact with each geom: the sphere of the vertex where it touches the geom, and otherwise,
+    of the deepest points of the capsules of its two edges in the geom, the one pressing the vertex deepest, its
+    penetration weighted by the weight of the vertex in its point along the edge. A point inside an edge is thus a
+    contact of the vertices of the edge whose spheres miss the geom, each resolving its share of it (see
+    'func_rod_rigid_contact_share' in legacy_coupler.py), and no vertex owns it. A vertex keeps its first contacts, the
+    geoms in their order.
     """
 
     n_contacts: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))
@@ -291,8 +292,9 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     # which give the weight of the vertex in the point
     verts_idx: qd.Tensor = field((int, 2))
     t: qd.Tensor = field(float, grad=True)
-    # The outward normal of the geom, the penetration, and the penetration at the start of the substep, the penetration
-    # less the approach of the point to the geom over the substep, zero if they were apart
+    # The outward normal of the geom, the penetration (for a point inside an edge, beyond the depth its contact sets in
+    # at, see 'func_rod_rigid_contact' in legacy_coupler.py), and the penetration at the start of the substep, the
+    # penetration less the approach of the point to the geom over the substep, zero if they were apart
     normal: qd.Tensor = field((float, 3), grad=True)
     penetration: qd.Tensor = field(float, grad=True)
     penetration_start: qd.Tensor = field(float, grad=True)
