@@ -669,10 +669,12 @@ def func_rigid_geom_influence(
 
 @qd.func
 def func_point_vel_after_collisions_with_rigid_geoms(
+    i_x: int,
+    i_y: int,
+    i_z: int,
     i_b: int,
     pos_world: qd.types.vector(3),
     vel: qd.types.vector(3),
-    mass: float,
     mpm_state: MPMState,
     geoms_state: GeomsState,
     links_state: LinksState,
@@ -686,7 +688,7 @@ def func_point_vel_after_collisions_with_rigid_geoms(
     is_backward: qd.template(),
 ):
     """
-    Return the velocity of a cell of the MPM grid of the given mass once it collided with every rigid geom that couples.
+    Return the velocity of a cell of the MPM grid once it collided with every rigid geom that couples.
 
     The momentum change of each collision pushes the link of the geom (see func_add_external_wrench), exactly with
     `is_deterministic` (see MPMConfig), except in the variant autodiff reverses (`is_backward`).
@@ -706,6 +708,9 @@ def func_point_vel_after_collisions_with_rigid_geoms(
                 skip_weak_normal=True,
             )
             if influence > legacy_coupler_info.influence_min[None]:
+                # FIXME: quadrants - autodiff of a loop of runtime length gets a wrong adjoint for a local computed
+                # before the loop and read in it, so the mass of the cell is read from the grid where it is used.
+                mass = mpm_state.grid.mass[i_x, i_y, i_z, i_b] / mpm_info.particle_volume_scale[None]
                 vel, force, is_colliding = func_point_vel_after_two_way_collision_with_rigid_geom(
                     i_g, i_b, pos_world, vel, mass, normal_rigid, influence, links_state, geoms_info, rigid_info
                 )
@@ -1225,10 +1230,12 @@ def kernel_mpm_grid_op(
             #################### MPM <-> Rigid ####################
             if qd.static(legacy_coupler_config.has_rigid_mpm):
                 vel_mpm = func_point_vel_after_collisions_with_rigid_geoms(
+                    i_x,
+                    i_y,
+                    i_z,
                     i_b,
                     pos,
                     vel_mpm,
-                    mass_mpm,
                     mpm_state,
                     geoms_state,
                     links_state,
