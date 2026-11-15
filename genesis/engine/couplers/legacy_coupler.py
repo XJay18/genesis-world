@@ -632,6 +632,77 @@ def kernel_reset_mpm_rigid_normal(envs_idx: qd.types.ndarray(), mpm_state: MPMSt
 
 
 @qd.func
+def func_rigid_geom_signed_distance(
+    i_g: int,
+    i_b: int,
+    pos_world: qd.types.vector(3),
+    geoms_state: GeomsState,
+    geoms_info: GeomsInfo,
+    sdf_info: SDFInfo,
+):
+    """
+    Return the signed distance of a point to a rigid geom, as 'sdf.sdf_func_world' does.
+
+    The rigid-MPM coupling evaluates it in a loop over the geoms that autodiff reverses, where reading the pose of the
+    geom before the branch on its type gives a wrong adjoint (see the FIXME). The other callers keep the shared one.
+    """
+    # FIXME: quadrants - in a loop of runtime length, the adjoint of a local read before a runtime branch and used under
+    # it leaks into the earlier iterations of the loop, so each branch reads the pose of the geom itself.
+    signed_dist = gs.qd_float(0.0)
+    if geoms_info.type[i_g] == gs.GEOM_TYPE.SPHERE:
+        g_pos = geoms_state.pos[i_g, i_b]
+        signed_dist = (pos_world - g_pos).norm() - geoms_info.data[i_g][0]
+    elif geoms_info.type[i_g] == gs.GEOM_TYPE.PLANE:
+        g_pos = geoms_state.pos[i_g, i_b]
+        g_quat = geoms_state.quat[i_g, i_b]
+        pos_mesh = qd_inv_transform_by_trans_quat(pos_world, g_pos, g_quat)
+        geom_data = geoms_info.data[i_g]
+        signed_dist = pos_mesh.dot(gs.qd_vec3([geom_data[0], geom_data[1], geom_data[2]]))
+    else:
+        g_pos = geoms_state.pos[i_g, i_b]
+        g_quat = geoms_state.quat[i_g, i_b]
+        pos_mesh = qd_inv_transform_by_trans_quat(pos_world, g_pos, g_quat)
+        pos_sdf = qd_transform_by_T(pos_mesh, sdf_info.geoms_info.T_mesh_to_sdf[i_g])
+        signed_dist = sdf.sdf_func_sdf(i_g, pos_sdf, sdf_info)
+    return signed_dist
+
+
+@qd.func
+def func_rigid_geom_normal(
+    i_g: int,
+    i_b: int,
+    pos_world: qd.types.vector(3),
+    geoms_state: GeomsState,
+    geoms_info: GeomsInfo,
+    rigid_info: RigidInfo,
+    sdf_info: SDFInfo,
+    collider_config: qd.template(),
+):
+    """
+    Return the outward normal of a rigid geom at a point, as 'sdf.sdf_func_normal_world' does.
+
+    Each branch on the type of the geom reads its pose, for the reason of 'func_rigid_geom_signed_distance'.
+    """
+    EPS = rigid_info.EPS[None]
+    grad_world = qd.Vector.zero(gs.qd_float, 3)
+    if geoms_info.type[i_g] == gs.GEOM_TYPE.SPHERE:
+        g_pos = geoms_state.pos[i_g, i_b]
+        grad_world = qd_normalize(pos_world - g_pos, EPS)
+    elif geoms_info.type[i_g] == gs.GEOM_TYPE.PLANE:
+        g_quat = geoms_state.quat[i_g, i_b]
+        geom_data = geoms_info.data[i_g]
+        grad_world = qd_transform_by_quat(gs.qd_vec3([geom_data[0], geom_data[1], geom_data[2]]), g_quat)
+    else:
+        g_pos = geoms_state.pos[i_g, i_b]
+        g_quat = geoms_state.quat[i_g, i_b]
+        pos_mesh = qd_inv_transform_by_trans_quat(pos_world, g_pos, g_quat)
+        pos_sdf = qd_transform_by_T(pos_mesh, sdf_info.geoms_info.T_mesh_to_sdf[i_g])
+        grad_sdf = sdf.sdf_func_grad(i_g, pos_sdf, geoms_info, rigid_info, sdf_info, collider_config)
+        grad_world = qd_transform_by_quat(grad_sdf, g_quat)
+    return qd_normalize(grad_world, EPS)
+
+
+@qd.func
 def func_rigid_geom_influence(
     i_g: int,
     i_b: int,
@@ -643,14 +714,21 @@ def func_rigid_geom_influence(
     legacy_coupler_info: LegacyCouplerInfo,
     collider_config: qd.template(),
     skip_weak_normal: qd.template(),
+    exact_adjoint: qd.template(),
 ):
     """
     Return the signed distance of a point to a rigid geom, the influence of the geom there, and its normal there.
 
     With `skip_weak_normal`, the normal is left zero where the influence is too weak to matter (see
-    'LegacyCouplerInfo'), which spares its evaluation.
+    'LegacyCouplerInfo'), which spares its evaluation. With `exact_adjoint`, for a caller that autodiff reverses in a
+    loop over the geoms, the signed distance and the normal come from the copies of the coupler (see
+    'func_rigid_geom_signed_distance').
     """
-    signed_dist = sdf.sdf_func_world(i_g, i_b, pos_world, geoms_state, geoms_info, sdf_info)
+    signed_dist = gs.qd_float(0.0)
+    if qd.static(exact_adjoint):
+        signed_dist = func_rigid_geom_signed_distance(i_g, i_b, pos_world, geoms_state, geoms_info, sdf_info)
+    else:
+        signed_dist = sdf.sdf_func_world(i_g, i_b, pos_world, geoms_state, geoms_info, sdf_info)
 
     # bigger coup_softness implies that the coupling influence extends further away from the object.
     softness = qd.max(legacy_coupler_info.softness_min[None], geoms_info.coup_softness[i_g])
@@ -661,18 +739,25 @@ def func_rigid_geom_influence(
     if qd.static(skip_weak_normal):
         is_normal_needed = influence > legacy_coupler_info.influence_min[None]
     if is_normal_needed:
-        normal_rigid = sdf.sdf_func_normal_world(
-            i_g, i_b, pos_world, geoms_state, geoms_info, rigid_info, sdf_info, collider_config
-        )
+        if qd.static(exact_adjoint):
+            normal_rigid = func_rigid_geom_normal(
+                i_g, i_b, pos_world, geoms_state, geoms_info, rigid_info, sdf_info, collider_config
+            )
+        else:
+            normal_rigid = sdf.sdf_func_normal_world(
+                i_g, i_b, pos_world, geoms_state, geoms_info, rigid_info, sdf_info, collider_config
+            )
     return signed_dist, influence, normal_rigid
 
 
 @qd.func
 def func_point_vel_after_collisions_with_rigid_geoms(
+    i_x: int,
+    i_y: int,
+    i_z: int,
     i_b: int,
     pos_world: qd.types.vector(3),
     vel: qd.types.vector(3),
-    mass: float,
     mpm_state: MPMState,
     geoms_state: GeomsState,
     links_state: LinksState,
@@ -686,7 +771,7 @@ def func_point_vel_after_collisions_with_rigid_geoms(
     is_backward: qd.template(),
 ):
     """
-    Return the velocity of a cell of the MPM grid of the given mass once it collided with every rigid geom that couples.
+    Return the velocity of a cell of the MPM grid once it collided with every rigid geom that couples.
 
     The momentum change of each collision pushes the link of the geom (see func_add_external_wrench), exactly with
     `is_deterministic` (see MPMConfig), except in the variant autodiff reverses (`is_backward`).
@@ -704,8 +789,12 @@ def func_point_vel_after_collisions_with_rigid_geoms(
                 legacy_coupler_info,
                 collider_config,
                 skip_weak_normal=True,
+                exact_adjoint=True,
             )
             if influence > legacy_coupler_info.influence_min[None]:
+                # FIXME: quadrants - autodiff of a loop of runtime length gets a wrong adjoint for a local computed
+                # before the loop and read in it, so the mass of the cell is read from the grid where it is used.
+                mass = mpm_state.grid.mass[i_x, i_y, i_z, i_b] / mpm_info.particle_volume_scale[None]
                 vel, force, is_colliding = func_point_vel_after_two_way_collision_with_rigid_geom(
                     i_g, i_b, pos_world, vel, mass, normal_rigid, influence, links_state, geoms_info, rigid_info
                 )
@@ -753,6 +842,7 @@ def func_sph_particle_geom_bound(
         legacy_coupler_info,
         collider_config,
         skip_weak_normal=False,
+        exact_adjoint=False,
     )
     vel_rigid = func_vel_at_point(geoms_info.link_idx[i_g], i_b, pos, links_state)
     rvel_normal = (vel_free - vel_rigid).dot(normal_rigid)
@@ -1225,10 +1315,12 @@ def kernel_mpm_grid_op(
             #################### MPM <-> Rigid ####################
             if qd.static(legacy_coupler_config.has_rigid_mpm):
                 vel_mpm = func_point_vel_after_collisions_with_rigid_geoms(
+                    i_x,
+                    i_y,
+                    i_z,
                     i_b,
                     pos,
                     vel_mpm,
-                    mass_mpm,
                     mpm_state,
                     geoms_state,
                     links_state,
@@ -1392,6 +1484,7 @@ def kernel_fem_surface_force(
                         legacy_coupler_info,
                         collider_config,
                         skip_weak_normal=True,
+                        exact_adjoint=False,
                     )
                     if influence > legacy_coupler_info.influence_min[None]:
                         vel_rigid = func_vel_at_point(geoms_info.link_idx[i_g], i_b, pos, links_state)
