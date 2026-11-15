@@ -145,9 +145,10 @@ class LegacyCouplerInfo(Data, kind=DataKind.CONSTANT):
     # middle points, then five pairs of steps (see 'func_rod_rigid_contact')
     rod_edge_contact_n_evals: qd.Tensor = field(int, shape=())
     # How much deeper than the spheres of its two vertices, relative to the radius, the deepest point inside an edge
-    # must be to make a contact of its own, its penetration counting from that depth, which keeps the rounding of a face
-    # parallel to the edge, or of the corner of a pad across it, from making one: such a contact, met on one side of a
-    # rod squeezed between two pads, would push the edge into the other pad, then back
+    # must be to make a contact of its own, its penetration counting from that depth. It keeps a face parallel to the
+    # edge, no deeper inside it than at its ends but for the rounding of the signed distance and the sag of the rod,
+    # from making one. The rim of a geom across the edge sinks that deep into the rod before its contact pushes, which a
+    # grip in fast motion needs small: a rim that yields lets a rod squeezed between two pads roll out over it
     rod_edge_contact_rel_depth: qd.Tensor = field(float, shape=())
     # The fraction of the penetration of a rod into rigid geoms at the start of a substep, of the part the rod cannot
     # leave alone (squeezed between two geoms), that the impulses of the contacts push the links back by at each
@@ -337,7 +338,7 @@ class LegacyCoupler(ErrnoMixin, CheckpointMixin, RBC):
                 rod_mpm_contact_band=rod_mpm_contact_band,
                 rod_mpm_node_mass_fraction=0.3,
                 rod_edge_contact_n_evals=15,
-                rod_edge_contact_rel_depth=0.05,
+                rod_edge_contact_rel_depth=0.01,
                 rod_rigid_overlap_recovery=0.1,
                 rod_rigid_anchor_recovery=0.1,
                 rod_rigid_overlap_relaxation=0.5,
