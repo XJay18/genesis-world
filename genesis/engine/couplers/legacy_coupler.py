@@ -1781,18 +1781,31 @@ def func_rod_rigid_contact_link_inverse_mass(
 
 
 @qd.func
-def func_rod_rigid_contact_share(i_v: int, i_c: int, i_b: int, rod_state: RodState) -> float:
+def func_rod_rigid_contact_share(i_v: int, i_c: int, i_b: int, is_squeezed: bool, rod_state: RodState) -> float:
     """Return the share of a vertex of the rods in resolving the point of one of its contacts with a rigid geom (see
-    'RodRigidContacts'): its weight in the point over the sum of the squared weights of the two vertices of the edge.
+    'RodRigidContacts'): its weight in the point over the sum of the squared weights of the two vertices of the edge,
+    or its weight alone for a vertex squeezed between geoms (see 'func_rod_rigid_contacts_are_squeezing').
 
     A vertex the impulses move moves by its share of the correction of the point, so that the point, which each vertex
     moves by its weight, moves by the whole correction: the sum of the weights times the shares is one. The share is
-    one for the sphere of a vertex and at the middle of an edge, and at most about 1.21, near a parameter of 0.29. A
-    vertex squeezed between geoms, which does not move, pushes the links back by its share instead.
+    one for the sphere of a vertex and at the middle of an edge, and at most about 1.21, near a parameter of 0.29.
+
+    A squeezed vertex does not move, its impulses pushing the links back instead, and its share is its weight, so that
+    the links resolve a point inside an edge next to it over the substeps. Its contact with a geom is the one of
+    largest weight times penetration (see 'kernel_project_rod_rigid_normal'), so that its target, its share times the
+    penetration, changes continuously as the contact passes from its sphere to an edge. A share above the weight
+    raises that target at once by up to twice there, and with it the impulses on the links pressing the vertex, which
+    can let a rod out of a grip in fast motion. Choosing the contact by share times penetration instead makes that
+    passage continuous, but a grip then slips further in fast motion than with this share.
+
+    FIXME: the share of a squeezed vertex is a stop-gap until the full share holds a grip in fast motion as well.
     """
     verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
     t = rod_state.rigid_contacts.t[i_v, i_c, i_b]
-    return qd.select(i_v == verts_idx[0], 1.0 - t, t) / ((1.0 - t) ** 2 + t**2)
+    share = qd.select(i_v == verts_idx[0], 1.0 - t, t)
+    if not is_squeezed:
+        share = share / ((1.0 - t) ** 2 + t**2)
+    return share
 
 
 @qd.func
@@ -2283,7 +2296,7 @@ def kernel_project_rod_rigid_normal(
             shares = qd.Vector.zero(gs.qd_float, N_CONTACTS_MAX)
             for i_c in qd.static(range(N_CONTACTS_MAX)):
                 if i_c < n_contacts:
-                    shares[i_c] = func_rod_rigid_contact_share(i_v, i_c, i_b, rod_state)
+                    shares[i_c] = func_rod_rigid_contact_share(i_v, i_c, i_b, is_squeezed, rod_state)
                     for j_c in qd.static(range(N_CONTACTS_MAX)):
                         if j_c < n_contacts:
                             coupling[i_c, j_c] = inv_mass * rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(
