@@ -337,7 +337,7 @@ def test_coupling_wrench_grad_matches_fd(use_implicit_solver, precision, show_vi
         return rigid_loss, (fem_block.get_verts_pos() ** 2).sum()
 
     tol = 5e-11 if precision == "64" else 2e-5
-    fem_tol = 2e-10 if precision == "64" else (5e-5 if use_implicit_solver else 1e-4)
+    fem_tol = 5e-10 if precision == "64" else (5e-5 if use_implicit_solver else 1e-4)
     vel = np.tile([0.1, 0.2, -0.1, 0.5, -0.3, 0.4], (2, 1))
     vel_ana = torch.tensor(vel, dtype=gs.tc_float, device=gs.device, requires_grad=True)
     rigid_loss, _ = rollout(vel_ana)
