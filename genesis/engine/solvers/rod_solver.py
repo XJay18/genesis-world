@@ -275,11 +275,12 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     """The contacts of each free vertex of the rods with the rigid geoms that need coupling in each environment, found
     once per substep (see 'kernel_project_rod_rigid_normal' in legacy_coupler.py).
 
-    A vertex has at most one contact with each geom: of the sphere of the vertex and the deepest points of the
-    capsules of its two edges in the geom, the one pressing the vertex deepest, its penetration weighted by the weight
-    of the vertex in its point along the edge. A point inside an edge is thus a contact of both vertices of the edge,
-    each resolving its share of it (see 'func_rod_rigid_contact_share' in legacy_coupler.py), and no vertex owns it. A
-    vertex keeps its first contacts, the geoms in their order.
+    A vertex has at most one contact with each geom: the sphere of the vertex where it touches the geom, and otherwise,
+    of the deepest points of the capsules of its two edges in the geom, the one pressing the vertex deepest, its
+    penetration weighted by the weight of the vertex in its point along the edge. A point inside an edge is thus a
+    contact of the vertices of the edge whose spheres miss the geom, each resolving its share of it (see
+    'func_rod_rigid_contact_share' in legacy_coupler.py), and no vertex owns it. A vertex keeps its first contacts, the
+    geoms in their order.
     """
 
     n_contacts: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))

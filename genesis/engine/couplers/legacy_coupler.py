@@ -1792,12 +1792,10 @@ def func_rod_rigid_contact_share(i_v: int, i_c: int, i_b: int, is_squeezed: bool
     one for the sphere of a vertex and at the middle of an edge, and at most about 1.21, near a parameter of 0.29.
 
     A squeezed vertex does not move, its impulses pushing the links back instead, and its share is its weight, so that
-    the links resolve a point inside an edge next to it over the substeps. Its contact with a geom is the one of
-    largest weight times penetration (see 'kernel_project_rod_rigid_normal'), so that its target, its share times the
-    penetration, changes continuously as the contact passes from its sphere to an edge. A share above the weight
-    raises that target at once by up to twice there, and with it the impulses on the links pressing the vertex, which
-    can let a rod out of a grip in fast motion. Choosing the contact by share times penetration instead makes that
-    passage continuous, but a grip then slips further in fast motion than with this share.
+    the links resolve a point inside an edge next to it over the substeps. A share above the weight raises its target,
+    its share times the penetration, by up to twice where its contact with a geom passes from its sphere to an edge
+    (see 'kernel_project_rod_rigid_normal'), and with it the impulses on the links pressing the vertex, which can let a
+    rod out of a grip in fast motion.
 
     FIXME: the share of a squeezed vertex is a stop-gap until the full share holds a grip in fast motion as well.
     """
@@ -2138,13 +2136,16 @@ def kernel_project_rod_rigid_normal(
     """Apply the last correction of the projection of the rods, find their contacts with the rigid geoms that need
     coupling, and compute the normal impulses of the contacts and the normal corrections of the rods.
 
-    A vertex has at most one contact with each geom (see 'RodRigidContacts'): of its sphere and the deepest points of
-    its two edges (see 'func_rod_rigid_contact'), the one pressing it deepest, its penetration weighted by the weight of
-    the vertex in the point along the edge. A point inside an edge is thus a contact of both vertices, each resolving
-    its share of the point (see 'func_rod_rigid_contact_share'), so that the two resolve the whole point between them
-    where they move, and the shares change continuously as the point moves along the edge. The contact takes over the
-    anchor of the contact of the vertex with the same geom at the last substep (see 'RodRigidAnchors'), whichever of its
-    sphere and edges the point was on.
+    A vertex has at most one contact with each geom (see 'RodRigidContacts'): its sphere where the sphere touches the
+    geom, and otherwise, of the deepest points of its two edges (see 'func_rod_rigid_contact'), the one pressing it
+    deepest, its penetration weighted by the weight of the vertex in the point along the edge. A vertex touching a geom
+    keeps that contact whatever the edges next to it do: the rim of a geom across an edge is held by the vertices whose
+    spheres miss it, and a vertex squeezed between two pads keeps both faces rather than trading one for the rim, over
+    which the rod would roll out of the grip. A point inside an edge is a contact of both vertices where neither sphere
+    touches, each resolving its share of the point (see 'func_rod_rigid_contact_share'), so that the two resolve the
+    whole point between them where they move, and the shares change continuously as the point moves along the edge.
+    The contact takes over the anchor of the contact of the vertex with the same geom at the last substep (see
+    'RodRigidAnchors'), whichever of its sphere and edges the point was on.
 
     Each vertex takes the impulses of its contacts alone, as if their points were at the vertex, and its contacts are
     solved together, each impulse non-negative (see 'func_solve_nonnegative'). A vertex pressed by two geoms from
@@ -2194,8 +2195,8 @@ def kernel_project_rod_rigid_normal(
                         legacy_coupler_info,
                         collider_config,
                     ):
-                        # The contact of the vertex with the geom, of its sphere and its edges the one pressing it
-                        # deepest, its penetration weighted by the weight of the vertex in the point
+                        # The contact of the vertex with the geom: its sphere where it touches, otherwise the edge
+                        # contact pressing it deepest, its penetration weighted by the weight of the vertex in the point
                         is_found = False
                         penetration_share_max = gs.qd_float(0.0)
                         contact_verts_idx = qd.Vector([i_v, i_v], dt=gs.qd_int)
@@ -2240,7 +2241,11 @@ def kernel_project_rod_rigid_normal(
                                 if weight >= 0.5 and penetration > penetration_max:
                                     penetration_max = penetration
                                     contact_geom_idx = i_g
-                                if weight * penetration > penetration_share_max:
+                                is_chosen = weight * penetration > penetration_share_max
+                                # The sphere comes last among the slots
+                                if qd.static(i_slot == 2):
+                                    is_chosen = True
+                                if is_chosen:
                                     is_found = True
                                     penetration_share_max = weight * penetration
                                     contact_verts_idx = qd.Vector([i_v_s, i_v_e], dt=gs.qd_int)
