@@ -286,10 +286,24 @@ def test_coupling_wrench_grad_matches_fd(use_implicit_solver, precision, show_vi
             E=5e4,
         ),
     )
+    # The box and a sphere under it both reach the cells of the grid between them, which collide with each geom in turn.
+    # Their reach spans the grid spacing.
     box = scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.0, 0.01, 0.0),
             size=(0.08, 0.08, 0.08),
+        ),
+        material=gs.materials.Rigid(
+            coup_softness=0.02,
+        ),
+    )
+    sphere = scene.add_entity(
+        morph=gs.morphs.Sphere(
+            pos=(0.0, -0.065, 0.0),
+            radius=0.03,
+        ),
+        material=gs.materials.Rigid(
+            coup_softness=0.02,
         ),
     )
     fem_block = scene.add_entity(
@@ -319,23 +333,22 @@ def test_coupling_wrench_grad_matches_fd(use_implicit_solver, precision, show_vi
         box.set_dofs_velocity(vel)
         for _ in range(20):
             scene.step()
-        box_loss = (box.get_pos() ** 2).sum() + (box.get_quat()[..., 1:] ** 2).sum()
-        return box_loss, (fem_block.get_verts_pos() ** 2).sum()
+        rigid_loss = (box.get_pos() ** 2).sum() + (box.get_quat()[..., 1:] ** 2).sum() + (sphere.get_pos() ** 2).sum()
+        return rigid_loss, (fem_block.get_verts_pos() ** 2).sum()
 
-    tol = 2e-10 if precision == "64" else 1e-4
-    # In single precision, the implicit solve rounds the displacement of each substep against the positions, which
-    # makes its finite differences noisy, while its analytic gradient matches double precision.
-    fem_tol = 2e-10 if precision == "64" else (1e-3 if use_implicit_solver else 5e-4)
+    tol = 5e-11 if precision == "64" else 2e-5
+    fem_tol = 2e-10 if precision == "64" else (5e-5 if use_implicit_solver else 1e-4)
     vel = np.tile([0.1, 0.2, -0.1, 0.5, -0.3, 0.4], (2, 1))
     vel_ana = torch.tensor(vel, dtype=gs.tc_float, device=gs.device, requires_grad=True)
-    box_loss, _ = rollout(vel_ana)
+    rigid_loss, _ = rollout(vel_ana)
     # The block pushes the box, which would otherwise keep its velocity
     assert (box.get_dofs_velocity()[..., 0] > vel_ana[..., 0] + 5e-3).all()
-    box_loss.backward()
+    rigid_loss.backward()
     (fem_grad,) = torch.autograd.grad(rollout(vel_ana)[1], vel_ana)
     # The finite differences run on the same scene without gradients, which simulates the same physics. A rollout after
-    # a reset starts free of the coupling wrench the previous one left.
-    eps = 1e-6 if precision == "64" else 1e-2
+    # a reset starts free of the coupling wrench the previous one left. The wide reach of the geoms puts cells near the
+    # influence below which a geom leaves them, across which a larger step would move them.
+    eps = 1e-6 if precision == "64" else 1e-3
     fd_grad = np.zeros((2, *vel.shape))
     with torch.no_grad():
         for i, j in np.ndindex(vel.shape):
