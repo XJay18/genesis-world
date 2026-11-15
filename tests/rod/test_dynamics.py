@@ -1084,6 +1084,33 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
         # The point of the rod the pads hold, by its weights on the vertices: the vertex at the rim of the pads for the
         # rod off the middle of its edge, the only point of the rod they touch, which the rod turns about
         held_weights.append(np.array(held_weight))
+    # A soft rope held at its middle vertex by pads squeezing it from above and below, which droops on both sides of the
+    # pads: the edges of the held vertex sink into the rims of the lower pad, deeper than the sphere of the vertex
+    gripper_flat = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=two_pad_gripper,
+            pos=(1.8, 0.0, 0.3),
+            euler=(90.0, 0.0, 0.0),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=friction,
+            gravity_compensation=1.0,
+        ),
+    )
+    rod_drooping = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=11,
+            interval=interval,
+            pos=(1.8 - 5 * interval, 0.0, 0.3),
+        ),
+        material=gs.materials.Rod.Base(
+            E=5e3,
+            segment_mass=0.001,
+            segment_radius=radius,
+        ),
+    )
+    pad_half_size = np.array([float(x) for x in mjcf_box.find("worldbody/body/body/geom").get("size").split()])
     scene.build(n_envs=2)
 
     slopes_tangent = []
@@ -1100,8 +1127,11 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
     carriage = grippers[0].get_link("carriage")
     for gripper in grippers:
         gripper.control_dofs_force(squeeze_force, pads_dof)
+    pads_flat_dof = [gripper_flat.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
+    gripper_flat.control_dofs_force(squeeze_force, pads_flat_dof)
+    pad_lower = gripper_flat.get_link("right_pad")
 
-    held_pos = []
+    held_pos, rims_penetration = [], []
     for i_step in range(n_close_steps + n_lift_steps + n_yaw_steps):
         lift_vel, yaw_vel = 0.0, 0.0
         if n_close_steps <= i_step < n_close_steps + n_lift_steps:
@@ -1135,6 +1165,17 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
             axis_pos = verts_pos[:, :-1, None] + t * (verts_pos[:, 1:, None] - verts_pos[:, :-1, None])
             axis_pos = axis_pos[..., ::2]
             assert np.linalg.norm(axis_pos - center, axis=-1).min() > clearance - penetration_max
+        # The penetration of the edges of the held vertex of the drooping rope into the lower pad
+        verts_pos = tensor_to_array(rod_drooping.get_verts_pos())[:, 4:7]
+        axis_pos = verts_pos[:, :-1, None] + t * (verts_pos[:, 1:, None] - verts_pos[:, :-1, None])
+        axis_pos = gu.inv_transform_by_trans_quat(
+            axis_pos,
+            tensor_to_array(pad_lower.get_pos())[:, None, None],
+            tensor_to_array(pad_lower.get_quat())[:, None, None],
+        )
+        excess = np.abs(axis_pos) - pad_half_size
+        signed_dist = np.linalg.norm(np.maximum(excess, 0.0), axis=-1) + np.minimum(excess.max(axis=-1), 0.0)
+        rims_penetration.append(radius - signed_dist.min(axis=-1))
         # The pads stop at the surface of the rod
         assert (grippers[0].get_dofs_position(pads_dof).sum(dim=-1) < 0.03 - (2.0 * radius - 1e-3)).all()
         if i_step == n_close_steps - 1:
@@ -1154,6 +1195,10 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
     assert np.linalg.norm(held_slip, axis=-1).max() < 2e-4
     for gripper in grippers:
         assert (gripper.get_dofs_position(yaw_dof) > math.radians(15.0)).all()
+    # The contacts of the edges of the drooping rope with the rims set in as the edges sink in, without pushing them
+    # back out at once: their penetration changes by the motion of the rope from one step to the next
+    rims_penetration = np.array(rims_penetration)
+    assert np.abs(np.diff(rims_penetration[n_close_steps:], axis=0)).max() < 5e-5
 
     # A rod stays on a slope below the friction angle, and slides down the other with the acceleration of Coulomb
     # friction, its positions integrated by symplectic Euler over the substeps
