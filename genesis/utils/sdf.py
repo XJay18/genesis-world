@@ -166,30 +166,11 @@ def sdf_func_world(geom_idx, batch_idx, pos_world, geoms_state: GeomsState, geom
     """
     sdf value from world coordinate
     """
-    # FIXME: quadrants - in a loop of runtime length, the adjoint of a local read before a runtime branch and used under
-    # it leaks into the earlier iterations of the loop, so each branch reads the pose of the geom itself.
-    sd = gs.qd_float(0.0)
 
-    if geoms_info.type[geom_idx] == gs.GEOM_TYPE.SPHERE:
-        g_pos = geoms_state.pos[geom_idx, batch_idx]
-        sd = (pos_world - g_pos).norm() - geoms_info.data[geom_idx][0]
+    g_pos = geoms_state.pos[geom_idx, batch_idx]
+    g_quat = geoms_state.quat[geom_idx, batch_idx]
 
-    elif geoms_info.type[geom_idx] == gs.GEOM_TYPE.PLANE:
-        g_pos = geoms_state.pos[geom_idx, batch_idx]
-        g_quat = geoms_state.quat[geom_idx, batch_idx]
-        pos_mesh = gu.qd_inv_transform_by_trans_quat(pos_world, g_pos, g_quat)
-        geom_data = geoms_info.data[geom_idx]
-        plane_normal = gs.qd_vec3([geom_data[0], geom_data[1], geom_data[2]])
-        sd = pos_mesh.dot(plane_normal)
-
-    else:
-        g_pos = geoms_state.pos[geom_idx, batch_idx]
-        g_quat = geoms_state.quat[geom_idx, batch_idx]
-        pos_mesh = gu.qd_inv_transform_by_trans_quat(pos_world, g_pos, g_quat)
-        pos_sdf = gu.qd_transform_by_T(pos_mesh, sdf_info.geoms_info.T_mesh_to_sdf[geom_idx])
-        sd = sdf_func_sdf(geom_idx, pos_sdf, sdf_info)
-
-    return sd
+    return sdf_func_world_local(geom_idx, pos_world, g_pos, g_quat, geoms_info, sdf_info)
 
 
 @qd.func
@@ -542,31 +523,12 @@ def sdf_func_normal_world(
     sdf_info: SDFInfo,
     collider_config: qd.template(),
 ):
-    # FIXME: quadrants - in a loop of runtime length, the adjoint of a local read before a runtime branch and used under
-    # it leaks into the earlier iterations of the loop, so each branch reads the pose of the geom itself.
-    EPS = rigid_info.EPS[None]
+    g_pos = geoms_state.pos[geom_idx, batch_idx]
+    g_quat = geoms_state.quat[geom_idx, batch_idx]
 
-    grad_world = qd.Vector.zero(gs.qd_float, 3)
-
-    if geoms_info.type[geom_idx] == gs.GEOM_TYPE.SPHERE:
-        g_pos = geoms_state.pos[geom_idx, batch_idx]
-        grad_world = gu.qd_normalize(pos_world - g_pos, EPS)
-
-    elif geoms_info.type[geom_idx] == gs.GEOM_TYPE.PLANE:
-        g_quat = geoms_state.quat[geom_idx, batch_idx]
-        geom_data = geoms_info.data[geom_idx]
-        plane_normal = gs.qd_vec3([geom_data[0], geom_data[1], geom_data[2]])
-        grad_world = gu.qd_transform_by_quat(plane_normal, g_quat)
-
-    else:
-        g_pos = geoms_state.pos[geom_idx, batch_idx]
-        g_quat = geoms_state.quat[geom_idx, batch_idx]
-        pos_mesh = gu.qd_inv_transform_by_trans_quat(pos_world, g_pos, g_quat)
-        pos_sdf = gu.qd_transform_by_T(pos_mesh, sdf_info.geoms_info.T_mesh_to_sdf[geom_idx])
-        grad_sdf = sdf_func_grad(geom_idx, pos_sdf, geoms_info, rigid_info, sdf_info, collider_config)
-        grad_world = gu.qd_transform_by_quat(grad_sdf, g_quat)
-
-    return gu.qd_normalize(grad_world, EPS)
+    return sdf_func_normal_world_local(
+        geom_idx, pos_world, g_pos, g_quat, geoms_info, rigid_info, sdf_info, collider_config
+    )
 
 
 @qd.func
