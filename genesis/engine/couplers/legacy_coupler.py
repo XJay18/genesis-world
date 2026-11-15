@@ -1781,30 +1781,18 @@ def func_rod_rigid_contact_link_inverse_mass(
 
 
 @qd.func
-def func_rod_rigid_contact_share(i_v: int, i_c: int, i_b: int, is_squeezed: bool, rod_state: RodState) -> float:
+def func_rod_rigid_contact_share(i_v: int, i_c: int, i_b: int, rod_state: RodState) -> float:
     """Return the share of a vertex of the rods in resolving the point of one of its contacts with a rigid geom (see
-    'RodRigidContacts'): its weight in the point over the sum of the squared weights of the two vertices of the edge,
-    or its weight alone for a vertex squeezed between geoms (see 'func_rod_rigid_contacts_are_squeezing').
+    'RodRigidContacts'): its weight in the point over the sum of the squared weights of the two vertices of the edge.
 
     A vertex the impulses move moves by its share of the correction of the point, so that the point, which each vertex
     moves by its weight, moves by the whole correction: the sum of the weights times the shares is one. The share is
-    one for the sphere of a vertex and at the middle of an edge, and at most about 1.21, near a parameter of 0.29.
-
-    A squeezed vertex does not move, its impulses pushing the links back instead, and its share is its weight, so that
-    the links resolve a point inside an edge next to it over the substeps. An edge contact counts only once it is
-    deeper than the spheres of its edge (see 'func_rod_rigid_contact'), so that it appears at a squeezed vertex with a
-    penetration well above the one of the sphere it replaces. A share above the weight raises the normal impulse of
-    the vertex further on that jump, and a squeezing grip then slides along the rod by the friction bounds of its
-    contacts while staying closed.
-
-    FIXME: the share of a squeezed vertex is a stop-gap until edge contacts appear without that jump in penetration.
+    one for the sphere of a vertex and at the middle of an edge, and at most about 1.21, near a parameter of 0.29. A
+    vertex squeezed between geoms, which does not move, pushes the links back by its share instead.
     """
     verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
     t = rod_state.rigid_contacts.t[i_v, i_c, i_b]
-    share = qd.select(i_v == verts_idx[0], 1.0 - t, t)
-    if not is_squeezed:
-        share = share / ((1.0 - t) ** 2 + t**2)
-    return share
+    return qd.select(i_v == verts_idx[0], 1.0 - t, t) / ((1.0 - t) ** 2 + t**2)
 
 
 @qd.func
@@ -2295,7 +2283,7 @@ def kernel_project_rod_rigid_normal(
             shares = qd.Vector.zero(gs.qd_float, N_CONTACTS_MAX)
             for i_c in qd.static(range(N_CONTACTS_MAX)):
                 if i_c < n_contacts:
-                    shares[i_c] = func_rod_rigid_contact_share(i_v, i_c, i_b, is_squeezed, rod_state)
+                    shares[i_c] = func_rod_rigid_contact_share(i_v, i_c, i_b, rod_state)
                     for j_c in qd.static(range(N_CONTACTS_MAX)):
                         if j_c < n_contacts:
                             coupling[i_c, j_c] = inv_mass * rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(
