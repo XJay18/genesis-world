@@ -165,11 +165,11 @@ def test_rigid_mpm_legacy_coupling(substeps, tol, show_viewer):
         scene.step()
 
     # Check that the sand moved the box along the negative Y direction
-    pos = tensor_to_array(obj_rigid.get_pos())
+    pos = obj_rigid.get_pos()
     assert (pos[..., 1] + 0.25 < 0.0).all()
 
     # Resetting one environment leaves the other one as it was
-    sand_pos = tensor_to_array(obj_sand.get_particles_pos())
+    sand_pos = obj_sand.get_particles_pos()
     scene.reset(envs_idx=[1])
     assert_equal(obj_rigid.get_pos()[0], pos[0])
     assert_equal(obj_sand.get_particles_pos()[0], sand_pos[0])
@@ -313,6 +313,19 @@ def test_deformable_parallel(show_viewer):
     assert final_mpm_cube_pos[..., 2].min() > -1e-5
     assert final_cloth_pos[..., 2].min() > -1e-5
     assert final_water_pos[..., 2].min() > -1e-5
+
+    # The liquid at rest on a rigid floor stands half a particle size above it, up to the discretization of the boundary
+    # FIXME: Within a support radius of a wall, the ghost lattice and the continuous plane disagree on the boundary
+    # volume, which lowers the corner layer. Replacing the wall lattice by exact boundaries removes it.
+    sph_solver = scene.sph_solver
+    water_pos = tensor_to_array(final_water_pos)
+    is_middle = (
+        (water_pos[..., :2] > sph_solver.boundary_lower[:2] + sph_solver.support_radius)
+        & (water_pos[..., :2] < sph_solver.boundary_upper[:2] - sph_solver.support_radius)
+    ).all(axis=-1)
+    is_bottom_middle = is_middle & (water_pos[..., 2] < sph_solver.particle_size)
+    bottom_height = (water_pos[..., 2] * is_bottom_middle).sum(axis=-1) / is_bottom_middle.sum(axis=-1)
+    assert_allclose(bottom_height, 0.5 * sph_solver.particle_size, atol=0.1 * sph_solver.particle_size)
 
     assert_allclose(cloth.get_particles_vel(), 0.0, atol=1e-5)
     assert_allclose(mpm_cube.get_particles_vel(), 0.0, atol=2e-4)
@@ -477,6 +490,30 @@ def test_sap_rigid_rigid_hydroelastic_contact(batch_links_info, show_viewer):
         with pytest.raises(gs.GenesisException, match="single fixed plane facing up"):
             scene.build()
 
+    # A scene of fixed bodies alone, without any degree of freedom, has nothing to solve and steps
+    scene = gs.Scene(
+        coupler_options=gs.options.SAPCouplerOptions(),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.0, 1.0, 1.0),
+            camera_lookat=(0.0, 0.0, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    fixed_box = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.1, 0.1, 0.1),
+            pos=(0.0, 0.0, 0.5),
+            fixed=True,
+        ),
+    )
+    scene.build()
+    for _ in range(2):
+        scene.step()
+    assert_allclose(fixed_box.get_pos(), (0.0, 0.0, 0.5), tol=gs.EPS)
+
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=DT,
@@ -592,9 +629,180 @@ def test_sap_rigid_rigid_hydroelastic_contact(batch_links_info, show_viewer):
     assert (robot_2_aabb[..., 1, 2] > robot_1_aabb[..., 1, 2] + 0.05).all()
 
 
-@pytest.mark.required("sparse")
-@pytest.mark.parametrize("rigid_floor_contact_type", ["tet", "vert"])
-def test_sap_rigid_floor_contact(rigid_floor_contact_type, asset_tmp_path, show_viewer):
+@pytest.mark.required
+@pytest.mark.parametrize("model_name", ["scaled_mjcf_equalities"])
+@pytest.mark.parametrize("n_envs, is_batched", [(0, False), (2, True)])
+def test_sap_equality_constraints(show_viewer, xml_path, n_envs, is_batched, tol):
+    DT = 1e-2
+    GRAVITY = 9.81
+    SCALE = 2.0
+    COEFFICIENTS = (0.2, 0.4, -0.3, 0.2, -0.1)
+    DRIVER_POSITION = 0.5
+    DRIVER_VELOCITY = 0.4
+    FOLLOWER_POSITION = sum([coefficient * DRIVER_POSITION**degree for degree, coefficient in enumerate(COEFFICIENTS)])
+    DERIVATIVE = sum(
+        [degree * coefficient * DRIVER_POSITION ** (degree - 1) for degree, coefficient in enumerate(COEFFICIENTS)]
+    )
+    FOLLOWER_VELOCITY = DRIVER_VELOCITY * DERIVATIVE
+    TARGET_POSITION = 0.25
+    UNRELATED_POSITION = 1.0
+    MAX_RESIDUAL_RATIO = 1e-3
+    # Half extents of the welded box and of the bar, whose centers lie that far from the point their anchor holds
+    WELDED_HALF_SIZE = 0.05 * SCALE
+    BAR_HALF_SIZE = (0.1 * SCALE, 0.02 * SCALE)
+    BALL_RADIUS = 0.03 * SCALE
+    CUBE_HALF_SIZE = 0.03 * SCALE
+    GROUND_HEIGHT = -1.0
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=DT,
+            gravity=(0.0, 0.0, -GRAVITY),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            batch_joints_info=is_batched,
+            batch_dofs_info=is_batched,
+        ),
+        coupler_options=gs.options.SAPCouplerOptions(),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.15, -0.75, 4.0),
+            camera_lookat=(0.15, -0.75, 0.0),
+            camera_up=(0.0, 1.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    ground = scene.add_entity(
+        morph=gs.morphs.Plane(
+            pos=(0.0, 0.0, GROUND_HEIGHT),
+        ),
+    )
+    entity = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=xml_path,
+            scale=SCALE,
+        ),
+    )
+    scene.build(n_envs=n_envs)
+
+    # Driver and follower joints of each pair, with the scale of their coordinates
+    joints_pairs = []
+    for driver_type, follower_type in (("hinge", "hinge"), ("slide", "slide"), ("slide", "hinge"), ("hinge", "slide")):
+        driver_joint = entity.get_joint(f"{driver_type}_{follower_type}_driver")
+        follower_joint = entity.get_joint(f"{driver_type}_{follower_type}_follower")
+        driver_scale = SCALE if driver_type == "slide" else 1.0
+        follower_scale = SCALE if follower_type == "slide" else 1.0
+        joints_pairs.append((driver_joint, follower_joint, driver_scale, follower_scale))
+    (i_target_q,) = entity.get_joint("target").qs_idx_local
+    (i_unrelated_q,) = entity.get_joint("unrelated").qs_idx_local
+    # The coordinates and the dofs of the joints of the joint equalities
+    joints = [
+        *[joint for joint_pair in joints_pairs for joint in joint_pair[:2]],
+        entity.get_joint("target"),
+        entity.get_joint("unrelated"),
+    ]
+    joints_qs_idx = [joint.qs_idx_local[0] for joint in joints]
+    joints_dofs_idx = [joint.dofs_idx_local[0] for joint in joints]
+    welded, bar, ball, cube = [entity.get_link(name) for name in ("welded", "bar", "ball", "cube")]
+
+    # A velocity tangent to the polynomial triggers no constraint impulse
+    qpos = entity.get_qpos()
+    dofs_vel = entity.get_dofs_velocity()
+    for driver_joint, follower_joint, driver_scale, follower_scale in joints_pairs:
+        qpos[..., driver_joint.qs_idx_local[0]] = DRIVER_POSITION * driver_scale
+        qpos[..., follower_joint.qs_idx_local[0]] = FOLLOWER_POSITION * follower_scale
+        dofs_vel[..., driver_joint.dofs_idx_local[0]] = DRIVER_VELOCITY * driver_scale
+        dofs_vel[..., follower_joint.dofs_idx_local[0]] = FOLLOWER_VELOCITY * follower_scale
+    qpos[..., i_target_q] = TARGET_POSITION * SCALE
+    qpos[..., i_unrelated_q] = UNRELATED_POSITION * SCALE
+    entity.set_qpos(qpos)
+    # In the last environment alone, the ball moves into its anchor and the cube into the ground, to which welds added
+    # after the build hold them
+    welded_envs_idx = [n_envs - 1] if is_batched else None
+    entity.set_qpos(
+        (1.5 * BALL_RADIUS, GROUND_HEIGHT + 0.5 * CUBE_HALF_SIZE),
+        [entity.get_joint(name).qs_idx_local[2] for name in ("ball_free", "cube_free")],
+        envs_idx=welded_envs_idx,
+    )
+    entity.set_dofs_velocity(dofs_vel)
+    for anchor_link, link in ((entity.get_link("drop_anchor"), ball), (ground.base_link, cube)):
+        scene.rigid_solver.add_weld_constraint(anchor_link.idx, link.idx, envs_idx=welded_envs_idx)
+    scene.step()
+    qpos_expected = qpos[..., joints_qs_idx] + dofs_vel[..., joints_dofs_idx] * DT
+    assert_allclose(entity.get_qpos()[..., joints_qs_idx], qpos_expected, tol=tol)
+
+    # Starting from rest, the points held by an equality coupling two links move by the share of the regularization of
+    # what gravity alone gives them in a step. They are checked in this step, where no equality starts violated: in
+    # single precision, the solve of the next one, which pulls the target joint by half a meter, resolves the light
+    # bodies only to the precision of that impulse. The weld also keeps the box from turning about its anchor, which
+    # holds it off its center, while the connect lets the bar swing about its end at the angular acceleration of gravity
+    # about that point, m g r / (I + m r^2), I the inertia of the bar about its center, in which the mass cancels out.
+    free_fall_vel = GRAVITY * DT
+    assert_allclose(welded.get_vel(), 0.0, atol=MAX_RESIDUAL_RATIO * free_fall_vel)
+    welded_swing = GRAVITY * WELDED_HALF_SIZE / (2.0 * WELDED_HALF_SIZE**2 / 3.0 + WELDED_HALF_SIZE**2)
+    assert_allclose(welded.get_ang(), 0.0, atol=MAX_RESIDUAL_RATIO * welded_swing * DT)
+    bar_end_offset = torch.tensor((-BAR_HALF_SIZE[0], 0.0, 0.0), dtype=gs.tc_float, device=gs.device)
+    bar_end_vel = bar.get_vel() + torch.linalg.cross(bar.get_ang(), bar_end_offset.expand_as(bar.get_ang()))
+    assert_allclose(bar_end_vel, 0.0, atol=MAX_RESIDUAL_RATIO * free_fall_vel)
+    bar_swing = (
+        GRAVITY * BAR_HALF_SIZE[0] / ((BAR_HALF_SIZE[0] ** 2 + BAR_HALF_SIZE[1] ** 2) / 3.0 + BAR_HALF_SIZE[0] ** 2)
+    )
+    assert_allclose(bar.get_ang()[..., 1], bar_swing * DT, tol=MAX_RESIDUAL_RATIO)
+
+    # The welds hold the ball inside its anchor and the cube inside the ground, their contacts dropped, while in the
+    # other environments, which hold no weld, both fall freely.
+    for link in (ball, cube):
+        link_vel = np.atleast_2d(tensor_to_array(link.get_vel()))
+        assert_allclose(link_vel[-1], 0.0, atol=MAX_RESIDUAL_RATIO * free_fall_vel)
+        assert_allclose(link_vel[:-1], (0.0, 0.0, -free_fall_vel), tol=tol)
+
+    # From rest, the solve leaves the share R / (R + J M^-1 J^T) of the linearized residual, which the regularization R
+    # keeps below MAX_RESIDUAL_RATIO. Every driver at its reference pose checks the Jacobian at poly(0) = a0 and
+    # poly'(0) = a1, and the target joint, which has no second joint, is pulled to a0.
+    for driver_joint, follower_joint, _, _ in joints_pairs:
+        qpos[..., driver_joint.qs_idx_local[0]] = 0.0
+        qpos[..., follower_joint.qs_idx_local[0]] = 0.0
+    qpos[..., i_target_q] = 0.0
+    entity.set_qpos(qpos)
+    mass_mat = entity.get_mass_mat()
+    scene.step()
+
+    qpos_after = entity.get_qpos()
+    for driver_joint, follower_joint, driver_scale, follower_scale in joints_pairs:
+        (i_driver_q,) = driver_joint.qs_idx_local
+        (i_follower_q,) = follower_joint.qs_idx_local
+        (i_driver_d,) = driver_joint.dofs_idx_local
+        (i_follower_d,) = follower_joint.dofs_idx_local
+        driver_displacement = (qpos_after[..., i_driver_q] - qpos[..., i_driver_q]) / driver_scale
+        expected_follower_position = COEFFICIENTS[0] + COEFFICIENTS[1] * driver_displacement
+        assert_allclose(
+            qpos_after[..., i_follower_q] / follower_scale,
+            expected_follower_position,
+            atol=MAX_RESIDUAL_RATIO * COEFFICIENTS[0],
+        )
+
+        # Each joint has its own root link, so its generalized impulse is M_ii * delta_q / dt. The two impulses have the
+        # ratio -poly'(driver), including the scaling of the coordinates.
+        driver_impulse = (
+            mass_mat[..., i_driver_d, i_driver_d] * (qpos_after[..., i_driver_q] - qpos[..., i_driver_q]) / DT
+        )
+        follower_impulse = (
+            mass_mat[..., i_follower_d, i_follower_d] * (qpos_after[..., i_follower_q] - qpos[..., i_follower_q]) / DT
+        )
+        assert_allclose(driver_impulse, -COEFFICIENTS[1] * follower_scale / driver_scale * follower_impulse, tol=tol)
+
+    assert_allclose(qpos_after[..., i_target_q] / SCALE, TARGET_POSITION, atol=MAX_RESIDUAL_RATIO * TARGET_POSITION)
+    assert_allclose(qpos_after[..., i_unrelated_q] / SCALE, UNRELATED_POSITION, tol=tol)
+
+    # The solve leaves the light bar a velocity error, in the norm of its kinetic energy, of at most its convergence
+    # tolerance (MAX_RESIDUAL_RATIO at most by default) times its momentum, which exceeds its impulses, even next to the
+    # large corrections of the target pull and of the welds. Its rotation about its center of mass holds over a quarter
+    # of the kinetic energy of the bar swinging about its end, so the swing is off by twice that at most.
+    assert_allclose(bar.get_ang()[..., 1], bar_swing * DT, rtol=2.0 * MAX_RESIDUAL_RATIO)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("model_name", ["box_on_masked_stick"])
+def test_sap_rigid_floor_contact(xml_path, asset_tmp_path, show_viewer):
     SLAB_SIZE = (0.4, 0.4, 0.2)
     CUBE_SIZE = (0.1, 0.1, 0.1)
     RHO = 1000.0
@@ -618,7 +826,6 @@ def test_sap_rigid_floor_contact(rigid_floor_contact_type, asset_tmp_path, show_
             sap_taud=SAP_TAUD,
             sap_beta=SAP_BETA,
             stiction_tolerance=STICTION_TOLERANCE,
-            rigid_floor_contact_type=rigid_floor_contact_type,
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(1.5, -2.0, 1.0),
@@ -695,6 +902,16 @@ def test_sap_rigid_floor_contact(rigid_floor_contact_type, asset_tmp_path, show_
             coup_friction=FRICTION_MU,
         ),
     )
+    # A cube resting flat on the ground, a stick hanging below it whose collision mask leaves out the ground
+    masked_stick_cube = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=xml_path,
+            pos=(1.5, 1.5, 0.5 * CUBE_SIZE[2]),
+        ),
+        material=gs.materials.Rigid(
+            rho=RHO,
+        ),
+    )
     scene.build(n_envs=2)
 
     push_force = 0.5 * FRICTION_MU * RHO * np.prod(SLAB_SIZE) * GRAVITY
@@ -703,7 +920,7 @@ def test_sap_rigid_floor_contact(rigid_floor_contact_type, asset_tmp_path, show_
         scene.step()
 
     # Each environment rests still on its own variant, and the other cubes rest still, flat on the ground
-    for entity in (variants, dropped_cube, tilted_cube, refined_cube):
+    for entity in (variants, dropped_cube, tilted_cube, refined_cube, masked_stick_cube):
         assert_allclose(entity.get_vel(), 0.0, atol=1e-5)
         assert_allclose(entity.get_ang(), 0.0, atol=1e-4)
         assert_allclose(entity.get_quat()[..., 1:3], 0.0, atol=1e-3)
@@ -711,13 +928,15 @@ def test_sap_rigid_floor_contact(rigid_floor_contact_type, asset_tmp_path, show_
     # The pushed slab sticks, creeping at most at the stiction tolerance
     assert (torch.linalg.norm(pushed_slab.get_vel(), dim=-1) < STICTION_TOLERANCE).all()
 
+    # The stick passes through the ground, the cube resting on its own bottom face
+    assert_allclose(masked_stick_cube.get_pos()[..., 2], 0.5 * CUBE_SIZE[2], atol=1e-3)
+
     # The contacts of a body at rest form one patch, regularized as one contact whatever their number. Each contact of
     # stiffness k takes the regularization max(beta^2 / (4 pi^2) * |W| / 3 * K / k, 1 / (dt * k * (dt + taud))), from the
     # Delassus operator W = I / m + [r]x I^-1 [r]x^T of the contact at r from the center of mass and the stiffness K of
     # the patch, the near-rigid one for light bodies and the compliant one for heavy ones. At rest, each contact carries
-    # the impulse vn_hat / Rn, vn_hat = depth / (dt + taud), and together they hold the weight. The vertex floor holds a
-    # box on the vertices of its bottom face, all of stiffness VERT_STIFFNESS. The tet floor holds it on slices spread
-    # over that face, closer to its center of mass than the corners, so that it rests less deep.
+    # the impulse vn_hat / Rn, vn_hat = depth / (dt + taud), and together they hold the weight. The floor holds a box
+    # on the vertices of its bottom face, all of stiffness VERT_STIFFNESS.
     substep_dt = DT / SUBSTEPS
     rest_depths = []
     for size, mesh in (
@@ -737,20 +956,53 @@ def test_sap_rigid_floor_contact(rigid_floor_contact_type, asset_tmp_path, show_
         rest_depths.append(mass * GRAVITY * substep_dt * (substep_dt + SAP_TAUD) / np.sum(1.0 / regularizations))
     rest_depths = torch.tensor(rest_depths, dtype=gs.tc_float, device=gs.device)
     rest_heights = 0.5 * torch.tensor((SLAB_SIZE[2], CUBE_SIZE[2]), dtype=gs.tc_float, device=gs.device)
-    # The tet floor bounds the depth of the refined cube by that of a cube held on its corners
-    refined_cube_rest_depth = rest_depths[2] if rigid_floor_contact_type == "vert" else rest_depths[1]
     for entity, entity_rest_heights, entity_rest_depths in (
         (variants, rest_heights, rest_depths[:2]),
         (dropped_cube, rest_heights[1], rest_depths[1]),
         (tilted_cube, rest_heights[1], rest_depths[1]),
-        (refined_cube, rest_heights[1], refined_cube_rest_depth),
+        (refined_cube, rest_heights[1], rest_depths[2]),
     ):
+        # A few roundings of the height of a body in single precision take a share of its depth
         entity_depths = entity_rest_heights - entity.get_pos()[..., 2]
-        if rigid_floor_contact_type == "vert":
-            # A few roundings of the height of a body in single precision take a share of its depth
-            assert_allclose(entity_depths, entity_rest_depths, rtol=5e-3)
-        else:
-            assert ((entity_depths > 0.0) & (entity_depths < entity_rest_depths)).all()
+        assert_allclose(entity_depths, entity_rest_depths, rtol=5e-3)
+
+
+@pytest.mark.required("sparse")
+@pytest.mark.parametrize("model_name", ["long_chain"])
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+def test_sap_long_kinematic_chain(xml_path, show_viewer):
+    CHAIN_HALF_HEIGHT = 0.015
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1 / 60,
+            substeps=2,
+        ),
+        coupler_options=gs.options.SAPCouplerOptions(),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.7, -1.0, 0.6),
+            camera_lookat=(0.7, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    chain = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=xml_path,
+            pos=(0.0, 0.0, CHAIN_HALF_HEIGHT),
+        ),
+    )
+    scene.build(n_envs=2)
+
+    for _ in range(40):
+        scene.step()
+
+    # The chain of 100 dofs lying flat on the ground rests still, every link slightly sunk into it
+    assert_allclose(chain.get_dofs_velocity(), 0.0, atol=1e-4)
+    chain_depths = CHAIN_HALF_HEIGHT - chain.get_links_pos()[..., 2]
+    assert ((chain_depths > 0.0) & (chain_depths < 1e-3)).all()
 
 
 @pytest.mark.required("sparse")
@@ -770,7 +1022,7 @@ def test_sap_fem_vs_robot(enable_lagged_friction, show_viewer):
         # Rigid-FEM contact without FEM self-contact, which no other test covers
         coupler_options=gs.options.SAPCouplerOptions(
             enable_lagged_friction=enable_lagged_friction,
-            enable_fem_self_tet_contact=False,
+            enable_fem_self_collision=False,
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(2.0, 1.5, 1.2),

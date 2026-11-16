@@ -1,5 +1,6 @@
 import builtins
 import contextlib
+import copy
 import ctypes
 import gc
 import hashlib
@@ -74,6 +75,95 @@ IS_INTERACTIVE_VIEWER_AVAILABLE = has_display or has_egl
 
 TOL_SINGLE = 5e-5
 TOL_DOUBLE = 1e-9
+
+
+@pytest.fixture(scope="session")
+def scaled_mjcf_joint_equalities():
+    mjcf = ET.Element("mujoco", model="scaled_mjcf_joint_equalities")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    equality = ET.SubElement(mjcf, "equality")
+    for driver_type, follower_type, position_y in (
+        ("hinge", "hinge", -0.25),
+        ("slide", "slide", -0.5),
+        ("slide", "hinge", -0.75),
+        ("hinge", "slide", -1.0),
+    ):
+        pair_name = f"{driver_type}_{follower_type}"
+        driver_body = ET.SubElement(worldbody, "body", name=f"{pair_name}_driver_body", pos=f"0 {position_y} 0")
+        ET.SubElement(driver_body, "joint", name=f"{pair_name}_driver", type=driver_type, axis="1 0 0")
+        ET.SubElement(driver_body, "geom", type="sphere", size="0.05", mass="1", contype="0", conaffinity="0")
+        follower_body = ET.SubElement(worldbody, "body", name=f"{pair_name}_follower_body", pos=f"0.15 {position_y} 0")
+        ET.SubElement(follower_body, "joint", name=f"{pair_name}_follower", type=follower_type, axis="1 0 0")
+        ET.SubElement(follower_body, "geom", type="sphere", size="0.05", mass="1", contype="0", conaffinity="0")
+        ET.SubElement(
+            equality,
+            "joint",
+            name=f"{pair_name}_coupling",
+            joint1=f"{pair_name}_follower",
+            joint2=f"{pair_name}_driver",
+            polycoef="0.2 0.4 -0.3 0.2 -0.1",
+        )
+    for name, position_y in (("target", 0.0), ("unrelated", 0.25)):
+        body = ET.SubElement(worldbody, "body", name=f"{name}_body", pos=f"0 {position_y} 0")
+        ET.SubElement(body, "joint", name=name, type="slide", axis="1 0 0")
+        ET.SubElement(body, "geom", type="sphere", size="0.05", mass="1", contype="0", conaffinity="0")
+    ET.SubElement(equality, "joint", name="fixed_target", joint1="target", polycoef="0.25 1 0 0 0")
+    return mjcf
+
+
+@pytest.fixture(scope="session")
+def scaled_mjcf_equalities(scaled_mjcf_joint_equalities):
+    # The joint equalities, then a box welded to a fixed anchor beside it, a bar connected to another one by one of its
+    # ends, a ball above a third one it may be welded to once moved into it, and a cube that may be welded to the ground
+    # once moved into it. The free bodies keep their center of mass at the origin of their frame.
+    mjcf = copy.deepcopy(scaled_mjcf_joint_equalities)
+    worldbody = mjcf.find("worldbody")
+    equality = mjcf.find("equality")
+    for name, position_y, contype in (("weld", 0.5, "0"), ("connect", 0.75, "0"), ("drop", 1.0, "1")):
+        anchor = ET.SubElement(worldbody, "body", name=f"{name}_anchor", pos=f"0 {position_y} 0")
+        ET.SubElement(anchor, "geom", type="sphere", size="0.03", contype=contype, conaffinity=contype)
+    for name, position_y, position_z, geom_type, size, contype in (
+        ("welded", 0.5, 0.0, "box", "0.05 0.05 0.05", "0"),
+        ("bar", 0.75, 0.0, "box", "0.1 0.02 0.02", "0"),
+        ("ball", 1.0, 0.1, "sphere", "0.03", "1"),
+        ("cube", 1.25, 0.0, "box", "0.03 0.03 0.03", "1"),
+    ):
+        body = ET.SubElement(worldbody, "body", name=name, pos=f"0 {position_y} {position_z}")
+        ET.SubElement(body, "freejoint", name=f"{name}_free")
+        ET.SubElement(body, "geom", type=geom_type, size=size, mass="1", contype=contype, conaffinity=contype)
+    ET.SubElement(equality, "weld", body1="welded", body2="weld_anchor", anchor="-0.05 0 0")
+    ET.SubElement(equality, "connect", body1="bar", body2="connect_anchor", anchor="-0.1 0 0")
+    return mjcf
+
+
+@pytest.fixture(scope="session")
+def box_on_masked_stick():
+    # A free box with a stick hanging below it, whose collision mask shares no bit with the default one of the ground
+    mjcf = ET.Element("mujoco", model="box_on_masked_stick")
+    body = ET.SubElement(ET.SubElement(mjcf, "worldbody"), "body", name="box")
+    ET.SubElement(body, "freejoint")
+    ET.SubElement(body, "geom", type="box", size="0.05 0.05 0.05")
+    ET.SubElement(
+        body, "geom", type="box", size="0.01 0.01 0.05", pos="0 0 -0.08", contype="65536", conaffinity="65536"
+    )
+    return mjcf
+
+
+@pytest.fixture(scope="session")
+def long_chain():
+    # A free box followed by 31 boxes on ball joints and a last one on a vertical hinge, 100 dofs in a row
+    mjcf = ET.Element("mujoco", model="long_chain")
+    body = ET.SubElement(ET.SubElement(mjcf, "worldbody"), "body", name="link0")
+    ET.SubElement(body, "freejoint")
+    ET.SubElement(body, "geom", type="box", size="0.02 0.015 0.015")
+    for i in range(1, 33):
+        body = ET.SubElement(body, "body", name=f"link{i}", pos="0.045 0 0")
+        if i < 32:
+            ET.SubElement(body, "joint", name=f"ball{i}", type="ball")
+        else:
+            ET.SubElement(body, "joint", name="hinge", type="hinge", axis="0 0 1")
+        ET.SubElement(body, "geom", type="box", size="0.02 0.015 0.015")
+    return mjcf
 
 
 # Canonical skip reason registry.
