@@ -70,7 +70,8 @@ class RodsInfo(Data, kind=DataKind.INFO, shape=(RODS,)):
 
 
 class RodVertsInfo(Data, kind=DataKind.INFO, shape=(ROD_VERTS,)):
-    """The topology, mass, radius, friction and restitution of each vertex of the rods."""
+    """The topology, mass, radius, friction and restitution of each vertex of the rods, and the friction of its contacts
+    with MPM materials."""
 
     rod_idx: qd.Tensor = field(int, kind=DataKind.CONSTANT)
     # The edges ending and starting at the vertex, -1 for none
@@ -83,6 +84,7 @@ class RodVertsInfo(Data, kind=DataKind.INFO, shape=(ROD_VERTS,)):
     mu_s: qd.Tensor = field(float)
     mu_k: qd.Tensor = field(float)
     restitution: qd.Tensor = field(float)
+    mpm_friction: qd.Tensor = field(float)
 
 
 class RodEdgesInfo(Data, kind=DataKind.CONSTANT, shape=(ROD_EDGES,)):
@@ -1485,6 +1487,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             (info.verts.mu_s, np.repeat([m.static_friction for m in materials], rods_n_verts), gs.tc_float),
             (info.verts.mu_k, np.repeat([m.kinetic_friction for m in materials], rods_n_verts), gs.tc_float),
             (info.verts.restitution, np.repeat([m.restitution for m in materials], rods_n_verts), gs.tc_float),
+            (info.verts.mpm_friction, np.repeat([m.mpm_friction for m in materials], rods_n_verts), gs.tc_float),
             (info.edges.rod_idx, edges_rod_idx, gs.tc_int),
             (info.edges.verts_idx, edges_verts_idx, gs.tc_int),
             (info.edges.hinges_idx, edges_hinges_idx, gs.tc_int),

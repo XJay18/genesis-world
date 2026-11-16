@@ -85,9 +85,10 @@ class LegacyCouplerOptions(BaseCouplerOptions):
         included, collide with the rigid geoms that need coupling, with the friction of the geom ('coup_friction' of
         its material), and push them back, so that a gripper can hold a rod by squeezing it. Defaults to True.
     rod_mpm : bool, optional
-        Whether to enable coupling between rod and MPM solvers: the rods rest on the surface of the MPM material, and
-        they push each other apart where they meet. It costs time only in scenes holding both rods and MPM materials,
-        growing with the total length of the rods over the grid spacing. Defaults to True.
+        Whether to enable coupling between rod and MPM solvers: the rods rest on the surface of the MPM material, with
+        friction (see 'mpm_friction' of the rod material), and they push each other apart where they meet. It costs time
+        only in scenes holding both rods and MPM materials, growing with the total length of the rods over the grid
+        spacing. Defaults to True.
     """
 
     rigid_mpm: StrictBool = True

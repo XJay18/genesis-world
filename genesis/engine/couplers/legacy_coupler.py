@@ -2894,7 +2894,9 @@ def kernel_rod_mpm_impulse(rod_state: RodState, rod_info: RodInfo):
     Compute the impulse each vertex of the rods takes from the patch of MPM material it approaches.
 
     The vertex and its patch meet in one inelastic contact along the normal of the patch, scaled by one plus the
-    restitution of the rod. A fixed or constrained vertex has no inverse mass, so its patch takes its velocity.
+    restitution of the rod, with Coulomb friction: the tangential impulse takes their relative tangential motion back
+    through the same inverse masses, bounded by the friction coefficient of the rod with MPM materials times the normal
+    impulse. A fixed or constrained vertex has no inverse mass, so its patch takes its velocity.
     """
     for i_v, i_b in qd.ndrange(*rod_state.verts.mpm_impulse.shape, axes=qd.static(eoa(rod_state.verts.mpm_impulse))):
         impulse = qd.Vector.zero(gs.qd_float, 3)
@@ -2902,7 +2904,11 @@ def kernel_rod_mpm_impulse(rod_state: RodState, rod_info: RodInfo):
         if is_approaching:
             inv_mass = func_inverse_mass(i_v, i_b, rod_state, rod_info) + rod_state.verts.mpm_inv_mass[i_v, i_b]
             vel_normal = vel_rel.dot(normal)
-            impulse = -(1.0 + rod_info.verts.restitution[i_v]) * vel_normal / inv_mass * normal
+            impulse_normal = -(1.0 + rod_info.verts.restitution[i_v]) * vel_normal / inv_mass
+            vel_tan = vel_rel - vel_normal * normal
+            vel_tan_norm = vel_tan.norm(rod_info.EPS[None])
+            impulse_tan = qd.min(vel_tan_norm / inv_mass, rod_info.verts.mpm_friction[i_v] * impulse_normal)
+            impulse = impulse_normal * normal - impulse_tan / vel_tan_norm * vel_tan
         rod_state.verts.mpm_impulse[i_v, i_b] = impulse
 
 
