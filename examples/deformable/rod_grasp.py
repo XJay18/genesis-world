@@ -25,8 +25,8 @@ def main():
             substeps=20,
         ),
         viewer_options=gs.options.ViewerOptions(
-            camera_pos=(1.4, -1.0, 0.6),
-            camera_lookat=(0.5, 0.0, 0.2),
+            camera_pos=(1.5, -1.1, 0.8),
+            camera_lookat=(0.5, 0.0, 0.3),
         ),
         show_viewer=args.vis,
     )

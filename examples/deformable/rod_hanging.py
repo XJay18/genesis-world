@@ -23,7 +23,7 @@ def main():
             damping=2.0,
         ),
         viewer_options=gs.options.ViewerOptions(
-            camera_pos=(0.4, -1.5, 0.7),
+            camera_pos=(0.4, -1.1, 0.6),
             camera_lookat=(0.4, 0.0, 0.25),
         ),
         show_viewer=args.vis,

@@ -30,7 +30,7 @@ def main():
         ),
         # The camera is tilted with gravity, so that the block is seen standing on a slope
         viewer_options=gs.options.ViewerOptions(
-            camera_pos=(0.1, -0.7, 0.35),
+            camera_pos=(0.05, -0.55, 0.3),
             camera_lookat=(0.0, 0.0, 0.08),
             camera_up=(-gravity[0], 0.0, -gravity[2]),
         ),
