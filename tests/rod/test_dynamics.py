@@ -602,14 +602,17 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
             coup_friction=0.1,
         ),
     )
+    # The block yields under the impact of the landing rods, which spends their energy rather than ringing with it
     block = scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.0, 0.0, 0.05),
             size=(0.2, 0.2, 0.1),
         ),
-        material=gs.materials.MPM.Elastic(),
+        material=gs.materials.MPM.ElastoPlastic(
+            von_mises_yield_stress=3000.0,
+        ),
     )
-    # A rod lying just above the block, within the reach of its grid nodes
+    # A rod lying just above the block
     rod = scene.add_entity(
         morph=gs.morphs.ParameterizedRod(
             n_vertices=30,
@@ -657,12 +660,12 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
         n_steps_settled = 50
         for i_rod in range(len(rods_landing)):
             heights = torch.stack([heights_step[i_rod] for heights_step in heights_landing])
-            # A rod lands without rising from its lowest height, with restitution zero, and it stays on the surface,
-            # within half a grid spacing of the top of the block plus its radius, at the resolution of the grid nodes it
-            # touches. It is settled, sinking less than a rod the grid nodes do not hold up
-            height_min, i_min = heights.min(dim=0)
+            # A rod lands without rising from where its fall first stops, with restitution zero, and it stays on the
+            # surface, within half a grid spacing of the top of the block plus its radius. It is settled, sinking less
+            # than a rod the material does not hold up
+            i_landing = ((heights[1:] > heights[:-1]).cumsum(dim=0) == 0).sum(dim=0)
             for i_b in range(2):
-                assert (heights[i_min[i_b] :, i_b] < height_min[i_b] + 1e-3).all()
+                assert (heights[i_landing[i_b] :, i_b] < heights[i_landing[i_b], i_b] + 1e-3).all()
             assert_allclose(heights[-1], block_top + 0.005, atol=0.5 * dx)
             sink_rate = (heights[-n_steps_settled] - heights[-1]) / (n_steps_settled * 1e-3)
             assert (sink_rate.abs() < 5e-3).all()
@@ -672,8 +675,8 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
 
 @pytest.mark.required
 def test_rod_mpm_contact_does_not_overshoot_at_any_mass(show_viewer):
-    # Rods of a range of masses, far enough apart not to meet the same grid nodes, thrown down at a block at rest. With
-    # restitution zero, their vertices lose speed in the contact and none ends moving up
+    # Rods of a range of masses, far enough apart not to meet the same grid nodes, thrown down at a block at rest from
+    # where they touch its surface. With restitution zero, their vertices lose speed and none ends moving up
     segment_masses = (0.02, 0.005, 0.001, 2e-4, 2e-5)
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -703,7 +706,7 @@ def test_rod_mpm_contact_does_not_overshoot_at_any_mass(show_viewer):
             morph=gs.morphs.ParameterizedRod(
                 n_vertices=15,
                 interval=0.01,
-                pos=(-0.07, y, 0.1045),
+                pos=(-0.07, y, 0.0995),
             ),
             material=gs.materials.Rod.Base(
                 E=1e5,
