@@ -441,7 +441,7 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
         self.sph_boundaries: SPHBoundaries | None = None
         self.rod_mpm_contact: RodMPMContact | None = None
 
-        # The MPM and PBD particles, the FEM vertices and the rod vertices collide with the rigid geoms through their SDF
+        # The MPM and PBD particles and the FEM and rod vertices collide with the rigid geoms through their SDF
         opt_in(SDFInfo, cond=lambda: any([self.rigid_couplings[i] for i in (0, 2, 3, 4)]))
         for field_ref in (
             RodData.rod_state.verts.dp_rigid_normal,
@@ -605,7 +605,18 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
         if self.legacy_coupler_config.has_rigid_mpm and self.mpm_solver.enable_CPIC:
             kernel_reset_mpm_rigid_normal(self.sim.sanitize_envs_idx(None), self.mpm_solver.mpm_state)
 
-        if not has_rod_mpm:
+        self._build_rod_mpm_contact(rod_mpm_sample_spacing)
+        self._is_built = True
+
+    def destroy(self) -> None:
+        self._is_built = False
+
+    def _build_rod_mpm_contact(self, rod_mpm_sample_spacing: float) -> None:
+        """
+        Build the samples of the edges of the rods that meet the MPM materials (see 'RodMPMContact'), at most
+        'rod_mpm_sample_spacing' grid spacings apart.
+        """
+        if not self.legacy_coupler_config.has_rod_mpm:
             self.rod_mpm_contact = RodMPMContact(unused=True)
             return
         edges_rest_length = qd_to_numpy(self.rod_solver.rod_info.edges.rest_length)
@@ -619,7 +630,7 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
         grid_x, grid_y, grid_z = self.mpm_solver._grid_res.tolist()
         self.rod_mpm_contact = RodMPMContact(
             sizes=dict(
-                rod_mpm_samples=len(samples_edge_idx), envs=self.sim._B, grid_x=grid_x, grid_y=grid_y, grid_z=grid_z
+                rod_mpm_samples=len(samples_edge_idx), envs=self.n_envs_, grid_x=grid_x, grid_y=grid_y, grid_z=grid_z
             ),
             requires_grad=self.sim.requires_grad,
         )
@@ -627,10 +638,6 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
         self.rod_mpm_contact.samples_t.from_numpy(
             ((samples_rank + 0.5) / edges_n_samples[samples_edge_idx]).astype(gs.np_float)
         )
-        self._is_built = True
-
-    def destroy(self) -> None:
-        self._is_built = False
 
     def _build_sph_boundaries(self, rigid_sph_geoms: list["RigidGeom"]) -> tuple[bool, bool]:
         """
@@ -3426,7 +3433,7 @@ def func_rod_rigid_contact(
     return is_contact, i_v_s, i_v_e, t, weight, normal, penetration, slip, inv_mass_link
 
 
-@qd.kernel
+@qd.kernel(fastcache=True)
 def kernel_project_rod_rigid_normal(
     rod_state: RodState,
     links_state: LinksState,
@@ -3672,7 +3679,7 @@ def kernel_project_rod_rigid_normal(
         rod_state.verts.dp_rigid_overlap[i_v, i_b] = dp_overlap
 
 
-@qd.kernel
+@qd.kernel(fastcache=True)
 def kernel_project_rod_rigid_friction(
     rod_state: RodState,
     links_state: LinksState,
@@ -3856,7 +3863,15 @@ def kernel_project_rod_rigid_friction(
                             * normal
                         )
                         force = -(impulse_normal * normal + impulse_friction) / (dt * dt)
-                        func_apply_external_wrench(i_l, i_b, point, force, links_state)
+                        func_add_external_wrench(
+                            i_l,
+                            i_b,
+                            point,
+                            force,
+                            torque=qd.Vector.zero(gs.qd_float, 3),
+                            links_state=links_state,
+                            is_exact=False,
+                        )
         rod_state.verts.dp_rigid_friction[i_v, i_b] = dp_friction
         rod_state.verts.dp_rigid_stick[i_v, i_b] = dp_stick
 
@@ -3961,7 +3976,7 @@ def func_rod_mpm_vert_contact(i_v: int, i_b: int, rod_state: RodState, rod_info:
     return is_approaching, normal, vel_rel
 
 
-@qd.kernel
+@qd.kernel(fastcache=True)
 def kernel_rod_mpm_contact_pos(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):
@@ -3985,7 +4000,7 @@ def kernel_rod_mpm_contact_pos(
         rod_mpm_contact.samples_contact_pos[i_s, i_b] = pos_contact
 
 
-@qd.kernel
+@qd.kernel(fastcache=True)
 def kernel_rod_mpm_gather(
     mpm_state: MPMState,
     rod_state: RodState,
@@ -4045,7 +4060,7 @@ def kernel_rod_mpm_gather(
         rod_mpm_contact.samples_is_touching[i_s, i_b] = is_touching
 
 
-@qd.kernel
+@qd.kernel(fastcache=True)
 def kernel_rod_mpm_share(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):
@@ -4077,7 +4092,7 @@ def kernel_rod_mpm_share(
                 qd.atomic_add(rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b], weight_node * share)
 
 
-@qd.kernel
+@qd.kernel(fastcache=True)
 def kernel_rod_mpm_grid_inv_mass(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):
@@ -4116,7 +4131,7 @@ def kernel_rod_mpm_grid_inv_mass(
                     )
 
 
-@qd.kernel
+@qd.kernel(fastcache=True)
 def kernel_rod_mpm_impulse(rod_state: RodState, rod_info: RodInfo):
     """
     Compute the impulse each vertex of the rods takes from the patch of MPM material it approaches.
@@ -4140,7 +4155,7 @@ def kernel_rod_mpm_impulse(rod_state: RodState, rod_info: RodInfo):
         rod_state.verts.mpm_impulse[i_v, i_b] = impulse
 
 
-@qd.kernel
+@qd.kernel(fastcache=True)
 def kernel_rod_mpm_scatter(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):

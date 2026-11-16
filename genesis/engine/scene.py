@@ -438,7 +438,7 @@ class Scene(BuildableMixin, RBC):
             vis_modes = ("visual", "particle", "recon")
         elif isinstance(spec, gs.entities.FEM):
             vis_modes = ("visual",)
-        elif isinstance(material, gs.materials.Rod.Base):
+        elif isinstance(spec, gs.entities.Rod):
             vis_modes = ("visual",)
         else:
             # The visual of a hybrid entity is the one of its outer soft part

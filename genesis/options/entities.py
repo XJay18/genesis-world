@@ -25,6 +25,7 @@ if TYPE_CHECKING:
         KinematicEntity,
         MPMEntity,
         RigidEntity,
+        RodEntity,
         SPHEntity,
     )
     from genesis.engine.entities.pbd_entity import PBDBaseEntity
@@ -483,6 +484,21 @@ class PBD(Spec["PBDBaseEntity"]):
     material: materials.PBD.Base
 
 
+class Rod(Spec["RodEntity"]):
+    """Spec of a rod simulated as a discrete elastic rod.
+
+    The material options of a rod apply to all its vertices. Its morph is a ``gs.morphs.Rod`` or a
+    ``gs.morphs.ParameterizedRod``.
+
+    Parameters
+    ----------
+    material : gs.materials.Rod.Base, optional
+        The material of the rod. Defaults to ``gs.materials.Rod.Base()``.
+    """
+
+    material: materials.Rod.Base = Field(default_factory=materials.Rod.Base)
+
+
 class Hybrid(Spec["HybridEntity"]):
     """Spec of an entity simulated with a rigid skeleton inside a material point method (MPM) skin.
 
@@ -499,5 +515,5 @@ class Hybrid(Spec["HybridEntity"]):
 # material takes the class of the nearest of its bases (see 'get_entity_spec_cls').
 _SPEC_CLS_BY_MATERIAL_CLS: dict[type[Any] | None, type[Spec]] = {
     spec_cls.model_fields["material"].annotation: spec_cls
-    for spec_cls in (Rigid, Kinematic, FEM, MPM, SPH, PBD, Hybrid)
+    for spec_cls in (Rigid, Kinematic, FEM, MPM, SPH, PBD, Rod, Hybrid)
 }

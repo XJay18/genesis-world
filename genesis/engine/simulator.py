@@ -122,7 +122,7 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
         self.sph_solver = SPHSolver(self, options.sph)
         self.pbd_solver = PBDSolver(self, options.pbd)
         self.fem_solver = FEMSolver(self, options.fem)
-        self.rod_solver = RodSolver(self.scene, self, options.rod)
+        self.rod_solver = RodSolver(self, options.rod)
 
         self._solvers: list["Solver"] = gs.List(
             [
