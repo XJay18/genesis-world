@@ -371,7 +371,8 @@ class RodEntity(Entity):
         """
         if not 0 <= verts_idx_start < verts_idx_end <= self.n_edges:
             gs.raise_exception(
-                f"Expected vertex indices 0 <= start < end <= {self.n_edges}, got {verts_idx_start} and {verts_idx_end}."
+                f"Expected vertex indices 0 <= start < end <= {self.n_edges}, got {verts_idx_start} and "
+                f"{verts_idx_end}."
             )
         verts_idx = [self._v_start + i_v % self.n_verts for i_v in range(verts_idx_start, verts_idx_end + 1)]
         verts_pos = self._solver.get_verts_pos(verts_idx, envs_idx)

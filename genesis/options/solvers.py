@@ -1003,4 +1003,3 @@ class RodOptions(GravityMixin, TimeBasedMixin):
     n_pbd_iters: PositiveInt = 10
     contact_margin: PositiveFloat | None = None
     multiplier_contact_candidates: PositiveInt = 32
-

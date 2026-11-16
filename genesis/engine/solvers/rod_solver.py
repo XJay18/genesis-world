@@ -181,9 +181,9 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
     # The position of the vertex when the broadphase ran, compared with the projections of the substep against its
     # margin (see 'kernel_project_rod_contacts')
     pos_broadphase: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, labels=ROD_BROADPHASE)
-    # The patch of MPM material the vertex meets, gathered over the samples of its edges in contact, each sample weighted
-    # by the weight of the vertex in it: its mass, momentum and mass-weighted outward normal, the inverse mass of the
-    # patch seen by the vertex, and the impulse the vertex takes from it (see 'kernel_rod_mpm_gather' in
+    # The patch of MPM material the vertex meets, gathered over the samples of its edges in contact, each sample
+    # weighted by the weight of the vertex in it: its mass, momentum and mass-weighted outward normal, the inverse mass
+    # of the patch seen by the vertex, and the impulse the vertex takes from it (see 'kernel_rod_mpm_gather' in
     # legacy_coupler.py)
     mpm_mass: qd.Tensor = field(float, kind=DataKind.SCRATCH, grad=True, opt_in=True)
     mpm_momentum: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
@@ -1749,10 +1749,10 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         Get a rigid geom each vertex of the rods penetrated during the last step, -1 for none.
 
         A vertex penetrates a geom where its sphere overlaps it, or the capsule of one of its edges does at a point
-        closer to it than to the other vertex of the edge. Each substep of the step in which a vertex penetrates some geom
-        records the geom it penetrates deepest, so that the geom of the latest such substep is reported, also when the
-        vertex left it before the end of the step. Fixed and constrained vertices, which do not collide with the rigid
-        geoms, never penetrate any. Only the geoms that need coupling are considered.
+        closer to it than to the other vertex of the edge. Each substep of the step in which a vertex penetrates some
+        geom records the geom it penetrates deepest, so that the geom of the latest such substep is reported, also when
+        the vertex left it before the end of the step. Fixed and constrained vertices, which do not collide with the
+        rigid geoms, never penetrate any. Only the geoms that need coupling are considered.
 
         Parameters
         ----------

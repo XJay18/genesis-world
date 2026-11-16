@@ -3215,8 +3215,9 @@ def func_rod_geom_signed_distance(
 @qd.func
 def func_rod_geom_distance_margin(i_g: int, geoms_info: GeomsInfo, sdf_info: SDFInfo) -> float:
     """Return how far the change of the signed distance of a geom between two points may exceed 'rod_sdf_max_slope'
-    (see LegacyCouplerInfo) times their distance: zero for the exact distances of planes and spheres, the largest cell of the signed distance
-    grid for the others, whose estimate beyond the grid follows the grid point nearest to the point."""
+    (see LegacyCouplerInfo) times their distance: zero for the exact distances of planes and spheres, the largest cell
+    of the signed distance grid for the others, whose estimate beyond the grid follows the grid point nearest to the
+    point."""
     margin = gs.qd_float(0.0)
     if geoms_info.type[i_g] != gs.GEOM_TYPE.PLANE and geoms_info.type[i_g] != gs.GEOM_TYPE.SPHERE:
         cell_size = sdf_info.geoms_info.sdf_cell_size[i_g]
@@ -3271,7 +3272,8 @@ def func_is_geom_near_rod_vertex(
     """Whether a geom may reach the capsules of the edges of a vertex of the rods.
 
     Its bounding sphere must reach them, then its signed distance at the vertex, which changes along the edges no
-    faster than 'rod_sdf_max_slope' (see LegacyCouplerInfo) times the point, up to its margin (see 'func_rod_geom_distance_margin').
+    faster than 'rod_sdf_max_slope' (see LegacyCouplerInfo) times the point, up to its margin (see
+    'func_rod_geom_distance_margin').
     """
     pos = rod_state.verts.pos[i_v, i_b]
     reach = rod_info.verts.radius[i_v]
