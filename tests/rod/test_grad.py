@@ -354,7 +354,7 @@ def test_mpm_coupling_grad_matches_fd(backend, show_viewer):
             rho=500.0,
         ),
     )
-    # A rod falling onto the block from within the reach of its grid nodes, which bounce it back
+    # A rod thrown at the block at an angle, so that its contacts carry friction as well as the restitution
     rod = scene.add_entity(
         morph=gs.morphs.ParameterizedRod(
             n_vertices=n_verts,
@@ -376,7 +376,7 @@ def test_mpm_coupling_grad_matches_fd(backend, show_viewer):
     block_weights = torch.tensor(rng.standard_normal((block.n_particles, 3)), dtype=gs.tc_float, device=gs.device)
     inputs = dict(
         rod_vel=torch.tensor(
-            [0.1, 0.05, -1.0] + 0.1 * rng.standard_normal((n_verts, 3)), dtype=gs.tc_float, device=gs.device
+            [0.5, 0.25, -1.0] + 0.1 * rng.standard_normal((n_verts, 3)), dtype=gs.tc_float, device=gs.device
         ),
         block_vel=torch.tensor([0.0, 0.0, 0.5], dtype=gs.tc_float, device=gs.device),
     )

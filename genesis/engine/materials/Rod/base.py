@@ -35,6 +35,11 @@ class Base(Material["RodEntity"]):
     restitution : float, optional
         Coefficient of restitution of the collisions of the rod with MPM materials, from 0 (the normal velocities
         equalize) to 1 (they bounce back elastically). Default is 0.
+    mpm_friction : float, optional
+        Friction coefficient of the contacts of the rod with MPM materials, which bounds the tangential impulse of a
+        contact by this coefficient times its normal impulse. Zero lets the rod slide freely, so that a rod lying on a
+        slope of soft material slides down it. A high value holds the rod in place but also drags the material along
+        with it. Default is 0.3.
     inextensible : bool, optional
         Whether the edges keep their rest length through a projection every substep. It allows a much larger time step
         than a stiff stretching energy, at the cost of a small drift of the length the projection leaves. Default is
@@ -56,6 +61,7 @@ class Base(Material["RodEntity"]):
     static_friction: NonNegativeFloat = 0.3
     kinetic_friction: NonNegativeFloat = 0.25
     restitution: float = Field(default=0.0, ge=0.0, le=1.0)
+    mpm_friction: NonNegativeFloat = 0.3
     inextensible: StrictBool = True
     segment_mass: PositiveFloat = 0.02
     segment_radius: PositiveFloat = 0.01

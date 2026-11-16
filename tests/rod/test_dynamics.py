@@ -602,14 +602,17 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
             coup_friction=0.1,
         ),
     )
+    # The block yields under the impact of the landing rods, which spends their energy rather than ringing with it
     block = scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.0, 0.0, 0.05),
             size=(0.2, 0.2, 0.1),
         ),
-        material=gs.materials.MPM.Elastic(),
+        material=gs.materials.MPM.ElastoPlastic(
+            von_mises_yield_stress=3000.0,
+        ),
     )
-    # A rod lying just above the block, within the reach of its grid nodes
+    # A rod lying just above the block
     rod = scene.add_entity(
         morph=gs.morphs.ParameterizedRod(
             n_vertices=30,
@@ -657,12 +660,12 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
         n_steps_settled = 50
         for i_rod in range(len(rods_landing)):
             heights = torch.stack([heights_step[i_rod] for heights_step in heights_landing])
-            # A rod lands without rising from its lowest height, with restitution zero, and it stays on the surface,
-            # within half a grid spacing of the top of the block plus its radius, at the resolution of the grid nodes it
-            # touches. It is settled, sinking less than a rod the grid nodes do not hold up
-            height_min, i_min = heights.min(dim=0)
+            # A rod lands without rising from where its fall first stops, with restitution zero, and it stays on the
+            # surface, within half a grid spacing of the top of the block plus its radius. It is settled, sinking less
+            # than a rod the material does not hold up
+            i_landing = ((heights[1:] > heights[:-1]).cumsum(dim=0) == 0).sum(dim=0)
             for i_b in range(2):
-                assert (heights[i_min[i_b] :, i_b] < height_min[i_b] + 1e-3).all()
+                assert (heights[i_landing[i_b] :, i_b] < heights[i_landing[i_b], i_b] + 1e-3).all()
             assert_allclose(heights[-1], block_top + 0.005, atol=0.5 * dx)
             sink_rate = (heights[-n_steps_settled] - heights[-1]) / (n_steps_settled * 1e-3)
             assert (sink_rate.abs() < 5e-3).all()
@@ -672,8 +675,8 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
 
 @pytest.mark.required
 def test_rod_mpm_contact_does_not_overshoot_at_any_mass(show_viewer):
-    # Rods of a range of masses, far enough apart not to meet the same grid nodes, thrown down at a block at rest. With
-    # restitution zero, their vertices lose speed in the contact and none ends moving up
+    # Rods of a range of masses, far enough apart not to meet the same grid nodes, thrown down at a block at rest from
+    # where they touch its surface. With restitution zero, their vertices lose speed and none ends moving up
     segment_masses = (0.02, 0.005, 0.001, 2e-4, 2e-5)
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -703,7 +706,7 @@ def test_rod_mpm_contact_does_not_overshoot_at_any_mass(show_viewer):
             morph=gs.morphs.ParameterizedRod(
                 n_vertices=15,
                 interval=0.01,
-                pos=(-0.07, y, 0.1045),
+                pos=(-0.07, y, 0.0995),
             ),
             material=gs.materials.Rod.Base(
                 E=1e5,
@@ -819,8 +822,8 @@ def test_rod_mpm_coupling_conserves_momentum(show_viewer):
         ),
         material=gs.materials.MPM.Elastic(),
     )
-    # A rod starting above the block, thrown down at it and pushing it along, the block and the rod being free. Its
-    # edges are longer than its radius, so that it does not touch itself
+    # A rod starting above the block, thrown down at it at an angle and pushing it along, the block and the rod being
+    # free. Its edges are longer than its radius, so that it does not touch itself
     rod = scene.add_entity(
         morph=gs.morphs.ParameterizedRod(
             n_vertices=8,
@@ -834,7 +837,7 @@ def test_rod_mpm_coupling_conserves_momentum(show_viewer):
         ),
     )
     scene.build(n_envs=1)
-    rod.set_verts_vel(torch.tensor((0.0, 0.0, -1.0), dtype=gs.tc_float, device=gs.device))
+    rod.set_verts_vel(torch.tensor((0.5, 0.0, -1.0), dtype=gs.tc_float, device=gs.device))
 
     rod_mass = rod.material.segment_mass
     particle_mass = (block.get_mass() / block.n_particles)[..., None, None]
@@ -848,6 +851,145 @@ def test_rod_mpm_coupling_conserves_momentum(show_viewer):
     # The rod stays behind the block it pushed, restitution being zero, instead of rebounding off it
     assert (block.get_particles_vel()[..., 2].mean(dim=-1) < -0.1).all()
     assert (rod.get_verts_vel()[..., 2].mean(dim=-1) < 0.0).all()
+
+
+@pytest.mark.required
+def test_rod_rests_on_mpm_surface(show_viewer):
+    dx = 1.0 / 64.0
+    radius = 0.005
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=10.0,
+            angular_damping=5.0,
+        ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.4, -0.25, -0.05),
+            upper_bound=(0.4, 0.25, 0.2),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.7, 0.4),
+            camera_lookat=(0.0, 0.0, 0.08),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.1,
+        ),
+    )
+    # Blocks whose tops lie on a grid node and half a grid spacing above one. Frictionless rods are laid just above
+    # them, light ones on a line of grid nodes and a quarter of a spacing off one, and a heavy one on a light block
+    blocks, rods = [], []
+    for x_block, offset, rho in ((-0.2, 0.0, 1000.0), (0.0, 0.5, 1000.0), (0.2, 0.5, 100.0)):
+        top = 0.1 + offset * dx
+        block = scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(x_block, 0.0, 0.5 * top),
+                size=(0.16, 0.2, top),
+            ),
+            material=gs.materials.MPM.Elastic(
+                rho=rho,
+            ),
+        )
+        for y, segment_mass in ((-2.0 * dx, 0.005), (2.25 * dx, 0.005)) if rho > 500.0 else ((0.0, 0.02),):
+            rod = scene.add_entity(
+                morph=gs.morphs.ParameterizedRod(
+                    n_vertices=15,
+                    interval=0.005,
+                    pos=(x_block - 0.035, y, top + radius + 0.004),
+                ),
+                material=gs.materials.Rod.Base(
+                    E=1e5,
+                    G=1e4,
+                    segment_mass=segment_mass,
+                    segment_radius=radius,
+                    mpm_friction=0.0,
+                ),
+            )
+            blocks.append(block)
+            rods.append(rod)
+    scene.build()
+    pos_init = [rod.get_verts_pos() for rod in rods]
+    for _ in range(150):
+        scene.step()
+    for block, rod, pos in zip(blocks, rods, pos_init):
+        # The rod rests on the surface of the material, its axis one radius above the top of the block wherever the
+        # top lies relative to the grid nodes, and the surface pushes it straight up wherever it lies between them
+        block_top = block.get_particles_pos()[..., 2].max()
+        assert_allclose(rod.get_verts_pos()[..., 2].mean(), block_top + radius, atol=5e-3)
+        assert_allclose(rod.get_verts_pos()[..., 1].mean(), pos[..., 1].mean(), atol=2e-3)
+
+
+@pytest.mark.required
+def test_rod_mpm_friction(show_viewer):
+    # A slope: gravity tilted along the rods, of slope 0.4
+    gravity = 9.81
+    slope_angle = math.atan(0.4)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(gravity * math.sin(slope_angle), 0.0, -gravity * math.cos(slope_angle)),
+        ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.3, -0.3, -0.05),
+            upper_bound=(0.3, 0.3, 0.45),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.4, -0.6, 0.4),
+            camera_lookat=(0.0, 0.0, 0.08),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=1.0,
+        ),
+    )
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.05),
+            size=(0.2, 0.2, 0.1),
+        ),
+        material=gs.materials.MPM.Elastic(),
+    )
+    # Rods laid on the block, with friction coefficients below and above the slope
+    rods = [
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=8,
+                interval=0.005,
+                pos=(-0.04, y, 0.1015),
+            ),
+            material=gs.materials.Rod.Base(
+                E=1e5,
+                G=1e4,
+                segment_radius=0.005,
+                mpm_friction=mpm_friction,
+            ),
+        )
+        for y, mpm_friction in ((0.0, 0.2), (0.06, 0.6))
+    ]
+    scene.build()
+    for _ in range(50):
+        scene.step()
+    pos_x = [rod.get_verts_pos()[:, 0].mean() for rod in rods]
+    vel_x = [rod.get_verts_vel()[:, 0].mean() for rod in rods]
+    for _ in range(100):
+        scene.step()
+    # The rod with friction below the slope slides down it with the acceleration Coulomb friction leaves, while the
+    # other one stays
+    acc = gravity * (math.sin(slope_angle) - 0.2 * math.cos(slope_angle))
+    assert_allclose(rods[0].get_verts_vel()[:, 0].mean() - vel_x[0], acc * 0.1, rtol=5e-2)
+    assert_allclose(rods[1].get_verts_pos()[:, 0].mean(), pos_x[1], atol=1e-3)
 
 
 @pytest.mark.required
