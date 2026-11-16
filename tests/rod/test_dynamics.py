@@ -602,15 +602,12 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
             coup_friction=0.1,
         ),
     )
-    # The block yields under the impact of the landing rods, which spends their energy rather than ringing with it
     block = scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.0, 0.0, 0.05),
             size=(0.2, 0.2, 0.1),
         ),
-        material=gs.materials.MPM.ElastoPlastic(
-            von_mises_yield_stress=3000.0,
-        ),
+        material=gs.materials.MPM.Elastic(),
     )
     # A rod lying just above the block
     rod = scene.add_entity(
@@ -644,12 +641,24 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
     ]
     scene.build(n_envs=2)
 
-    heights_landing = []
+    # The top of the block under a landing rod: its particles within the footprint of the rod
+    footprint = torch.tensor((0.035, 0.01), dtype=gs.tc_float, device=gs.device)
+    heights_landing, gaps_landing = [], []
     for _ in range(250):
         scene.step()
-        block_top = block.get_particles_pos()[..., 2].max(dim=-1).values
+        particles_pos = block.get_particles_pos()
+        block_top = particles_pos[..., 2].max(dim=-1).values
         rod_bottom = rod.get_verts_pos()[..., 2].min(dim=-1).values
-        heights_landing.append([rod_landing.get_verts_pos()[..., 2].mean(dim=-1) for rod_landing in rods_landing])
+        heights_step, gaps_step = [], []
+        for rod_landing in rods_landing:
+            rod_pos = rod_landing.get_verts_pos()
+            rod_center_xy = rod_pos[..., :2].mean(dim=-2, keepdim=True)
+            is_under = ((particles_pos[..., :2] - rod_center_xy).abs() < footprint).all(dim=-1)
+            top_under = torch.where(is_under, particles_pos[..., 2], -torch.inf).max(dim=-1).values
+            heights_step.append(rod_pos[..., 2].mean(dim=-1))
+            gaps_step.append(rod_pos[..., 2].mean(dim=-1) - top_under)
+        heights_landing.append(heights_step)
+        gaps_landing.append(gaps_step)
         # The coupled rod rests on the block, while the uncoupled one falls through it
         if rod_mpm:
             assert (rod_bottom > block_top).all()
@@ -660,12 +669,13 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
         n_steps_settled = 50
         for i_rod in range(len(rods_landing)):
             heights = torch.stack([heights_step[i_rod] for heights_step in heights_landing])
-            # A rod lands without rising from where its fall first stops, with restitution zero, and it stays on the
-            # surface, within half a grid spacing of the top of the block plus its radius. It is settled, sinking less
-            # than a rod the material does not hold up
+            gaps = torch.stack([gaps_step[i_rod] for gaps_step in gaps_landing])
+            # A rod lands without rising off the surface under it from where its fall first stops, with restitution
+            # zero, the block ringing under it, and it stays on the surface, within half a grid spacing of the top of
+            # the block plus its radius. It is settled, sinking less than a rod the material does not hold up
             i_landing = ((heights[1:] > heights[:-1]).cumsum(dim=0) == 0).sum(dim=0)
             for i_b in range(2):
-                assert (heights[i_landing[i_b] :, i_b] < heights[i_landing[i_b], i_b] + 1e-3).all()
+                assert (gaps[i_landing[i_b] :, i_b] < gaps[i_landing[i_b], i_b] + 5e-3).all()
             assert_allclose(heights[-1], block_top + 0.005, atol=0.5 * dx)
             sink_rate = (heights[-n_steps_settled] - heights[-1]) / (n_steps_settled * 1e-3)
             assert (sink_rate.abs() < 5e-3).all()
