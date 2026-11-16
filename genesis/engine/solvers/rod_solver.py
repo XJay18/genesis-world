@@ -46,10 +46,6 @@ ROD_HINGES = Size("rod_hinges")
 # the edges in heap order, the first being unused
 ROD_EDGE_PAIRS = Size("rod_edge_pairs")
 ROD_BVH_NODES = Size("rod_bvh_nodes")
-# The runs of consecutive edges of the rods, of length ROD_RUN_LEN but the last, whose bounding boxes bound the edges an
-# MPM grid node can collide with
-ROD_EDGE_RUNS = Size("rod_edge_runs")
-ROD_RUN_LEN = 16
 # The rigid links, of which the rods count their contacts
 ROD_RIGID_LINKS = Size("rod_rigid_links")
 
@@ -129,9 +125,6 @@ class RodInfo(Data):
     # The number of leaves of the hierarchy of the broadphase, a power of two, and its depth
     n_bvh_leaves: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
     bvh_depth: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
-    # The length of the runs of edges whose bounding boxes bound the edges an MPM grid node can collide with (see
-    # ROD_EDGE_RUNS)
-    edges_run_len: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
     damping: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
     angular_damping: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
     EPS: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
@@ -181,13 +174,20 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
     dp_rigid_overlap: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     dp_rigid_friction: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     dp_rigid_stick: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
-    # The change of velocity the MPM grid nodes impart, summed over the nodes before it is applied
-    dv_mpm: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     # The rigid geom the vertex penetrated deepest at the latest substep of the step with a penetration, -1 for none
     contact_geom_idx: qd.Tensor = field(int, kind=DataKind.DERIVED, opt_in=True)
     # The position of the vertex when the broadphase ran, compared with the projections of the substep against its
     # margin (see 'kernel_project_rod_contacts')
     pos_broadphase: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, labels=ROD_BROADPHASE)
+    # The patch of MPM material the vertex meets, gathered over the samples of its edges in contact, each sample weighted
+    # by the weight of the vertex in it: its mass, momentum and mass-weighted outward normal, the inverse mass of the
+    # patch seen by the vertex, and the impulse the vertex takes from it (see 'kernel_rod_mpm_gather' in
+    # legacy_coupler.py)
+    mpm_mass: qd.Tensor = field(float, kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    mpm_momentum: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    mpm_normal: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    mpm_inv_mass: qd.Tensor = field(float, kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    mpm_impulse: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
 
 
 class RodEdgesState(Data, kind=DataKind.STATE, shape=(ROD_EDGES, ENVS)):
@@ -337,16 +337,6 @@ class RodState(Data):
     broadphase: RodBroadphase
     rigid_contacts: RodRigidContacts = field(opt_in=True)
     rigid_anchors: RodRigidAnchors = field(opt_in=True)
-    # The bounding box of the vertices of all the rods in each environment, which bounds the MPM grid nodes that can
-    # collide with them
-    aabb_min: qd.Tensor = field((float, 3), shape=(ENVS,), kind=DataKind.SCRATCH, opt_in=True)
-    aabb_max: qd.Tensor = field((float, 3), shape=(ENVS,), kind=DataKind.SCRATCH, opt_in=True)
-    # The bounding boxes of runs of edges in each environment, grown like the bounding box above, which bound the edges
-    # an MPM grid node can collide with (see 'func_mpm_collide_with_rods' in legacy_coupler.py)
-    edges_runs_min: qd.Tensor = field((float, 3), shape=(ROD_EDGE_RUNS, ENVS), kind=DataKind.SCRATCH, opt_in=True)
-    edges_runs_max: qd.Tensor = field((float, 3), shape=(ROD_EDGE_RUNS, ENVS), kind=DataKind.SCRATCH, opt_in=True)
-    # The mass of the MPM grid nodes of the material each edge reaches, which share its contact
-    edges_mpm_mass: qd.Tensor = field(float, shape=(ROD_EDGES, ENVS), kind=DataKind.SCRATCH, grad=True, opt_in=True)
 
 
 class RodData(Data):
@@ -367,7 +357,6 @@ class RodData(Data):
                 rod_hinges=solver.n_hinges,
                 rod_edge_pairs=solver.n_edge_pair_candidates,
                 rod_bvh_nodes=2 * solver.n_bvh_leaves,
-                rod_edge_runs=(solver.n_edges + ROD_RUN_LEN - 1) // ROD_RUN_LEN,
                 rod_rigid_links=solver._sim.rigid_solver.n_links,
             ),
             values=dict(
@@ -380,7 +369,6 @@ class RodData(Data):
                     contact_margin=solver.contact_margin,
                     n_bvh_leaves=solver.n_bvh_leaves,
                     bvh_depth=solver.bvh_depth,
-                    edges_run_len=ROD_RUN_LEN,
                 )
             ),
             unused={
@@ -422,13 +410,6 @@ def func_inverse_mass(i_v: int, i_b: int, rod_state: RodState, rod_info: RodInfo
     if func_is_free(i_v, i_b, rod_state):
         inv_mass = 1.0 / rod_info.verts.mass[i_v]
     return inv_mass
-
-
-@qd.func
-def func_vert_n_edges(i_v: int, rod_info: RodInfo) -> int:
-    """Return the number of edges of the rods a vertex belongs to, one at the end of an open rod and two otherwise."""
-    edges_idx = rod_info.verts.edges_idx[i_v]
-    return qd.select(edges_idx[0] >= 0, 1, 0) + qd.select(edges_idx[1] >= 0, 1, 0)
 
 
 @qd.func
