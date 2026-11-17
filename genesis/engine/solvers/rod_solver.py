@@ -56,6 +56,8 @@ ROD_HINGES = Size("rod_hinges")
 # the edges in heap order, the first being unused
 ROD_EDGE_PAIRS = Size("rod_edge_pairs")
 ROD_BVH_NODES = Size("rod_bvh_nodes")
+# The subtrees of the hierarchy of the broadphase that its refit and its count of the slots take in parallel
+ROD_BVH_SUBTREES = Size("rod_bvh_subtrees")
 # The rigid links, of which the rods count their contacts
 ROD_RIGID_LINKS = Size("rod_rigid_links")
 
@@ -137,6 +139,8 @@ class RodInfo(Data):
     # The number of leaves of the hierarchy of the broadphase, a power of two, and its depth
     n_bvh_leaves: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
     bvh_depth: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
+    # The depth of the subtrees of the hierarchy of the broadphase, half of its depth rounded down (see RodBroadphase)
+    bvh_subtree_depth: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
     damping: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
     angular_damping: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
     EPS: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
@@ -272,9 +276,13 @@ class RodBroadphase(Data, kind=DataKind.SCRATCH):
 
     nodes_min: qd.Tensor = field((float, 3), shape=(ROD_BVH_NODES, ENVS), labels=ROD_BROADPHASE)
     nodes_max: qd.Tensor = field((float, 3), shape=(ROD_BVH_NODES, ENVS), labels=ROD_BROADPHASE)
-    # The candidate count of each edge, the pairs it starts, and the slot of its first candidate
+    # The candidate count of each edge, the pairs it starts, and the slot of its first candidate counted from the first
+    # slot of the edges of its subtree
     edges_n_candidates: qd.Tensor = field(int, shape=(ROD_EDGES, ENVS), labels=ROD_BROADPHASE)
     edges_candidates_start: qd.Tensor = field(int, shape=(ROD_EDGES, ENVS), labels=ROD_BROADPHASE)
+    # The candidate count of the edges of each subtree, and the slot of their first candidate
+    subtrees_n_candidates: qd.Tensor = field(int, shape=(ROD_BVH_SUBTREES, ENVS), labels=ROD_BROADPHASE)
+    subtrees_candidates_start: qd.Tensor = field(int, shape=(ROD_BVH_SUBTREES, ENVS), labels=ROD_BROADPHASE)
     # The number of candidates in each environment, which may exceed the capacity (see OVERFLOW_ROD_CANDIDATES)
     n_candidates: qd.Tensor = field(int, shape=(ENVS,), labels=ROD_BROADPHASE)
     # Whether a vertex of the environment moved further than half of the margin since the broadphase ran
@@ -377,6 +385,7 @@ class RodData(Data):
                 rod_hinges=solver.n_hinges,
                 rod_edge_pairs=solver.n_edge_pair_candidates,
                 rod_bvh_nodes=2 * solver.n_bvh_leaves,
+                rod_bvh_subtrees=solver.n_bvh_leaves >> solver._bvh_subtree_depth,
                 rod_rigid_links=solver.sim.rigid_solver.n_links,
                 rod_state=dict(
                     verts=dict(
@@ -407,6 +416,7 @@ class RodData(Data):
                     contact_margin=solver.contact_margin,
                     n_bvh_leaves=solver.n_bvh_leaves,
                     bvh_depth=solver.bvh_depth,
+                    bvh_subtree_depth=solver._bvh_subtree_depth,
                 )
             ),
             unused={
@@ -944,32 +954,53 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
     no atomic appends and its order is the same in every run and on every backend. A list overflowing its capacity
     flags the environment, the candidates that fit being kept.
     """
-    # The leaves: the bounding box of each edge, and the empty boxes of the leaves past the last edge. The positions of
-    # its vertices, from which the projections of the substep are measured (see 'kernel_project_rod_contacts'), are
-    # saved with them, the vertices shared by two edges being written twice with the same value
-    for i_l, i_b in qd.ndrange(
-        rod_info.n_bvh_leaves[None], rod_state.verts.pos.shape[1], axes=qd.static(eoa(rod_state.broadphase.nodes_min))
+    # The hierarchy is refit in two levels, which bounds the serial work of a thread by about the square root of the
+    # number of edges: each subtree of half the depth computes the boxes of its leaves, then refits its nodes bottom-up,
+    # then each environment refits the nodes above the subtrees. The leaves are the bounding boxes of the edges, and
+    # the empty boxes of the leaves past the last edge. The positions of the vertices of the edges, from which the
+    # projections of the substep are measured (see 'kernel_project_rod_contacts'), are saved with them, the vertices
+    # shared by two edges being written twice with the same value
+    for i_t, i_b in qd.ndrange(
+        *rod_state.broadphase.subtrees_n_candidates.shape, axes=qd.static(eoa(rod_state.broadphase.nodes_min))
     ):
-        box_min = qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
-        box_max = -qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
-        if i_l < rod_info.edges.rod_idx.shape[0]:
-            i_v_s, i_v_e = rod_info.edges.verts_idx[i_l]
-            pos_s, pos_e = rod_state.verts.pos[i_v_s, i_b], rod_state.verts.pos[i_v_e, i_b]
-            rod_state.verts.pos_broadphase[i_v_s, i_b] = pos_s
-            rod_state.verts.pos_broadphase[i_v_e, i_b] = pos_e
-            reach = 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e] + rod_info.contact_margin[None])
-            box_min = qd.min(pos_s, pos_e) - reach
-            box_max = qd.max(pos_s, pos_e) + reach
-        i_n = rod_info.n_bvh_leaves[None] + i_l
-        rod_state.broadphase.nodes_min[i_n, i_b] = box_min
-        rod_state.broadphase.nodes_max[i_n, i_b] = box_max
+        n_leaves, depth_subtree = rod_info.n_bvh_leaves[None], rod_info.bvh_subtree_depth[None]
+        n_subtrees = rod_state.broadphase.subtrees_n_candidates.shape[0]
+        for i_l_ in range(1 << depth_subtree):
+            i_l = (i_t << depth_subtree) + i_l_
+            box_min = qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
+            box_max = -qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
+            if i_l < rod_info.edges.rod_idx.shape[0]:
+                i_v_s, i_v_e = rod_info.edges.verts_idx[i_l]
+                pos_s, pos_e = rod_state.verts.pos[i_v_s, i_b], rod_state.verts.pos[i_v_e, i_b]
+                rod_state.verts.pos_broadphase[i_v_s, i_b] = pos_s
+                rod_state.verts.pos_broadphase[i_v_e, i_b] = pos_e
+                reach = 0.5 * (
+                    rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e] + rod_info.contact_margin[None]
+                )
+                box_min = qd.min(pos_s, pos_e) - reach
+                box_max = qd.max(pos_s, pos_e) + reach
+            rod_state.broadphase.nodes_min[n_leaves + i_l, i_b] = box_min
+            rod_state.broadphase.nodes_max[n_leaves + i_l, i_b] = box_max
+        # The nodes of the subtree in decreasing heap order within it, a child being refit before its parent: the node
+        # of index i_m in the heap of the subtree lies at depth k below its root, the node of index (n_subtrees + i_t)
+        # in the hierarchy, hence at index ((n_subtrees + i_t) << k) + i_m - (1 << k) in the hierarchy
+        for i_m_ in range((1 << depth_subtree) - 1):
+            i_m = (1 << depth_subtree) - 1 - i_m_
+            k = 31 - qd.math.clz(i_m)
+            i_n = ((n_subtrees + i_t) << k) + i_m - (1 << k)
+            rod_state.broadphase.nodes_min[i_n, i_b] = qd.min(
+                rod_state.broadphase.nodes_min[2 * i_n, i_b], rod_state.broadphase.nodes_min[2 * i_n + 1, i_b]
+            )
+            rod_state.broadphase.nodes_max[i_n, i_b] = qd.max(
+                rod_state.broadphase.nodes_max[2 * i_n, i_b], rod_state.broadphase.nodes_max[2 * i_n + 1, i_b]
+            )
 
-    # The internal nodes, a child being refit before its parent
+    # The nodes above the subtrees, a child being refit before its parent
     for i_b in range(rod_state.verts.pos.shape[1]):
         rod_state.broadphase.is_stale[i_b] = False
         rod_state.broadphase.n_envs_fallback[None] = 0
-        for i_n_ in range(rod_info.n_bvh_leaves[None] - 1):
-            i_n = rod_info.n_bvh_leaves[None] - 1 - i_n_
+        for i_n_ in range(rod_state.broadphase.subtrees_n_candidates.shape[0] - 1):
+            i_n = rod_state.broadphase.subtrees_n_candidates.shape[0] - 1 - i_n_
             rod_state.broadphase.nodes_min[i_n, i_b] = qd.min(
                 rod_state.broadphase.nodes_min[2 * i_n, i_b], rod_state.broadphase.nodes_min[2 * i_n + 1, i_b]
             )
@@ -986,11 +1017,26 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
             i_e, i_b, i_start=0, rod_state=rod_state, rod_info=rod_info, is_filling=False
         )
 
-    for i_b in range(rod_state.broadphase.n_candidates.shape[0]):
+    # The slots are counted in two levels, within the edges of each subtree, then over the subtrees, as the refit
+    for i_t, i_b in qd.ndrange(
+        *rod_state.broadphase.subtrees_n_candidates.shape,
+        axes=qd.static(eoa(rod_state.broadphase.subtrees_n_candidates)),
+    ):
         n_candidates = 0
-        for i_e in range(rod_state.broadphase.edges_n_candidates.shape[0]):
+        i_e_start = i_t << rod_info.bvh_subtree_depth[None]
+        i_e_end = qd.min(
+            i_e_start + (1 << rod_info.bvh_subtree_depth[None]), rod_state.broadphase.edges_n_candidates.shape[0]
+        )
+        for i_e in range(i_e_start, i_e_end):
             rod_state.broadphase.edges_candidates_start[i_e, i_b] = n_candidates
             n_candidates += rod_state.broadphase.edges_n_candidates[i_e, i_b]
+        rod_state.broadphase.subtrees_n_candidates[i_t, i_b] = n_candidates
+
+    for i_b in range(rod_state.broadphase.n_candidates.shape[0]):
+        n_candidates = 0
+        for i_t in range(rod_state.broadphase.subtrees_n_candidates.shape[0]):
+            rod_state.broadphase.subtrees_candidates_start[i_t, i_b] = n_candidates
+            n_candidates += rod_state.broadphase.subtrees_n_candidates[i_t, i_b]
         rod_state.broadphase.n_candidates[i_b] = n_candidates
         if n_candidates > rod_state.edge_pairs.edges_idx.shape[0]:
             errno[i_b] = errno[i_b] | RodErrorCode.OVERFLOW_ROD_CANDIDATES
@@ -998,7 +1044,11 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
     for i_e, i_b in qd.ndrange(
         *rod_state.broadphase.edges_n_candidates.shape, axes=qd.static(eoa(rod_state.broadphase.edges_n_candidates))
     ):
-        i_start = rod_state.broadphase.edges_candidates_start[i_e, i_b]
+        i_t = i_e >> rod_info.bvh_subtree_depth[None]
+        i_start = (
+            rod_state.broadphase.subtrees_candidates_start[i_t, i_b]
+            + rod_state.broadphase.edges_candidates_start[i_e, i_b]
+        )
         func_query_rod_bvh(i_e, i_b, i_start, rod_state, rod_info, is_filling=True)
 
 
@@ -1448,6 +1498,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         self._n_edge_pair_candidates = 0
         self._has_broadphase = False
         self._n_bvh_leaves = 0
+        self._bvh_subtree_depth = 0
         self._bvh_depth = 0
         # The rod of each edge and of each hinge, by which the energies sum per rod
         self._edges_rod_idx: torch.Tensor | None = None
@@ -1486,6 +1537,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             if self._has_broadphase:
                 self._bvh_depth = int(np.ceil(np.log2(self.n_edges)))
                 self._n_bvh_leaves = 1 << self._bvh_depth
+                self._bvh_subtree_depth = self._bvh_depth // 2
             elif self._n_edge_pairs > 0:
                 edge_pairs_idx = self._compute_edge_pairs()
         if self._contact_margin is None:
