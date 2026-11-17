@@ -1,3 +1,6 @@
+import math
+
+import numpy as np
 import quadrants as qd
 
 import genesis as gs
@@ -388,3 +391,93 @@ def func_exact_sum_take(i_s: int, i_b: int, exact_sums: ExactSums):
     total = total + exact_sums.slots_nonfinite[i_s, i_b]
     exact_sums.slots_nonfinite[i_s, i_b] = 0.0
     return total
+
+
+# The values summed exactly in 32-bit integer bins without carries, and the bins each of them is cut into (see
+# CarryFreeSums)
+CARRY_FREE_SUM_SLOTS = Size("carry_free_sum_slots")
+CARRY_FREE_SUM_BINS = Size("carry_free_sum_bins")
+
+
+class CarryFreeSums(Data, kind=DataKind.SCRATCH, shape=(CARRY_FREE_SUM_SLOTS, CARRY_FREE_SUM_BINS, ENVS)):
+    """
+    Sums of floating-point terms added from parallel threads, whose result is the same whatever the order of the terms,
+    through atomics whose result no thread waits for.
+
+    A term is cut exactly into integer multiples of the unit of each bin, from the highest bin down, and each bin adds
+    its multiple as a 32-bit integer (see func_carry_free_sum_add). With units 2^b apart, a term below 2^b times the
+    highest unit adds less than 2^b in magnitude to every bin, so a bin holds 2^(31 - b) terms before it overflows, and
+    needs no carry into a second integer, which 'ExactSums' adds through an atomic whose result is waited for. The owner
+    of the sums bounds the terms a slot takes before it is cleared, which sets b (see carry_free_sum_units). The part of
+    a term below the lowest unit is dropped, the same whatever the order. Once every term is added, any thread reads the
+    sum (see func_carry_free_sum_read), and the slot is cleared before its next sum (see func_carry_free_sum_clear).
+    """
+
+    bins: qd.Tensor = field(int)
+    # The unit of each bin, a power of two, in increasing order, at least two of them
+    bins_unit: qd.Tensor = field(float, shape=(CARRY_FREE_SUM_BINS,), kind=DataKind.CONSTANT)
+    # The sum of the terms of each slot that no bin can hold, 'inf', 'nan' or beyond 2^b times the highest unit, 0
+    # without any. It is the same whatever the order of the terms that are not finite (see 'slots_nonfinite' in
+    # ExactSums), and those beyond the range of the bins, far beyond the scale of the sums, add in the order of the
+    # threads.
+    slots_outside: qd.Tensor = field(float, shape=(CARRY_FREE_SUM_SLOTS, ENVS))
+
+
+def carry_free_sum_units(n_terms_max: int, value_max: float, unit_min: float) -> np.ndarray:
+    """
+    Return the units of the bins of carry-free sums whose slots take at most `n_terms_max` terms each before they are
+    cleared, the terms below `value_max` in magnitude added exactly down to `unit_min`.
+
+    The units are 2^b apart with the largest b for which a bin holds `n_terms_max` terms (see CarryFreeSums), from the
+    lowest power of two whose bin holds the terms below `value_max` down to the first at most `unit_min`.
+    """
+    n_bits_terms = max(int(n_terms_max - 1).bit_length(), 0)
+    assert n_bits_terms < 31, "Too many terms per slot for carry-free sums"
+    n_bits = 31 - n_bits_terms
+    exponent_max = math.ceil(math.log2(value_max)) - n_bits
+    n_bins = max(math.ceil((exponent_max - math.floor(math.log2(unit_min))) / n_bits) + 1, 2)
+    return 2.0 ** np.arange(exponent_max - n_bits * (n_bins - 1), exponent_max + 1, n_bits, dtype=gs.np_float)
+
+
+@qd.func
+def func_carry_free_sum_add(i_s: int, i_b: int, value: float, sums: CarryFreeSums):
+    """
+    Add a term to a slot of carry-free sums.
+
+    The cut of the term into bins is exact, as in func_exact_sum_add, each bin adding its multiple through an atomic
+    whose result is not read.
+    """
+    n_bins = sums.bins_unit.shape[0]
+    is_inside = qd.abs(value) < sums.bins_unit[n_bins - 1] * (sums.bins_unit[n_bins - 1] / sums.bins_unit[n_bins - 2])
+    if not is_inside:
+        qd.atomic_add(sums.slots_outside[i_s, i_b], value)
+    remainder = qd.select(is_inside, value, 0.0)
+    for k_ in range(n_bins):
+        k = n_bins - 1 - k_
+        unit = sums.bins_unit[k]
+        count = qd.cast(remainder / unit, gs.qd_int)
+        if count != 0:
+            remainder = remainder - qd.cast(count, gs.qd_float) * unit
+            qd.atomic_add(sums.bins[i_s, k, i_b], count)
+
+
+@qd.func
+def func_carry_free_sum_read(i_s: int, i_b: int, sums: CarryFreeSums):
+    """
+    Return the sum of a slot of carry-free sums, from the highest bin down, leaving the slot as it is.
+
+    The sum is 'inf' or 'nan' if a term was, for the reader to detect.
+    """
+    total = gs.qd_float(0.0)
+    for k_ in range(sums.bins_unit.shape[0]):
+        k = sums.bins_unit.shape[0] - 1 - k_
+        total = total + qd.cast(sums.bins[i_s, k, i_b], gs.qd_float) * sums.bins_unit[k]
+    return total + sums.slots_outside[i_s, i_b]
+
+
+@qd.func
+def func_carry_free_sum_clear(i_s: int, i_b: int, sums: CarryFreeSums):
+    """Empty a slot of carry-free sums for the next sum, once every thread read it."""
+    for k in range(sums.bins_unit.shape[0]):
+        sums.bins[i_s, k, i_b] = 0
+    sums.slots_outside[i_s, i_b] = 0.0
