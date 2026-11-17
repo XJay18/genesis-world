@@ -4334,24 +4334,27 @@ def kernel_rod_mpm_share(
                     weight_node = w[offset[0], 0] * w[offset[1], 1] * w[offset[2], 2]
                     qd.atomic_add(rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b], weight_node * share)
 
+    # A thread per node of the stencil of each sample, the owners summing their nodes in parallel
     if qd.static(IS_GATHER):
-        for i_s, i_b in qd.ndrange(
-            *rod_mpm_contact.samples_is_touching.shape, axes=qd.static(eoa(rod_mpm_contact.samples_is_touching))
+        for i_so, i_b in qd.ndrange(
+            27 * rod_mpm_contact.samples_is_touching.shape[0],
+            rod_mpm_contact.samples_is_touching.shape[1],
+            axes=qd.static(eoa(rod_mpm_contact.samples_is_touching)),
         ):
+            i_s = i_so // 27
             if rod_mpm_contact.samples_is_touching[i_s, i_b]:
-                for i_o in range(27):
-                    is_owner, cell, share = func_rod_mpm_node_sum(
-                        i_s,
-                        i_o,
-                        i_b,
-                        gs.qd_float(0.0),
-                        rod_mpm_contact.samples_share,
-                        mpm_state,
-                        rod_mpm_contact,
-                        mpm_info,
-                    )
-                    if is_owner:
-                        rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b] = share
+                is_owner, cell, share = func_rod_mpm_node_sum(
+                    i_s,
+                    i_so % 27,
+                    i_b,
+                    gs.qd_float(0.0),
+                    rod_mpm_contact.samples_share,
+                    mpm_state,
+                    rod_mpm_contact,
+                    mpm_info,
+                )
+                if is_owner:
+                    rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b] = share
 
 
 @reversed_with(is_backward=True)
@@ -4484,26 +4487,29 @@ def kernel_rod_mpm_scatter(
                         weight_node = w[offset[0], 0] * w[offset[1], 1] * w[offset[2], 2]
                         qd.atomic_add(mpm_state.grid.vel_out[cell[0], cell[1], cell[2], i_b], weight_node * dv)
 
+    # A thread per node of the stencil of each sample (see kernel_rod_mpm_share)
     if qd.static(IS_GATHER):
-        for i_s, i_b in qd.ndrange(
-            *rod_mpm_contact.samples_is_touching.shape, axes=qd.static(eoa(rod_mpm_contact.samples_is_touching))
+        for i_so, i_b in qd.ndrange(
+            27 * rod_mpm_contact.samples_is_touching.shape[0],
+            rod_mpm_contact.samples_is_touching.shape[1],
+            axes=qd.static(eoa(rod_mpm_contact.samples_is_touching)),
         ):
+            i_s = i_so // 27
             if rod_mpm_contact.samples_is_touching[i_s, i_b]:
-                for i_o in range(27):
-                    is_owner, cell, dv = func_rod_mpm_node_sum(
-                        i_s,
-                        i_o,
-                        i_b,
-                        qd.Vector.zero(gs.qd_float, 3),
-                        rod_mpm_contact.samples_dv,
-                        mpm_state,
-                        rod_mpm_contact,
-                        mpm_info,
+                is_owner, cell, dv = func_rod_mpm_node_sum(
+                    i_s,
+                    i_so % 27,
+                    i_b,
+                    qd.Vector.zero(gs.qd_float, 3),
+                    rod_mpm_contact.samples_dv,
+                    mpm_state,
+                    rod_mpm_contact,
+                    mpm_info,
+                )
+                if is_owner and mpm_state.grid.mass[cell[0], cell[1], cell[2], i_b] > rod_info.EPS[None]:
+                    mpm_state.grid.vel_out[cell[0], cell[1], cell[2], i_b] = (
+                        mpm_state.grid.vel_out[cell[0], cell[1], cell[2], i_b] + dv
                     )
-                    if is_owner and mpm_state.grid.mass[cell[0], cell[1], cell[2], i_b] > rod_info.EPS[None]:
-                        mpm_state.grid.vel_out[cell[0], cell[1], cell[2], i_b] = (
-                            mpm_state.grid.vel_out[cell[0], cell[1], cell[2], i_b] + dv
-                        )
 
     for i_v, i_b in qd.ndrange(*rod_state.verts.vel.shape, axes=qd.static(eoa(rod_state.verts.vel))):
         rod_state.verts.vel[i_v, i_b] = (
