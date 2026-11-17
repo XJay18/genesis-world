@@ -18,9 +18,9 @@ from genesis.engine.state_change import StateChange, mutates
 from genesis.grad.bridge import no_grad, reversed_with
 from genesis.options.surfaces import Surface
 from genesis.utils.data import ENVS, Config, ConfigItem, Data, DataItem, DataKind, Size, eoa, field, iter_data
-from genesis.utils.geom import qd_transform_by_trans_quat
+from genesis.utils.geom import SpatialHashGrid, func_sort_particles_by_slot, hash_grid_sizes, qd_transform_by_trans_quat
 from genesis.utils.misc import broadcast_tensor, qd_from_torch, qd_isfinite, qd_to_torch, qd_zero_grad, tensor_to_array
-from genesis.utils.simt import ExactSums, func_exact_sum_add, func_exact_sum_take, requires_deterministic_accumulation
+from genesis.utils.simt import ExactSums, requires_deterministic_accumulation
 
 from .base_solver import ErrorCode, GravityMixin, Solver, TimeBasedMixin
 
@@ -118,6 +118,13 @@ class RodInfo(Data):
     # The pairs of edges tested for rod-rod contact when they all fit the capacity of the broadphase, the adjacent edges
     # of a rod left out
     edge_pairs_idx: qd.Tensor = field((int, 2), shape=(ROD_EDGE_PAIRS,), kind=DataKind.CONSTANT, labels=ROD_ALL_PAIRS)
+    # The pairs of that list each edge takes part in, for the contacts to gather them per edge in a fixed order (see
+    # 'RodConfig.is_deterministic'): those it starts from 'edges_pairs_start[i_e]' to 'edges_pairs_start[i_e + 1]', the
+    # list being sorted by first edge, and the indices of those it ends from 'edges_pairs_rev_start[i_e]' on in
+    # 'pairs_rev_idx', in increasing order
+    edges_pairs_start: qd.Tensor = field(int, shape=(ROD_EDGES + 1,), kind=DataKind.CONSTANT)
+    edges_pairs_rev_start: qd.Tensor = field(int, shape=(ROD_EDGES + 1,), kind=DataKind.CONSTANT)
+    pairs_rev_idx: qd.Tensor = field(int, shape=(ROD_EDGE_PAIRS,), kind=DataKind.CONSTANT)
     gravity: qd.Tensor = field((float, 3), shape=(ENVS,), kind=DataKind.INFO)
     substep_dt: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
     # The edges of a rod closer than this many edges do not collide (see 'RodOptions.adjacent_gap'), and the margin of
@@ -191,11 +198,6 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
     mpm_normal: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     mpm_inv_mass: qd.Tensor = field(float, kind=DataKind.SCRATCH, grad=True, opt_in=True)
     mpm_impulse: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
-    # The corrections of the rod-rod contacts and their friction, summed exactly over the contacts of each vertex, slot
-    # 3 i_v + k holding component k of vertex i_v, which 'dp_contact' and 'dv_friction' take once every contact added
-    # its term (see 'RodConfig.is_deterministic')
-    dp_contact_sums: ExactSums = field(kind=DataKind.SCRATCH)
-    dv_friction_sums: ExactSums = field(kind=DataKind.SCRATCH)
 
 
 class RodEdgesState(Data, kind=DataKind.STATE, shape=(ROD_EDGES, ENVS)):
@@ -219,6 +221,12 @@ class RodEdgesState(Data, kind=DataKind.STATE, shape=(ROD_EDGES, ENVS)):
     stretching_energy: qd.Tensor = field(float, kind=DataKind.DERIVED)
     d1_ref_next: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True)
     d2_ref_next: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True)
+    # The corrections, the number of contacts and the friction of the rod-rod contacts of the edge for its first and
+    # its second vertex, summed over the pairs of the edge in a fixed order, which the vertices add up (see
+    # 'RodConfig.is_deterministic')
+    dp_contact_ends: qd.Tensor = field((float, 3), shape=(ROD_EDGES, 2, ENVS), kind=DataKind.SCRATCH)
+    n_contacts_ends: qd.Tensor = field(int, shape=(ROD_EDGES, 2, ENVS), kind=DataKind.SCRATCH)
+    dv_friction_ends: qd.Tensor = field((float, 3), shape=(ROD_EDGES, 2, ENVS), kind=DataKind.SCRATCH)
 
 
 class RodHingesState(Data, kind=DataKind.STATE, shape=(ROD_HINGES, ENVS)):
@@ -273,6 +281,9 @@ class RodBroadphase(Data, kind=DataKind.SCRATCH):
     # The number of environments the loop over the pairs outside of the candidates runs over, zero until a vertex of any
     # environment moved past the margin, which spares that loop (see 'kernel_project_rod_contacts')
     n_envs_fallback: qd.Tensor = field(int, shape=(), labels=ROD_BROADPHASE)
+    # The candidates sorted by their second edge, a slot per edge, the candidates of an edge in increasing order, for the
+    # contacts to gather the pairs each edge ends (see 'RodConfig.is_deterministic')
+    pairs_rev: SpatialHashGrid = field(kind=DataKind.SCRATCH)
 
 
 # The most contacts with the rigid geoms a vertex of the rods takes, one per geom (see 'RodRigidContacts')
@@ -359,6 +370,7 @@ class RodData(Data):
 
     def __init__(self, solver):
         options = solver._options
+        is_deterministic = solver.rod_config.is_deterministic
         super().__init__(
             sizes=dict(
                 envs=solver.n_envs_,
@@ -369,16 +381,11 @@ class RodData(Data):
                 rod_edge_pairs=solver.n_edge_pair_candidates,
                 rod_bvh_nodes=2 * solver.n_bvh_leaves,
                 rod_rigid_links=solver.sim.rigid_solver.n_links,
+                # The weights of the contacts of each link, and the candidates of the broadphase sorted by second edge
+                exact_sum_slots=solver.sim.rigid_solver.n_links,
                 exact_sum_bins=3,
-                rod_state=dict(
-                    verts=dict(
-                        dp_contact_sums=dict(exact_sum_slots=3 * solver.n_verts),
-                        dv_friction_sums=dict(exact_sum_slots=3 * solver.n_verts),
-                    ),
-                    rigid_contacts=dict(
-                        links_contacts_weight_sums=dict(exact_sum_slots=solver.sim.rigid_solver.n_links)
-                    ),
-                ),
+                particles=solver.n_edge_pair_candidates,
+                **hash_grid_sizes(max(solver.n_edges, 1)),
             ),
             values=dict(
                 rod_info=dict(
@@ -396,11 +403,25 @@ class RodData(Data):
                 ROD_CONTACTS: solver.n_edge_pairs == 0,
                 ROD_BROADPHASE: not solver.has_broadphase,
                 ROD_ALL_PAIRS: solver.has_broadphase or solver.n_edge_pairs == 0,
-                # The exact sums of the contacts, which a scene without deterministic algorithms never reads
-                (RodData.rod_state.verts.dp_contact_sums, RodData.rod_state.verts.dv_friction_sums): not (
-                    solver.rod_config.is_deterministic and solver.n_edge_pairs > 0
-                ),
-                RodData.rod_state.rigid_contacts.links_contacts_weight_sums: not solver.rod_config.is_deterministic,
+                # The arrays of the sums of the contacts in a fixed order, which a scene without deterministic
+                # algorithms never reads
+                (
+                    RodData.rod_state.edges.dp_contact_ends,
+                    RodData.rod_state.edges.n_contacts_ends,
+                    RodData.rod_state.edges.dv_friction_ends,
+                ): not (is_deterministic and solver.n_edge_pairs > 0),
+                (
+                    RodData.rod_info.edges_pairs_start,
+                    RodData.rod_info.edges_pairs_rev_start,
+                    RodData.rod_info.pairs_rev_idx,
+                ): not (is_deterministic and solver.n_edge_pairs > 0 and not solver.has_broadphase),
+                RodData.rod_state.broadphase.pairs_rev: not (is_deterministic and solver.has_broadphase),
+                # The second edge of a candidate is its slot, so that the grid of the hash goes unread
+                (
+                    RodData.rod_state.broadphase.pairs_rev.cell_size,
+                    RodData.rod_state.broadphase.pairs_rev.grid_res,
+                ): True,
+                RodData.rod_state.rigid_contacts.links_contacts_weight_sums: not is_deterministic,
             },
             requires_grad=solver._requires_grad,
         )
@@ -421,7 +442,7 @@ class RodConfig(Config):
     # ROD_RIGID_CONTACTS_PER_VERT)
     n_rigid_contacts_per_vert: int
     # Whether the contacts sum their corrections and impulses in an order independent of the threads, with
-    # `use_deterministic_algorithms` (see 'dp_contact_sums' in RodVertsState and kernel_project_rod_contacts)
+    # `use_deterministic_algorithms` (see kernel_project_rod_contacts)
     is_deterministic: bool
 
 
@@ -439,42 +460,6 @@ def func_inverse_mass(i_v: int, i_b: int, rod_state: RodState, rod_info: RodInfo
     if func_is_free(i_v, i_b, rod_state):
         inv_mass = 1.0 / rod_info.verts.mass[i_v]
     return inv_mass
-
-
-@qd.func
-def func_take_verts_sums(i_v: int, i_b: int, exact_sums: ExactSums) -> qd.types.vector(3):
-    """Return the vector a vertex of the rods summed exactly in its three slots of exact sums, emptying them."""
-    value = qd.Vector.zero(gs.qd_float, 3)
-    # A runtime loop over the components keeps a single inlined copy of the bin reads
-    for k in range(3):
-        value[k] = func_exact_sum_take(3 * i_v + k, i_b, exact_sums)
-    return value
-
-
-@qd.func
-def func_add_edge_pair_sums(
-    i_b: int,
-    verts_idx: qd.types.vector(4, dtype=qd.i32),
-    impulse: qd.types.vector(3),
-    weights: qd.types.vector(4),
-    inv_masses: qd.types.vector(4),
-    exact_sums: ExactSums,
-):
-    """Add the moves of the four vertices of a pair of edges in contact to their slots of exact sums.
-
-    Each vertex moves by its inverse mass times its weight in its closest point times the impulse, the vertices of the
-    second edge by the opposite impulse. A vertex that does not move, of zero inverse mass or weight, adds nothing,
-    which leaves its slots empty where it takes part in no contact (see 'n_contacts' in RodVertsState).
-    """
-    # A runtime loop over the vertices and components keeps a single inlined copy of the bin updates
-    for i_t in range(12):
-        i_c_v = i_t // 3
-        i_v = verts_idx[i_c_v]
-        sign = qd.select(i_c_v < 2, 1.0, -1.0)
-        if inv_masses[i_c_v] * weights[i_c_v] > 0.0:
-            func_exact_sum_add(
-                3 * i_v + i_t % 3, i_b, sign * inv_masses[i_c_v] * weights[i_c_v] * impulse[i_t % 3], exact_sums
-            )
 
 
 @qd.func
@@ -879,7 +864,9 @@ def func_query_rod_bvh(
 
 @no_grad
 @qd.kernel(fastcache=True)
-def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo, errno: qd.Tensor):
+def kernel_update_rod_contact_candidates(
+    rod_state: RodState, rod_info: RodInfo, rod_config: qd.template(), errno: qd.Tensor
+):
     """Find the candidate pairs of edges of the rod-rod contacts of the substep, once the positions are integrated.
 
     The bounding boxes of the edges, grown by their radius and half of the margin, are the leaves of a hierarchy over
@@ -945,26 +932,23 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
         i_start = rod_state.broadphase.edges_candidates_start[i_e, i_b]
         func_query_rod_bvh(i_e, i_b, i_start, rod_state, rod_info, is_filling=True)
 
+    # The candidates sorted by their second edge, for the contacts to gather them per edge (see 'pairs_rev')
+    if qd.static(rod_config.is_deterministic):
+        for i_c, i_b in qd.ndrange(*rod_state.broadphase.pairs_rev.particles_slot.shape):
+            i_slot = -1
+            if i_c < rod_state.broadphase.n_candidates[i_b]:
+                i_slot = rod_state.edge_pairs.edges_idx[i_c, i_b][1]
+            rod_state.broadphase.pairs_rev.particles_slot[i_c, i_b] = i_slot
+        func_sort_particles_by_slot(rod_state.broadphase.pairs_rev)
+
 
 @qd.func
-def func_project_rod_edge_pair(
-    i_e_a: int,
-    i_e_b: int,
-    i_c: int,
-    i_iter: int,
-    i_b: int,
-    rod_state: RodState,
-    rod_info: RodInfo,
-    is_exact: qd.template(),
-):
-    """Compute the correction of a pair of edges whose capsules overlap, at the current positions.
+def func_rod_edge_pair_contact(i_e_a: int, i_e_b: int, i_b: int, rod_state: RodState, rod_info: RodInfo):
+    """Return the contact of a pair of edges at the current positions: the penetration of their capsules, the normal
+    from the second edge to the first, and the weights of the four vertices in the closest points and their inverse
+    masses, the first edge first.
 
-    The two edges are pushed apart along the line joining their closest points, each of the four vertices moving in
-    proportion to its inverse mass and to its weight in its closest point, and averaging the moves of the contacts it
-    takes part in. 'i_c' is the slot of the pair in the list of candidates, -1 for a pair outside of it. The first
-    projection of a substep records the normal and the penetration of the pairs of the list, from which the friction of
-    the substep follows. With `is_exact`, the corrections add to the exact sums of the vertices ('dp_contact_sums'),
-    and to 'dp_contact' directly otherwise.
+    The penetration is negative where the capsules are apart, and where no vertex owning the contact moves.
     """
     i_v_a1, i_v_a2 = rod_info.edges.verts_idx[i_e_a]
     i_v_b1, i_v_b2 = rod_info.edges.verts_idx[i_e_b]
@@ -999,6 +983,26 @@ def func_project_rod_edge_pair(
     )
     if inv_mass_owner_a + inv_mass_owner_b <= 0.0:
         penetration = gs.qd_float(-1.0)
+    weights = qd.Vector([1.0 - t, t, 1.0 - u, u], dt=gs.qd_float)
+    inv_masses = qd.Vector([inv_mass_a1, inv_mass_a2, inv_mass_b1, inv_mass_b2], dt=gs.qd_float)
+    return penetration, normal, weights, inv_masses
+
+
+@qd.func
+def func_project_rod_edge_pair(
+    i_e_a: int, i_e_b: int, i_c: int, i_iter: int, i_b: int, rod_state: RodState, rod_info: RodInfo
+):
+    """Compute the correction of a pair of edges whose capsules overlap, at the current positions.
+
+    The two edges are pushed apart along the line joining their closest points, each of the four vertices moving in
+    proportion to its inverse mass and to its weight in its closest point, and averaging the moves of the contacts it
+    takes part in. 'i_c' is the slot of the pair in the list of candidates, -1 for a pair outside of it. The first
+    projection of a substep records the normal and the penetration of the pairs of the list, from which the friction of
+    the substep follows.
+    """
+    i_v_a1, i_v_a2 = rod_info.edges.verts_idx[i_e_a]
+    i_v_b1, i_v_b2 = rod_info.edges.verts_idx[i_e_b]
+    penetration, normal, weights, inv_masses = func_rod_edge_pair_contact(i_e_a, i_e_b, i_b, rod_state, rod_info)
     # The normal of a pair is read by the friction only where it penetrates (see 'kernel_finalize_rod_positions')
     if i_iter == 0 and i_c >= 0:
         rod_state.edge_pairs.penetration[i_c, i_b] = penetration
@@ -1006,24 +1010,86 @@ def func_project_rod_edge_pair(
             rod_state.edge_pairs.normal[i_c, i_b] = normal
     if penetration > 0.0:
         verts_idx = qd.Vector([i_v_a1, i_v_a2, i_v_b1, i_v_b2], dt=gs.qd_int)
-        weights = qd.Vector([1.0 - t, t, 1.0 - u, u], dt=gs.qd_float)
-        inv_masses = qd.Vector([inv_mass_a1, inv_mass_a2, inv_mass_b1, inv_mass_b2], dt=gs.qd_float)
         inv_mass_eff = (weights * weights).dot(inv_masses)
         if inv_mass_eff > rod_info.EPS[None]:
             impulse = penetration / inv_mass_eff * normal
-            if qd.static(is_exact):
-                func_add_edge_pair_sums(i_b, verts_idx, impulse, weights, inv_masses, rod_state.verts.dp_contact_sums)
-            else:
-                qd.atomic_add(rod_state.verts.dp_contact[i_v_a1, i_b], inv_masses[0] * weights[0] * impulse)
-                qd.atomic_add(rod_state.verts.dp_contact[i_v_a2, i_b], inv_masses[1] * weights[1] * impulse)
-                qd.atomic_sub(rod_state.verts.dp_contact[i_v_b1, i_b], inv_masses[2] * weights[2] * impulse)
-                qd.atomic_sub(rod_state.verts.dp_contact[i_v_b2, i_b], inv_masses[3] * weights[3] * impulse)
+            qd.atomic_add(rod_state.verts.dp_contact[i_v_a1, i_b], inv_masses[0] * weights[0] * impulse)
+            qd.atomic_add(rod_state.verts.dp_contact[i_v_a2, i_b], inv_masses[1] * weights[1] * impulse)
+            qd.atomic_sub(rod_state.verts.dp_contact[i_v_b1, i_b], inv_masses[2] * weights[2] * impulse)
+            qd.atomic_sub(rod_state.verts.dp_contact[i_v_b2, i_b], inv_masses[3] * weights[3] * impulse)
             # Each vertex averages the corrections of its contacts (see 'func_last_projection_correction'), so that the
             # contacts sharing it do not push it further than each asks
             for i_c_v in qd.static(range(4)):
                 if inv_masses[i_c_v] * weights[i_c_v] > 0.0:
                     i_v_c = verts_idx[i_c_v]
                     qd.atomic_add(rod_state.verts.n_contacts[i_v_c, i_b], 1)
+
+
+@qd.func
+def func_rod_edge_partners(i_e: int, i_b: int, rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
+    """Return the pairs of edges an edge takes part in: the first slot and the number of the pairs it starts in the list
+    of the pairs, then the first entry and the number of the entries of the list of the pairs it ends (see
+    'edges_pairs_start' in RodInfo and 'pairs_rev' in RodBroadphase)."""
+    i_c_start, n_starts, i_r_start, n_ends = 0, 0, 0, 0
+    if qd.static(rod_config.has_broadphase):
+        i_c_start = rod_state.broadphase.edges_candidates_start[i_e, i_b]
+        # The candidates past the capacity are left out (see OVERFLOW_ROD_CANDIDATES)
+        n_starts = qd.max(
+            qd.min(
+                rod_state.broadphase.edges_n_candidates[i_e, i_b],
+                rod_state.edge_pairs.penetration.shape[0] - i_c_start,
+            ),
+            0,
+        )
+        i_r_start = rod_state.broadphase.pairs_rev.slot_start[i_e, i_b]
+        n_ends = rod_state.broadphase.pairs_rev.slot_size[i_e, i_b]
+    else:
+        i_c_start = rod_info.edges_pairs_start[i_e]
+        n_starts = rod_info.edges_pairs_start[i_e + 1] - i_c_start
+        i_r_start = rod_info.edges_pairs_rev_start[i_e]
+        n_ends = rod_info.edges_pairs_rev_start[i_e + 1] - i_r_start
+    return i_c_start, n_starts, i_r_start, n_ends
+
+
+@qd.func
+def func_rod_edge_partner(
+    k: int,
+    i_c_start: int,
+    n_starts: int,
+    i_r_start: int,
+    i_b: int,
+    rod_state: RodState,
+    rod_info: RodInfo,
+    rod_config: qd.template(),
+):
+    """Return the slot of the pair 'k' of an edge in the list of the pairs and its two edges, the pairs it starts
+    coming first (see func_rod_edge_partners)."""
+    i_c = i_c_start + k
+    if k >= n_starts:
+        i_r = i_r_start + k - n_starts
+        if qd.static(rod_config.has_broadphase):
+            i_c = rod_state.broadphase.pairs_rev.particles_idx[i_r, i_b]
+        else:
+            i_c = rod_info.pairs_rev_idx[i_r]
+    i_e_a, i_e_b = -1, -1
+    if qd.static(rod_config.has_broadphase):
+        i_e_a, i_e_b = rod_state.edge_pairs.edges_idx[i_c, i_b]
+    else:
+        i_e_a, i_e_b = rod_info.edge_pairs_idx[i_c]
+    return i_c, i_e_a, i_e_b
+
+
+@qd.func
+def func_rod_edge_pair_ends(
+    is_first: bool, weights: qd.types.vector(4), inv_masses: qd.types.vector(4), impulse: qd.types.vector(3)
+):
+    """Return the moves of the first and the second vertex of one edge of a pair of edges by the impulse of the pair,
+    and whether each of them moves, the vertices of the first edge taking the impulse and those of the second edge its
+    opposite (see func_project_rod_edge_pair)."""
+    sign = qd.select(is_first, 1.0, -1.0)
+    coef_start = qd.select(is_first, inv_masses[0] * weights[0], inv_masses[2] * weights[2])
+    coef_end = qd.select(is_first, inv_masses[1] * weights[1], inv_masses[3] * weights[3])
+    return sign * coef_start * impulse, sign * coef_end * impulse, coef_start > 0.0, coef_end > 0.0
 
 
 @reversed_with(is_backward=True)
@@ -1038,11 +1104,12 @@ def kernel_project_rod_contacts(
     then also tests all those pairs. Without one, every pair of edges that can collide is tested.
 
     The pairs sharing a vertex add their corrections up through atomics, whose order varies across threads. With
-    `is_deterministic` (see RodConfig), they add to exact sums instead, which the vertices then take, whatever the
-    order. The variant autodiff reverses (`is_backward`) adds through atomics, the reversal of an atomic sum reading
-    the adjoint of each term in its own thread.
+    `is_deterministic` (see RodConfig), each edge sums instead the corrections of its two vertices over its pairs, in
+    the order of the list of the pairs (see func_rod_edge_partners), each pair being computed by both its edges, and
+    each vertex adds up its two edges. The variant autodiff reverses (`is_backward`) adds through atomics, the reversal
+    of an atomic sum reading the adjoint of each term in its own thread.
     """
-    IS_EXACT = qd.static(rod_config.is_deterministic and not is_backward)
+    IS_GATHER = qd.static(rod_config.is_deterministic and not is_backward)
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
         pos = rod_state.verts.pos[i_v, i_b] + rod_state.verts.dp_inextensibility[i_v, i_b]
         rod_state.verts.pos[i_v, i_b] = pos
@@ -1054,44 +1121,167 @@ def kernel_project_rod_contacts(
                 rod_state.broadphase.is_stale[i_b] = True
                 rod_state.broadphase.n_envs_fallback[None] = rod_state.verts.pos.shape[1]
 
-    for i_c, i_b in qd.ndrange(
-        *rod_state.edge_pairs.penetration.shape, axes=qd.static(eoa(rod_state.edge_pairs.penetration))
-    ):
-        if qd.static(rod_config.has_broadphase):
-            if i_c < rod_state.broadphase.n_candidates[i_b]:
-                i_e_a, i_e_b = rod_state.edge_pairs.edges_idx[i_c, i_b]
-                func_project_rod_edge_pair(i_e_a, i_e_b, i_c, i_iter, i_b, rod_state, rod_info, is_exact=IS_EXACT)
-        else:
-            i_e_a, i_e_b = rod_info.edge_pairs_idx[i_c]
-            func_project_rod_edge_pair(i_e_a, i_e_b, i_c, i_iter, i_b, rod_state, rod_info, is_exact=IS_EXACT)
+    if qd.static(IS_GATHER):
+        for i_e, i_b in qd.ndrange(*rod_state.edges.theta.shape, axes=qd.static(eoa(rod_state.edges.theta))):
+            dp_start, dp_end = qd.Vector.zero(gs.qd_float, 3), qd.Vector.zero(gs.qd_float, 3)
+            n_start, n_end = 0, 0
+            i_c_start, n_starts, i_r_start, n_ends = func_rod_edge_partners(i_e, i_b, rod_state, rod_info, rod_config)
+            for k in range(n_starts + n_ends):
+                i_c, i_e_a, i_e_b = func_rod_edge_partner(
+                    k, i_c_start, n_starts, i_r_start, i_b, rod_state, rod_info, rod_config
+                )
+                penetration, normal, weights, inv_masses = func_rod_edge_pair_contact(
+                    i_e_a, i_e_b, i_b, rod_state, rod_info
+                )
+                # The edge starting the pair records it (see func_project_rod_edge_pair)
+                if i_iter == 0 and k < n_starts:
+                    rod_state.edge_pairs.penetration[i_c, i_b] = penetration
+                    if penetration > 0.0:
+                        rod_state.edge_pairs.normal[i_c, i_b] = normal
+                if penetration > 0.0:
+                    inv_mass_eff = (weights * weights).dot(inv_masses)
+                    if inv_mass_eff > rod_info.EPS[None]:
+                        dp_s, dp_e, is_start_moved, is_end_moved = func_rod_edge_pair_ends(
+                            k < n_starts, weights, inv_masses, penetration / inv_mass_eff * normal
+                        )
+                        dp_start, dp_end = dp_start + dp_s, dp_end + dp_e
+                        n_start, n_end = (
+                            n_start + qd.select(is_start_moved, 1, 0),
+                            n_end + qd.select(is_end_moved, 1, 0),
+                        )
+            rod_state.edges.dp_contact_ends[i_e, 0, i_b] = dp_start
+            rod_state.edges.dp_contact_ends[i_e, 1, i_b] = dp_end
+            rod_state.edges.n_contacts_ends[i_e, 0, i_b] = n_start
+            rod_state.edges.n_contacts_ends[i_e, 1, i_b] = n_end
+    else:
+        for i_c, i_b in qd.ndrange(
+            *rod_state.edge_pairs.penetration.shape, axes=qd.static(eoa(rod_state.edge_pairs.penetration))
+        ):
+            if qd.static(rod_config.has_broadphase):
+                if i_c < rod_state.broadphase.n_candidates[i_b]:
+                    i_e_a, i_e_b = rod_state.edge_pairs.edges_idx[i_c, i_b]
+                    func_project_rod_edge_pair(i_e_a, i_e_b, i_c, i_iter, i_b, rod_state, rod_info)
+            else:
+                i_e_a, i_e_b = rod_info.edge_pairs_idx[i_c]
+                func_project_rod_edge_pair(i_e_a, i_e_b, i_c, i_iter, i_b, rod_state, rod_info)
 
     # An environment with a vertex past the margin also tests the pairs outside of the candidates, two leaf boxes that
     # overlap at the broadphase having made the pair a candidate. The loop runs over no environment until then.
     # FIXME: quadrants - the adjoint of the narrowphase is wrong where this loop is nested in the loop of the candidates,
     # so that the pairs take a task of their own, at the cost of a kernel task per projection.
     if qd.static(rod_config.has_broadphase):
-        for i_b, i_e_a, i_e_b in qd.ndrange(
-            rod_state.broadphase.n_envs_fallback[None], rod_state.edges.theta.shape[0], rod_state.edges.theta.shape[0]
-        ):
-            if rod_state.broadphase.is_stale[i_b] and i_e_a < i_e_b:
-                if func_is_rod_edge_pair_valid(i_e_a, i_e_b, rod_info):
-                    if not func_is_rod_broadphase_overlap(i_e_a, i_e_b, i_b, rod_state, rod_info):
-                        func_project_rod_edge_pair(
-                            i_e_a,
-                            i_e_b,
-                            i_c=-1,
-                            i_iter=i_iter,
-                            i_b=i_b,
-                            rod_state=rod_state,
-                            rod_info=rod_info,
-                            is_exact=IS_EXACT,
-                        )
+        if qd.static(IS_GATHER):
+            # Each edge of an environment goes through the other edges in increasing order (see above)
+            for i_b, i_e in qd.ndrange(rod_state.broadphase.n_envs_fallback[None], rod_state.edges.theta.shape[0]):
+                if rod_state.broadphase.is_stale[i_b]:
+                    dp_start = rod_state.edges.dp_contact_ends[i_e, 0, i_b]
+                    dp_end = rod_state.edges.dp_contact_ends[i_e, 1, i_b]
+                    n_start = rod_state.edges.n_contacts_ends[i_e, 0, i_b]
+                    n_end = rod_state.edges.n_contacts_ends[i_e, 1, i_b]
+                    for i_e_x in range(rod_state.edges.theta.shape[0]):
+                        i_e_a, i_e_b = qd.min(i_e, i_e_x), qd.max(i_e, i_e_x)
+                        if i_e_a < i_e_b and func_is_rod_edge_pair_valid(i_e_a, i_e_b, rod_info):
+                            if not func_is_rod_broadphase_overlap(i_e_a, i_e_b, i_b, rod_state, rod_info):
+                                penetration, normal, weights, inv_masses = func_rod_edge_pair_contact(
+                                    i_e_a, i_e_b, i_b, rod_state, rod_info
+                                )
+                                if penetration > 0.0:
+                                    inv_mass_eff = (weights * weights).dot(inv_masses)
+                                    if inv_mass_eff > rod_info.EPS[None]:
+                                        dp_s, dp_e, is_start_moved, is_end_moved = func_rod_edge_pair_ends(
+                                            i_e == i_e_a, weights, inv_masses, penetration / inv_mass_eff * normal
+                                        )
+                                        dp_start, dp_end = dp_start + dp_s, dp_end + dp_e
+                                        n_start = n_start + qd.select(is_start_moved, 1, 0)
+                                        n_end = n_end + qd.select(is_end_moved, 1, 0)
+                    rod_state.edges.dp_contact_ends[i_e, 0, i_b] = dp_start
+                    rod_state.edges.dp_contact_ends[i_e, 1, i_b] = dp_end
+                    rod_state.edges.n_contacts_ends[i_e, 0, i_b] = n_start
+                    rod_state.edges.n_contacts_ends[i_e, 1, i_b] = n_end
+        else:
+            for i_b, i_e_a, i_e_b in qd.ndrange(
+                rod_state.broadphase.n_envs_fallback[None],
+                rod_state.edges.theta.shape[0],
+                rod_state.edges.theta.shape[0],
+            ):
+                if rod_state.broadphase.is_stale[i_b] and i_e_a < i_e_b:
+                    if func_is_rod_edge_pair_valid(i_e_a, i_e_b, rod_info):
+                        if not func_is_rod_broadphase_overlap(i_e_a, i_e_b, i_b, rod_state, rod_info):
+                            func_project_rod_edge_pair(
+                                i_e_a, i_e_b, i_c=-1, i_iter=i_iter, i_b=i_b, rod_state=rod_state, rod_info=rod_info
+                            )
 
-    # A vertex moved by no contact holds empty sums and keeps its zero correction (see func_add_edge_pair_sums)
-    if qd.static(IS_EXACT):
+    # Each vertex adds up the sums of the edge it ends and of the edge it starts
+    if qd.static(IS_GATHER):
         for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
-            if rod_state.verts.n_contacts[i_v, i_b] > 0:
-                rod_state.verts.dp_contact[i_v, i_b] = func_take_verts_sums(i_v, i_b, rod_state.verts.dp_contact_sums)
+            dp = qd.Vector.zero(gs.qd_float, 3)
+            n_contacts = 0
+            for i_slot in qd.static(range(2)):
+                i_e = rod_info.verts.edges_idx[i_v][i_slot]
+                if i_e >= 0:
+                    dp = dp + rod_state.edges.dp_contact_ends[i_e, 1 - i_slot, i_b]
+                    n_contacts = n_contacts + rod_state.edges.n_contacts_ends[i_e, 1 - i_slot, i_b]
+            rod_state.verts.dp_contact[i_v, i_b] = dp
+            rod_state.verts.n_contacts[i_v, i_b] = n_contacts
+
+
+@qd.func
+def func_rod_edge_pair_friction(i_c: int, i_e_a: int, i_e_b: int, i_b: int, rod_state: RodState, rod_info: RodInfo):
+    """Return whether the friction of a pair of edges in contact acts, its impulse on the first edge, and the weights of
+    the four vertices in the closest points and their inverse masses, the first edge first.
+
+    'i_c' is the slot of the pair in the list of the pairs, which recorded its normal and penetration at the first
+    projection of the substep (see func_project_rod_edge_pair).
+    """
+    i_v_a1, i_v_a2 = rod_info.edges.verts_idx[i_e_a]
+    i_v_b1, i_v_b2 = rod_info.edges.verts_idx[i_e_b]
+    penetration = rod_state.edge_pairs.penetration[i_c, i_b]
+    t, u = func_closest_points_of_edges(
+        rod_state.verts.pos[i_v_a1, i_b],
+        rod_state.verts.pos[i_v_a2, i_b],
+        rod_state.verts.pos[i_v_b1, i_b],
+        rod_state.verts.pos[i_v_b2, i_b],
+        rod_info.EPS[None],
+    )
+    vel_a = (1.0 - t) * rod_state.verts.vel[i_v_a1, i_b] + t * rod_state.verts.vel[i_v_a2, i_b]
+    vel_b = (1.0 - u) * rod_state.verts.vel[i_v_b1, i_b] + u * rod_state.verts.vel[i_v_b2, i_b]
+    vel_rel = vel_a - vel_b
+    normal = rod_state.edge_pairs.normal[i_c, i_b]
+    vel_tangent = vel_rel - vel_rel.dot(normal) * normal
+    vel_tangent_norm = vel_tangent.norm()
+
+    weights = qd.Vector([1.0 - t, t, 1.0 - u, u], dt=gs.qd_float)
+    inv_masses = qd.Vector(
+        [
+            func_inverse_mass(i_v_a1, i_b, rod_state, rod_info),
+            func_inverse_mass(i_v_a2, i_b, rod_state, rod_info),
+            func_inverse_mass(i_v_b1, i_b, rod_state, rod_info),
+            func_inverse_mass(i_v_b2, i_b, rod_state, rod_info),
+        ],
+        dt=gs.qd_float,
+    )
+    inv_mass_eff = (weights * weights).dot(inv_masses)
+    is_active = inv_mass_eff > rod_info.EPS[None]
+    impulse = qd.Vector.zero(gs.qd_float, 3)
+    if is_active:
+        vel_normal = penetration / rod_info.substep_dt[None]
+        mu_s = 0.25 * (
+            rod_info.verts.mu_s[i_v_a1]
+            + rod_info.verts.mu_s[i_v_a2]
+            + rod_info.verts.mu_s[i_v_b1]
+            + rod_info.verts.mu_s[i_v_b2]
+        )
+        mu_k = 0.25 * (
+            rod_info.verts.mu_k[i_v_a1]
+            + rod_info.verts.mu_k[i_v_a2]
+            + rod_info.verts.mu_k[i_v_b1]
+            + rod_info.verts.mu_k[i_v_b2]
+        )
+        dv_tangent = -vel_tangent
+        if vel_tangent_norm >= mu_s * vel_normal:
+            dv_tangent = -mu_k * vel_normal / qd.max(vel_tangent_norm, rod_info.EPS[None]) * vel_tangent
+        impulse = dv_tangent / inv_mass_eff
+    return is_active, impulse, weights, inv_masses
 
 
 @reversed_with(is_backward=True)
@@ -1110,7 +1300,7 @@ def kernel_finalize_rod_positions(
     'LegacyCoupler.project_rod_rigid_contacts'), the last one of the rods otherwise. The friction of the pairs sharing a
     vertex adds up as their corrections do (see kernel_project_rod_contacts).
     """
-    IS_EXACT = qd.static(rod_config.is_deterministic and not is_backward)
+    IS_GATHER = qd.static(rod_config.is_deterministic and not is_backward)
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
         dp = qd.Vector.zero(gs.qd_float, 3)
         if qd.static(rod_config.has_rigid_contacts):
@@ -1148,77 +1338,59 @@ def kernel_finalize_rod_positions(
             rod_state.verts.dv_friction[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
         # Coulomb friction cancels the tangential relative velocity of the closest points of two edges in contact, up
-        # to the bound the penetration recovered over the substep sets
-        for i_c, i_b in qd.ndrange(
-            *rod_state.edge_pairs.penetration.shape, axes=qd.static(eoa(rod_state.edge_pairs.penetration))
-        ):
-            penetration = rod_state.edge_pairs.penetration[i_c, i_b]
-            i_e_a, i_e_b = -1, -1
-            if qd.static(rod_config.has_broadphase):
-                if i_c < rod_state.broadphase.n_candidates[i_b]:
-                    i_e_a, i_e_b = rod_state.edge_pairs.edges_idx[i_c, i_b]
-            else:
-                i_e_a, i_e_b = rod_info.edge_pairs_idx[i_c]
-            if i_e_a >= 0 and penetration > 0.0:
-                i_v_a1, i_v_a2 = rod_info.edges.verts_idx[i_e_a]
-                i_v_b1, i_v_b2 = rod_info.edges.verts_idx[i_e_b]
-                t, u = func_closest_points_of_edges(
-                    rod_state.verts.pos[i_v_a1, i_b],
-                    rod_state.verts.pos[i_v_a2, i_b],
-                    rod_state.verts.pos[i_v_b1, i_b],
-                    rod_state.verts.pos[i_v_b2, i_b],
-                    rod_info.EPS[None],
+        # to the bound the penetration recovered over the substep sets. The pairs sharing a vertex add their friction up
+        # as their corrections do (see kernel_project_rod_contacts)
+        if qd.static(IS_GATHER):
+            for i_e, i_b in qd.ndrange(*rod_state.edges.theta.shape, axes=qd.static(eoa(rod_state.edges.theta))):
+                dv_start, dv_end = qd.Vector.zero(gs.qd_float, 3), qd.Vector.zero(gs.qd_float, 3)
+                i_c_start, n_starts, i_r_start, n_ends = func_rod_edge_partners(
+                    i_e, i_b, rod_state, rod_info, rod_config
                 )
-                vel_a = (1.0 - t) * rod_state.verts.vel[i_v_a1, i_b] + t * rod_state.verts.vel[i_v_a2, i_b]
-                vel_b = (1.0 - u) * rod_state.verts.vel[i_v_b1, i_b] + u * rod_state.verts.vel[i_v_b2, i_b]
-                vel_rel = vel_a - vel_b
-                normal = rod_state.edge_pairs.normal[i_c, i_b]
-                vel_tangent = vel_rel - vel_rel.dot(normal) * normal
-                vel_tangent_norm = vel_tangent.norm()
-
-                weights = qd.Vector([1.0 - t, t, 1.0 - u, u], dt=gs.qd_float)
-                inv_masses = qd.Vector(
-                    [
-                        func_inverse_mass(i_v_a1, i_b, rod_state, rod_info),
-                        func_inverse_mass(i_v_a2, i_b, rod_state, rod_info),
-                        func_inverse_mass(i_v_b1, i_b, rod_state, rod_info),
-                        func_inverse_mass(i_v_b2, i_b, rod_state, rod_info),
-                    ],
-                    dt=gs.qd_float,
-                )
-                inv_mass_eff = (weights * weights).dot(inv_masses)
-                if inv_mass_eff > rod_info.EPS[None]:
-                    vel_normal = penetration / rod_info.substep_dt[None]
-                    mu_s = 0.25 * (
-                        rod_info.verts.mu_s[i_v_a1]
-                        + rod_info.verts.mu_s[i_v_a2]
-                        + rod_info.verts.mu_s[i_v_b1]
-                        + rod_info.verts.mu_s[i_v_b2]
+                for k in range(n_starts + n_ends):
+                    i_c, i_e_a, i_e_b = func_rod_edge_partner(
+                        k, i_c_start, n_starts, i_r_start, i_b, rod_state, rod_info, rod_config
                     )
-                    mu_k = 0.25 * (
-                        rod_info.verts.mu_k[i_v_a1]
-                        + rod_info.verts.mu_k[i_v_a2]
-                        + rod_info.verts.mu_k[i_v_b1]
-                        + rod_info.verts.mu_k[i_v_b2]
-                    )
-                    dv_tangent = -vel_tangent
-                    if vel_tangent_norm >= mu_s * vel_normal:
-                        dv_tangent = -mu_k * vel_normal / qd.max(vel_tangent_norm, rod_info.EPS[None]) * vel_tangent
-                    impulse = dv_tangent / inv_mass_eff
-                    if qd.static(IS_EXACT):
-                        verts_idx = qd.Vector([i_v_a1, i_v_a2, i_v_b1, i_v_b2], dt=gs.qd_int)
-                        func_add_edge_pair_sums(
-                            i_b, verts_idx, impulse, weights, inv_masses, rod_state.verts.dv_friction_sums
+                    if rod_state.edge_pairs.penetration[i_c, i_b] > 0.0:
+                        is_active, impulse, weights, inv_masses = func_rod_edge_pair_friction(
+                            i_c, i_e_a, i_e_b, i_b, rod_state, rod_info
                         )
-                    else:
+                        if is_active:
+                            dv_s, dv_e, is_start_moved, is_end_moved = func_rod_edge_pair_ends(
+                                k < n_starts, weights, inv_masses, impulse
+                            )
+                            dv_start, dv_end = dv_start + dv_s, dv_end + dv_e
+                rod_state.edges.dv_friction_ends[i_e, 0, i_b] = dv_start
+                rod_state.edges.dv_friction_ends[i_e, 1, i_b] = dv_end
+
+            for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
+                dv = qd.Vector.zero(gs.qd_float, 3)
+                for i_slot in qd.static(range(2)):
+                    i_e = rod_info.verts.edges_idx[i_v][i_slot]
+                    if i_e >= 0:
+                        dv = dv + rod_state.edges.dv_friction_ends[i_e, 1 - i_slot, i_b]
+                rod_state.verts.dv_friction[i_v, i_b] = dv
+        else:
+            for i_c, i_b in qd.ndrange(
+                *rod_state.edge_pairs.penetration.shape, axes=qd.static(eoa(rod_state.edge_pairs.penetration))
+            ):
+                penetration = rod_state.edge_pairs.penetration[i_c, i_b]
+                i_e_a, i_e_b = -1, -1
+                if qd.static(rod_config.has_broadphase):
+                    if i_c < rod_state.broadphase.n_candidates[i_b]:
+                        i_e_a, i_e_b = rod_state.edge_pairs.edges_idx[i_c, i_b]
+                else:
+                    i_e_a, i_e_b = rod_info.edge_pairs_idx[i_c]
+                if i_e_a >= 0 and penetration > 0.0:
+                    is_active, impulse, weights, inv_masses = func_rod_edge_pair_friction(
+                        i_c, i_e_a, i_e_b, i_b, rod_state, rod_info
+                    )
+                    if is_active:
+                        i_v_a1, i_v_a2 = rod_info.edges.verts_idx[i_e_a]
+                        i_v_b1, i_v_b2 = rod_info.edges.verts_idx[i_e_b]
                         qd.atomic_add(rod_state.verts.dv_friction[i_v_a1, i_b], inv_masses[0] * weights[0] * impulse)
                         qd.atomic_add(rod_state.verts.dv_friction[i_v_a2, i_b], inv_masses[1] * weights[1] * impulse)
                         qd.atomic_sub(rod_state.verts.dv_friction[i_v_b1, i_b], inv_masses[2] * weights[2] * impulse)
                         qd.atomic_sub(rod_state.verts.dv_friction[i_v_b2, i_b], inv_masses[3] * weights[3] * impulse)
-
-        if qd.static(IS_EXACT):
-            for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
-                rod_state.verts.dv_friction[i_v, i_b] = func_take_verts_sums(i_v, i_b, rod_state.verts.dv_friction_sums)
 
 
 @qd.kernel(fastcache=True)
@@ -1474,19 +1646,12 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         if self.is_active:
             self._init_rod_data(edge_pairs_idx)
             self._build_gravity(self.rod_info.gravity)
-        if self.rod_config.is_deterministic:
-            # Units from 2^-64 up to 1, 2^32 apart (see ExactSums), in m for the corrections, in m/s for the friction,
-            # and for the weights of the contacts, which lie in [0, 1]. A term is at most a few times the penetration
-            # of a contact (a few radii) or its relative velocity, far below 2^31 times the top unit, and the lowest
-            # unit lies below half the spacing of the floating-point positions beyond a millimeter
-            bins_unit = 2.0 ** np.array([-64.0, -32.0, 0.0], dtype=gs.np_float)
-            exact_sums = []
-            if self.rod_config.has_edge_pairs:
-                exact_sums += [self.rod_state.verts.dp_contact_sums, self.rod_state.verts.dv_friction_sums]
-            if self.rod_config.has_rigid_contacts:
-                exact_sums.append(self.rod_state.rigid_contacts.links_contacts_weight_sums)
-            for sums in exact_sums:
-                sums.bins_unit.from_numpy(bins_unit)
+        if self.rod_config.is_deterministic and self.rod_config.has_rigid_contacts:
+            # Units from 2^-64 up to 1, 2^32 apart (see ExactSums): a weight lies in [0, 1] and a link sums at most four
+            # per vertex, far below 2^31, and the lowest unit resolves every weight above 2^-12 exactly
+            self.rod_state.rigid_contacts.links_contacts_weight_sums.bins_unit.from_numpy(
+                2.0 ** np.array([-64.0, -32.0, 0.0], dtype=gs.np_float)
+            )
         for entity in self._entities:
             entity._build()
 
@@ -1638,6 +1803,16 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             qd_from_torch(array, tensor)
         if not self._has_broadphase and self._n_edge_pairs > 0:
             qd_from_torch(info.edge_pairs_idx, torch.as_tensor(edge_pairs_idx, dtype=gs.tc_int, device=gs.device))
+            if self.rod_config.is_deterministic:
+                # The list is sorted by first edge, and a stable sort by second edge keeps the pairs of an edge in order
+                edges_bound = np.arange(self.n_edges + 1)
+                pairs_rev_idx = np.argsort(edge_pairs_idx[:, 1], kind="stable")
+                for array, value in (
+                    (info.edges_pairs_start, np.searchsorted(edge_pairs_idx[:, 0], edges_bound)),
+                    (info.edges_pairs_rev_start, np.searchsorted(edge_pairs_idx[pairs_rev_idx, 1], edges_bound)),
+                    (info.pairs_rev_idx, pairs_rev_idx),
+                ):
+                    qd_from_torch(array, torch.as_tensor(value, dtype=gs.tc_int, device=gs.device))
         self._edges_rod_idx = torch.as_tensor(edges_rod_idx, dtype=gs.tc_int, device=gs.device)
         self._hinges_rod_idx = self._edges_rod_idx[torch.as_tensor(hinges_edges_idx[:, 0], device=gs.device)]
 
@@ -1655,7 +1830,9 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             return
         kernel_integrate_rod_positions(self.rod_state, self.rod_info)
         if self.rod_config.has_broadphase:
-            kernel_update_rod_contact_candidates(self.rod_state, self.rod_info, self.data_manager.errno)
+            kernel_update_rod_contact_candidates(
+                self.rod_state, self.rod_info, self.rod_config, self.data_manager.errno
+            )
         for i_iter in range(self._n_pbd_iters):
             if self.rod_config.has_edge_pairs:
                 kernel_project_rod_contacts(i_iter, self.rod_state, self.rod_info, self.rod_config, is_backward=False)
