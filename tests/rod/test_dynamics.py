@@ -379,11 +379,19 @@ def test_rod_contacts_match_reference(contact_margin, asset_tmp_path, show_viewe
     # FIXME: the reference trajectory is a recorded GPU run of this scene. Replace with physics-informed assertions on
     # the contacts between the rods.
     ref = np.load(os.path.join(os.path.dirname(__file__), "data", "s1_hanging_gpu_200steps.npz"))
-    coil_radius = 0.005
-    angle = np.linspace(0.0, 6.0 * np.pi, 60)
-    coil = np.stack([0.03 * np.cos(angle), 0.03 * np.sin(angle), 0.9 * coil_radius * angle / np.pi], axis=-1)
-    file = str(asset_tmp_path / "rod_coil_overlapping.npy")
-    np.save(file, coil)
+    # A rod wound in a helix whose turns press on their neighbours, overlapping them by 0.5 % of the contact distance
+    spool_radius, segment_radius = 0.05, 0.005
+    spool_angle = 0.01 / spool_radius * np.arange(150)
+    spool = np.stack(
+        [
+            spool_radius * np.cos(spool_angle),
+            spool_radius * np.sin(spool_angle),
+            0.995 * segment_radius * spool_angle / np.pi,
+        ],
+        axis=-1,
+    )
+    file = str(asset_tmp_path / "rod_spool.npy")
+    np.save(file, spool)
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1e-3,
@@ -429,34 +437,37 @@ def test_rod_contacts_match_reference(contact_margin, asset_tmp_path, show_viewe
                 ),
             )
         )
-    # A coil far from the hanging rods whose turns overlap their neighbours, which falls and settles in a pile, each of
-    # its vertices taking the corrections of several contacts
-    coil = scene.add_entity(
+    # The spool far from the hanging rods, which falls and settles on the ground, each of its vertices taking the
+    # corrections of several contacts
+    spool = scene.add_entity(
         morph=gs.morphs.Rod(
             file=file,
-            pos=(-0.5, 0.5, 0.05),
+            pos=(-0.5, 0.5, 0.01),
         ),
         material=gs.materials.Rod.Base(
-            segment_radius=coil_radius,
+            E=1e5,
+            G=1e4,
+            segment_radius=segment_radius,
         ),
     )
-    scene.build(n_envs=2)
+    # Three identical environments (see test_rod_mpm_coupling)
+    scene.build(n_envs=3)
     for rod, verts_idx in zip(rods, ([0, 1], [78, 79], [0, 1, 2], [0, 1, 2])):
         rod.set_verts_fixed(True, verts_idx)
     assert_equal([(rod.v_start, rod.n_verts, rod.e_start, rod.n_edges) for rod in rods], ref["rod_ranges"])
 
     pos = [torch.cat([rod.get_verts_pos() for rod in rods], dim=1)]
-    coil_pos = [coil.get_verts_pos()]
+    spool_states = [torch.cat([spool.get_verts_pos(), spool.get_verts_vel()], dim=-1)]
     for _ in range(ref["step"][-1] // 10):
         for _ in range(10):
             scene.step()
         pos.append(torch.cat([rod.get_verts_pos() for rod in rods], dim=1))
-        coil_pos.append(coil.get_verts_pos())
+        spool_states.append(torch.cat([spool.get_verts_pos(), spool.get_verts_vel()], dim=-1))
     assert_allclose(torch.stack(pos), ref["pos"], atol=1e-3)
     # The contacts sum the corrections of a vertex in an order independent of the threads with deterministic
     # algorithms, so identical environments stay bitwise identical
-    for verts_pos in (torch.stack(pos), torch.stack(coil_pos)):
-        assert_equal(verts_pos[:, 0], verts_pos[:, 1])
+    for state in (torch.stack(pos), torch.stack(spool_states)):
+        assert_equal(state, state[:, :1].expand_as(state))
 
 
 @pytest.mark.required
@@ -664,7 +675,9 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
         )
         for y, segment_mass in ((0.06, 0.02), (-0.06, 2e-4))
     ]
-    scene.build(n_envs=2)
+    # Three environments, a count that the lanes of a GPU warp do not divide, so that the threads of different
+    # environments interleave differently in the sums of the contacts
+    scene.build(n_envs=3)
 
     heights_landing = []
     for _ in range(250):
@@ -686,7 +699,7 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
             # surface, within half a grid spacing of the top of the block plus its radius. It is settled, sinking less
             # than a rod the material does not hold up
             i_landing = ((heights[1:] > heights[:-1]).cumsum(dim=0) == 0).sum(dim=0)
-            for i_b in range(2):
+            for i_b in range(3):
                 assert (heights[i_landing[i_b] :, i_b] < heights[i_landing[i_b], i_b] + 1e-3).all()
             assert_allclose(heights[-1], block_top + 0.005, atol=0.5 * dx)
             sink_rate = (heights[-n_steps_settled] - heights[-1]) / (n_steps_settled * 1e-3)
@@ -694,7 +707,7 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
     # The contacts with the grid nodes sum their terms in an order independent of the threads with deterministic
     # algorithms, so identical environments stay bitwise identical
     for state in (scene.rod_solver.get_verts_pos(), block.get_particles_pos()):
-        assert_equal(state[0], state[1])
+        assert_equal(state, state[:1].expand_as(state))
 
 
 @pytest.mark.required
@@ -1277,7 +1290,8 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
         ),
     )
     pad_half_size = np.array([float(x) for x in mjcf_box.find("worldbody/body/body/geom").get("size").split()])
-    scene.build(n_envs=2)
+    # Three environments, which identical contacts must leave identical (see test_rod_mpm_coupling)
+    scene.build(n_envs=3)
 
     slopes_tangent = []
     for rod, slope_angle, y in zip(rods_on_slope, slopes_angle, (0.5, 0.8)):
@@ -1369,7 +1383,7 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
     # The contacts sum their impulses on the vertices and on the links in an order independent of the threads with
     # deterministic algorithms, so identical environments stay bitwise identical
     for state in (scene.rod_solver.get_verts_pos(), scene.rigid_solver.get_qpos()):
-        assert_equal(state[0], state[1])
+        assert_equal(state, state[:1].expand_as(state))
 
     # A rod stays on a slope below the friction angle, and slides down the other with the acceleration of Coulomb
     # friction, its positions integrated by symplectic Euler over the substeps
@@ -1849,14 +1863,19 @@ def test_rod_rigid_slow_grip_lifts_rod_from_ground(two_pad_gripper, show_viewer)
 @pytest.mark.required
 @pytest.mark.parametrize("backend", [gs.gpu])
 def test_gpu_simulation_determinism(asset_tmp_path, show_viewer):
-    # Run-to-run reproducibility on GPU under deterministic algorithms, where the threads add the contacts of the rods
-    # in an order that changes from one run to the next: every trial from the same initial state must reproduce a
-    # bit-identical trajectory of the rods, the rigid bodies and the MPM particles they push
-    n_trials, n_steps, radius = 3, 30, 0.005
-    angle = np.linspace(0.0, 6.0 * np.pi, 60)
-    coil = np.stack([0.03 * np.cos(angle), 0.03 * np.sin(angle), 0.9 * radius * angle / np.pi], axis=-1)
-    file = str(asset_tmp_path / "rod_coil_overlapping.npy")
-    np.save(file, coil)
+    # Reproducibility on GPU under deterministic algorithms, where the threads add the contacts of the rods in an order
+    # that changes from one run to the next and from one environment to the next: every trial from the same initial
+    # state must reproduce a bit-identical trajectory of the rods, the rigid bodies and the MPM particles they push, in
+    # each of three identical environments (see test_rod_mpm_coupling)
+    n_trials, n_steps, spool_radius, radius = 3, 30, 0.05, 0.005
+    # A rod wound in a helix whose turns press on their neighbours (see test_rod_contacts_match_reference)
+    spool_angle = 0.01 / spool_radius * np.arange(150)
+    spool = np.stack(
+        [spool_radius * np.cos(spool_angle), spool_radius * np.sin(spool_angle), 0.995 * radius * spool_angle / np.pi],
+        axis=-1,
+    )
+    file = str(asset_tmp_path / "rod_spool.npy")
+    np.save(file, spool)
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1e-3,
@@ -1879,12 +1898,12 @@ def test_gpu_simulation_determinism(asset_tmp_path, show_viewer):
             coup_friction=0.5,
         ),
     )
-    # A coil whose turns overlap their neighbours, lying on a free box: the contacts of each vertex with the other turns
-    # and with the box, and the reactions of the contacts on the box
+    # The spool standing on a free box: the contacts of each vertex with the other turns and with the box, and the
+    # reactions of the contacts on the box
     scene.add_entity(
         morph=gs.morphs.Box(
             pos=(0.5, 0.0, 0.02),
-            size=(0.1, 0.1, 0.04),
+            size=(0.15, 0.15, 0.04),
         ),
         material=gs.materials.Rigid(
             needs_coup=True,
@@ -1897,6 +1916,8 @@ def test_gpu_simulation_determinism(asset_tmp_path, show_viewer):
             pos=(0.5, 0.0, 0.04 + radius),
         ),
         material=gs.materials.Rod.Base(
+            E=1e5,
+            G=1e4,
             segment_radius=radius,
         ),
     )
@@ -1919,7 +1940,7 @@ def test_gpu_simulation_determinism(asset_tmp_path, show_viewer):
             segment_radius=radius,
         ),
     )
-    scene.build()
+    scene.build(n_envs=3)
 
     trials = []
     for _ in range(n_trials):
@@ -1939,6 +1960,9 @@ def test_gpu_simulation_determinism(asset_tmp_path, show_viewer):
                 ]
             )
         trials.append(steps)
+    for states in trials[0]:
+        for state in states:
+            assert_equal(state, np.broadcast_to(state[:1], state.shape))
     for steps in trials[1:]:
         for states, states_ref in zip(steps, trials[0]):
             for state, state_ref in zip(states, states_ref):
