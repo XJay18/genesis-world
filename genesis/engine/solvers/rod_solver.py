@@ -1,5 +1,7 @@
+import functools
+import inspect
 import math
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from enum import auto
 from typing import TYPE_CHECKING, ClassVar
 
@@ -15,11 +17,19 @@ import genesis.utils.geom as gu
 from genesis.engine.entities.rod_entity import RodEntity
 from genesis.engine.solvers.rigid.data import LinksState
 from genesis.engine.state_change import StateChange, mutates
-from genesis.grad.bridge import no_grad
+from genesis.grad.bridge import no_grad, register_custom_backward
 from genesis.options.surfaces import Surface
 from genesis.utils.data import ENVS, Config, ConfigItem, Data, DataItem, DataKind, Size, eoa, field, iter_data
 from genesis.utils.geom import qd_transform_by_trans_quat
 from genesis.utils.misc import broadcast_tensor, qd_from_torch, qd_isfinite, qd_to_torch, qd_zero_grad, tensor_to_array
+from genesis.utils.simt import (
+    CarryFreeSums,
+    carry_free_sum_units,
+    func_carry_free_sum_add,
+    func_carry_free_sum_clear,
+    func_carry_free_sum_read,
+    requires_deterministic_accumulation,
+)
 
 from .base_solver import ErrorCode, GravityMixin, Solver, TimeBasedMixin
 
@@ -190,6 +200,11 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
     mpm_normal: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
     mpm_inv_mass: qd.Tensor = field(float, kind=DataKind.SCRATCH, grad=True, opt_in=True)
     mpm_impulse: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
+    # The corrections of the rod-rod contacts and their friction, summed exactly over the contacts of each vertex, slot
+    # 3 i_v + k holding component k of vertex i_v, emptied by the kernel adding to them and read into 'dp_contact' and
+    # 'dv_friction' by the next one (see 'RodConfig.is_deterministic')
+    dp_contact_sums: CarryFreeSums = field(kind=DataKind.SCRATCH)
+    dv_friction_sums: CarryFreeSums = field(kind=DataKind.SCRATCH)
 
 
 class RodEdgesState(Data, kind=DataKind.STATE, shape=(ROD_EDGES, ENVS)):
@@ -310,6 +325,9 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     impulse_overlap: qd.Tensor = field(float, grad=True)
     # The contacts of the rods with each link, which share its motion in the friction impulses, each vertex counted once
     links_n_contacts: qd.Tensor = field(int, shape=(ROD_RIGID_LINKS, ENVS))
+    # The weights of the contacts of each link summed exactly, which its contacts read into 'links_contacts_weight' once
+    # every contact added its weight (see 'RodConfig.is_deterministic')
+    links_contacts_weight_sums: CarryFreeSums
 
 
 class RodRigidAnchors(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ROD_RIGID_CONTACTS_PER_VERT, ENVS)):
@@ -360,6 +378,24 @@ class RodData(Data):
                 rod_edge_pairs=solver.n_edge_pair_candidates,
                 rod_bvh_nodes=2 * solver.n_bvh_leaves,
                 rod_rigid_links=solver.sim.rigid_solver.n_links,
+                rod_state=dict(
+                    verts=dict(
+                        dp_contact_sums=dict(
+                            carry_free_sum_slots=3 * solver.n_verts,
+                            carry_free_sum_bins=len(solver._verts_sums_units),
+                        ),
+                        dv_friction_sums=dict(
+                            carry_free_sum_slots=3 * solver.n_verts,
+                            carry_free_sum_bins=len(solver._verts_sums_units),
+                        ),
+                    ),
+                    rigid_contacts=dict(
+                        links_contacts_weight_sums=dict(
+                            carry_free_sum_slots=solver.sim.rigid_solver.n_links,
+                            carry_free_sum_bins=len(solver._links_sums_units),
+                        )
+                    ),
+                ),
             ),
             values=dict(
                 rod_info=dict(
@@ -377,6 +413,11 @@ class RodData(Data):
                 ROD_CONTACTS: solver.n_edge_pairs == 0,
                 ROD_BROADPHASE: not solver.has_broadphase,
                 ROD_ALL_PAIRS: solver.has_broadphase or solver.n_edge_pairs == 0,
+                # The exact sums of the contacts, which a scene without deterministic algorithms never reads
+                (RodData.rod_state.verts.dp_contact_sums, RodData.rod_state.verts.dv_friction_sums): not (
+                    solver.rod_config.is_deterministic and solver.n_edge_pairs > 0
+                ),
+                RodData.rod_state.rigid_contacts.links_contacts_weight_sums: not solver.rod_config.is_deterministic,
             },
             requires_grad=solver._requires_grad,
         )
@@ -396,6 +437,34 @@ class RodConfig(Config):
     # The contacts with the rigid geoms a vertex takes at most, which the kernels of the coupling unroll (see
     # ROD_RIGID_CONTACTS_PER_VERT)
     n_rigid_contacts_per_vert: int
+    # Whether the contacts sum their corrections and impulses in an order independent of the threads, with
+    # `use_deterministic_algorithms` (see 'dp_contact_sums' in RodVertsState and kernel_project_rod_contacts)
+    is_deterministic: bool
+
+
+@functools.cache
+def _rod_config_with_atomic_sums(rod_config: RodConfig) -> RodConfig:
+    """Return the rod config whose contacts sum through atomics, the same config without `is_deterministic`."""
+    config = {key: value for key, value in vars(rod_config).items() if not key.startswith("_")}
+    return RodConfig(**{**config, "is_deterministic": False})
+
+
+def reversed_with_atomic_sums(kernel: Callable) -> Callable:
+    """
+    Declare that the launches of a kernel taking the rod config are reversed by its own autodiff, with the sums of the
+    contacts through atomics.
+
+    With `is_deterministic` (see RodConfig), the kernel adds terms to carry-free sums or takes them, whose integer bins
+    carry no gradient. The reversal runs the variant of the config without it, which computes the same values from the
+    same arrays through atomics, the reversal of an atomic sum reading the adjoint of each term in its own thread. The
+    tag goes above the kernel decorator.
+    """
+    i_config = list(inspect.signature(kernel.fn).parameters).index("rod_config")
+
+    def backward(*args):
+        kernel.grad(*args[:i_config], _rod_config_with_atomic_sums(args[i_config]), *args[i_config + 1 :])
+
+    return register_custom_backward(backward)(kernel)
 
 
 @qd.func
@@ -415,6 +484,49 @@ def func_inverse_mass(i_v: int, i_b: int, rod_state: RodState, rod_info: RodInfo
 
 
 @qd.func
+def func_read_verts_sums(i_v: int, i_b: int, sums: CarryFreeSums) -> qd.types.vector(3):
+    """Return the vector a vertex of the rods summed exactly in its three slots of carry-free sums."""
+    value = qd.Vector.zero(gs.qd_float, 3)
+    # A runtime loop over the components keeps a single inlined copy of the bin reads
+    for k in range(3):
+        value[k] = func_carry_free_sum_read(3 * i_v + k, i_b, sums)
+    return value
+
+
+@qd.func
+def func_clear_verts_sums(i_v: int, i_b: int, sums: CarryFreeSums):
+    """Empty the three slots of carry-free sums of a vertex of the rods for the next sum."""
+    for k in range(3):
+        func_carry_free_sum_clear(3 * i_v + k, i_b, sums)
+
+
+@qd.func
+def func_add_edge_pair_sums(
+    i_b: int,
+    verts_idx: qd.types.vector(4, dtype=qd.i32),
+    impulse: qd.types.vector(3),
+    weights: qd.types.vector(4),
+    inv_masses: qd.types.vector(4),
+    sums: CarryFreeSums,
+):
+    """Add the moves of the four vertices of a pair of edges in contact to their slots of carry-free sums.
+
+    Each vertex moves by its inverse mass times its weight in its closest point times the impulse, the vertices of the
+    second edge by the opposite impulse. A vertex that does not move, of zero inverse mass or weight, adds nothing,
+    which leaves its slots empty where it takes part in no contact (see 'n_contacts' in RodVertsState).
+    """
+    # A runtime loop over the vertices and components keeps a single inlined copy of the bin updates
+    for i_t in range(12):
+        i_c_v = i_t // 3
+        i_v = verts_idx[i_c_v]
+        sign = qd.select(i_c_v < 2, 1.0, -1.0)
+        if inv_masses[i_c_v] * weights[i_c_v] > 0.0:
+            func_carry_free_sum_add(
+                3 * i_v + i_t % 3, i_b, sign * inv_masses[i_c_v] * weights[i_c_v] * impulse[i_t % 3], sums
+            )
+
+
+@qd.func
 def func_last_projection_correction(
     i_v: int, i_b: int, rod_state: RodState, rod_config: qd.template()
 ) -> qd.types.vector(3):
@@ -423,10 +535,16 @@ def func_last_projection_correction(
     one of the inextensibility otherwise.
 
     The projections of a substep chain their kernels, each applying the correction of the previous one before computing
-    its own (see 'kernel_project_rod_inextensibility').
+    its own (see 'kernel_project_rod_inextensibility'). With `is_deterministic` (see RodConfig), the contacts left their
+    corrections in carry-free sums, which the vertex reads into 'dp_contact' here, the kernel applying them being the
+    only one to read them.
     """
     dp = qd.Vector.zero(gs.qd_float, 3)
     if qd.static(rod_config.has_edge_pairs):
+        if qd.static(rod_config.is_deterministic):
+            # A vertex moved by no contact holds empty sums and keeps its zero correction (see func_add_edge_pair_sums)
+            if rod_state.verts.n_contacts[i_v, i_b] > 0:
+                rod_state.verts.dp_contact[i_v, i_b] = func_read_verts_sums(i_v, i_b, rod_state.verts.dp_contact_sums)
         dp = rod_state.verts.dp_contact[i_v, i_b] / qd.max(rod_state.verts.n_contacts[i_v, i_b], 1)
     else:
         dp = rod_state.verts.dp_inextensibility[i_v, i_b]
@@ -734,6 +852,7 @@ def kernel_integrate_rod_positions(rod_state: RodState, rod_info: RodInfo):
 # positions are written once, linearly, before any loop reads them, so that autodiff reverses every loop at the values
 # it read. The chain of a substep is: 'kernel_integrate_rod_positions', then for each projection the contacts and the
 # inextensibility of the next one, then 'kernel_finalize_rod_positions'.
+@reversed_with_atomic_sums
 @qd.kernel(fastcache=True)
 def kernel_project_rod_inextensibility(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
     """Apply the corrections of the last projection, then compute the corrections of the inextensibility constraints."""
@@ -885,7 +1004,14 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
 
 @qd.func
 def func_project_rod_edge_pair(
-    i_e_a: int, i_e_b: int, i_c: int, i_iter: int, i_b: int, rod_state: RodState, rod_info: RodInfo
+    i_e_a: int,
+    i_e_b: int,
+    i_c: int,
+    i_iter: int,
+    i_b: int,
+    rod_state: RodState,
+    rod_info: RodInfo,
+    is_exact: qd.template(),
 ):
     """Compute the correction of a pair of edges whose capsules overlap, at the current positions.
 
@@ -893,7 +1019,8 @@ def func_project_rod_edge_pair(
     proportion to its inverse mass and to its weight in its closest point, and averaging the moves of the contacts it
     takes part in. 'i_c' is the slot of the pair in the list of candidates, -1 for a pair outside of it. The first
     projection of a substep records the normal and the penetration of the pairs of the list, from which the friction of
-    the substep follows.
+    the substep follows. With `is_exact`, the corrections add to the exact sums of the vertices ('dp_contact_sums'),
+    and to 'dp_contact' directly otherwise.
     """
     i_v_a1, i_v_a2 = rod_info.edges.verts_idx[i_e_a]
     i_v_b1, i_v_b2 = rod_info.edges.verts_idx[i_e_b]
@@ -940,10 +1067,13 @@ def func_project_rod_edge_pair(
         inv_mass_eff = (weights * weights).dot(inv_masses)
         if inv_mass_eff > rod_info.EPS[None]:
             impulse = penetration / inv_mass_eff * normal
-            qd.atomic_add(rod_state.verts.dp_contact[i_v_a1, i_b], inv_masses[0] * weights[0] * impulse)
-            qd.atomic_add(rod_state.verts.dp_contact[i_v_a2, i_b], inv_masses[1] * weights[1] * impulse)
-            qd.atomic_sub(rod_state.verts.dp_contact[i_v_b1, i_b], inv_masses[2] * weights[2] * impulse)
-            qd.atomic_sub(rod_state.verts.dp_contact[i_v_b2, i_b], inv_masses[3] * weights[3] * impulse)
+            if qd.static(is_exact):
+                func_add_edge_pair_sums(i_b, verts_idx, impulse, weights, inv_masses, rod_state.verts.dp_contact_sums)
+            else:
+                qd.atomic_add(rod_state.verts.dp_contact[i_v_a1, i_b], inv_masses[0] * weights[0] * impulse)
+                qd.atomic_add(rod_state.verts.dp_contact[i_v_a2, i_b], inv_masses[1] * weights[1] * impulse)
+                qd.atomic_sub(rod_state.verts.dp_contact[i_v_b1, i_b], inv_masses[2] * weights[2] * impulse)
+                qd.atomic_sub(rod_state.verts.dp_contact[i_v_b2, i_b], inv_masses[3] * weights[3] * impulse)
             # Each vertex averages the corrections of its contacts (see 'func_last_projection_correction'), so that the
             # contacts sharing it do not push it further than each asks
             for i_c_v in qd.static(range(4)):
@@ -952,6 +1082,7 @@ def func_project_rod_edge_pair(
                     qd.atomic_add(rod_state.verts.n_contacts[i_v_c, i_b], 1)
 
 
+@reversed_with_atomic_sums
 @qd.kernel(fastcache=True)
 def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
     """Apply the corrections of the inextensibility constraints, then compute those of the rod-rod contacts.
@@ -959,29 +1090,36 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
     With a broadphase, the contacts are searched among its candidate pairs, and a vertex moved further than half of the
     margin from its position in the broadphase may bring a pair of edges outside of them into contact: its environment
     then also tests all those pairs. Without one, every pair of edges that can collide is tested.
+
+    The pairs sharing a vertex add their corrections up through atomics, whose order varies across threads. With
+    `is_deterministic` (see RodConfig), they add to carry-free sums instead, which the vertices read in the next kernel,
+    whatever the order (see func_last_projection_correction).
     """
+    IS_EXACT = qd.static(rod_config.is_deterministic)
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
         pos = rod_state.verts.pos[i_v, i_b] + rod_state.verts.dp_inextensibility[i_v, i_b]
         rod_state.verts.pos[i_v, i_b] = pos
         rod_state.verts.dp_contact[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
         rod_state.verts.n_contacts[i_v, i_b] = 0
+        # The sums are emptied before the contacts add to them, whatever a reversal left in them
+        if qd.static(IS_EXACT):
+            func_clear_verts_sums(i_v, i_b, rod_state.verts.dp_contact_sums)
         if qd.static(rod_config.has_broadphase):
             move = pos - rod_state.verts.pos_broadphase[i_v, i_b]
             if move.dot(move) > 0.25 * rod_info.contact_margin[None] * rod_info.contact_margin[None]:
                 rod_state.broadphase.is_stale[i_b] = True
                 rod_state.broadphase.n_envs_fallback[None] = rod_state.verts.pos.shape[1]
 
-    # The pairs sharing a vertex add their corrections up through atomics, whose order varies on GPU
     for i_c, i_b in qd.ndrange(
         *rod_state.edge_pairs.penetration.shape, axes=qd.static(eoa(rod_state.edge_pairs.penetration))
     ):
         if qd.static(rod_config.has_broadphase):
             if i_c < rod_state.broadphase.n_candidates[i_b]:
                 i_e_a, i_e_b = rod_state.edge_pairs.edges_idx[i_c, i_b]
-                func_project_rod_edge_pair(i_e_a, i_e_b, i_c, i_iter, i_b, rod_state, rod_info)
+                func_project_rod_edge_pair(i_e_a, i_e_b, i_c, i_iter, i_b, rod_state, rod_info, is_exact=IS_EXACT)
         else:
             i_e_a, i_e_b = rod_info.edge_pairs_idx[i_c]
-            func_project_rod_edge_pair(i_e_a, i_e_b, i_c, i_iter, i_b, rod_state, rod_info)
+            func_project_rod_edge_pair(i_e_a, i_e_b, i_c, i_iter, i_b, rod_state, rod_info, is_exact=IS_EXACT)
 
     # An environment with a vertex past the margin also tests the pairs outside of the candidates, two leaf boxes that
     # overlap at the broadphase having made the pair a candidate. The loop runs over no environment until then.
@@ -995,23 +1133,31 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
                 if func_is_rod_edge_pair_valid(i_e_a, i_e_b, rod_info):
                     if not func_is_rod_broadphase_overlap(i_e_a, i_e_b, i_b, rod_state, rod_info):
                         func_project_rod_edge_pair(
-                            i_e_a, i_e_b, i_c=-1, i_iter=i_iter, i_b=i_b, rod_state=rod_state, rod_info=rod_info
+                            i_e_a,
+                            i_e_b,
+                            i_c=-1,
+                            i_iter=i_iter,
+                            i_b=i_b,
+                            rod_state=rod_state,
+                            rod_info=rod_info,
+                            is_exact=IS_EXACT,
                         )
 
 
+@reversed_with_atomic_sums
 @qd.kernel(fastcache=True)
 def kernel_finalize_rod_positions(
-    rod_state: RodState,
-    links_state: LinksState,
-    rod_info: RodInfo,
-    rod_config: qd.template(),
+    rod_state: RodState, links_state: LinksState, rod_info: RodInfo, rod_config: qd.template()
 ):
     """Apply the corrections of the last projection and the constraints of the vertices, then update the reference
     frames and the velocities of the rods, and compute the friction of the rod-rod contacts.
 
     The last projection is the one of the contacts with the rigid geoms where the rods couple with them (see
-    'LegacyCoupler.project_rod_rigid_contacts'), the last one of the rods otherwise.
+    'LegacyCoupler.project_rod_rigid_contacts'), the last one of the rods otherwise. The friction of the pairs sharing a
+    vertex adds up as their corrections do (see kernel_project_rod_contacts), into carry-free sums with
+    `is_deterministic`, which kernel_finalize_rod_velocities reads.
     """
+    IS_EXACT = qd.static(rod_config.is_deterministic)
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
         dp = qd.Vector.zero(gs.qd_float, 3)
         if qd.static(rod_config.has_rigid_contacts):
@@ -1047,6 +1193,8 @@ def kernel_finalize_rod_positions(
     if qd.static(rod_config.has_edge_pairs):
         for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
             rod_state.verts.dv_friction[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            if qd.static(IS_EXACT):
+                func_clear_verts_sums(i_v, i_b, rod_state.verts.dv_friction_sums)
 
         # Coulomb friction cancels the tangential relative velocity of the closest points of two edges in contact, up
         # to the bound the penetration recovered over the substep sets
@@ -1106,18 +1254,28 @@ def kernel_finalize_rod_positions(
                     if vel_tangent_norm >= mu_s * vel_normal:
                         dv_tangent = -mu_k * vel_normal / qd.max(vel_tangent_norm, rod_info.EPS[None]) * vel_tangent
                     impulse = dv_tangent / inv_mass_eff
-                    qd.atomic_add(rod_state.verts.dv_friction[i_v_a1, i_b], inv_masses[0] * weights[0] * impulse)
-                    qd.atomic_add(rod_state.verts.dv_friction[i_v_a2, i_b], inv_masses[1] * weights[1] * impulse)
-                    qd.atomic_sub(rod_state.verts.dv_friction[i_v_b1, i_b], inv_masses[2] * weights[2] * impulse)
-                    qd.atomic_sub(rod_state.verts.dv_friction[i_v_b2, i_b], inv_masses[3] * weights[3] * impulse)
+                    if qd.static(IS_EXACT):
+                        verts_idx = qd.Vector([i_v_a1, i_v_a2, i_v_b1, i_v_b2], dt=gs.qd_int)
+                        func_add_edge_pair_sums(
+                            i_b, verts_idx, impulse, weights, inv_masses, rod_state.verts.dv_friction_sums
+                        )
+                    else:
+                        qd.atomic_add(rod_state.verts.dv_friction[i_v_a1, i_b], inv_masses[0] * weights[0] * impulse)
+                        qd.atomic_add(rod_state.verts.dv_friction[i_v_a2, i_b], inv_masses[1] * weights[1] * impulse)
+                        qd.atomic_sub(rod_state.verts.dv_friction[i_v_b1, i_b], inv_masses[2] * weights[2] * impulse)
+                        qd.atomic_sub(rod_state.verts.dv_friction[i_v_b2, i_b], inv_masses[3] * weights[3] * impulse)
 
 
+@reversed_with_atomic_sums
 @qd.kernel(fastcache=True)
 def kernel_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
     """Apply the friction of the rod-rod contacts and the constraints of the vertices to the velocities, then commit the
     reference frames and the rest curvatures the substep computed."""
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
         if qd.static(rod_config.has_edge_pairs):
+            # The friction left in carry-free sums (see kernel_finalize_rod_positions)
+            if qd.static(rod_config.is_deterministic):
+                rod_state.verts.dv_friction[i_v, i_b] = func_read_verts_sums(i_v, i_b, rod_state.verts.dv_friction_sums)
             rod_state.verts.vel[i_v, i_b] = rod_state.verts.vel[i_v, i_b] + rod_state.verts.dv_friction[i_v, i_b]
         if rod_state.verts.is_constrained[i_v, i_b]:
             rod_state.verts.vel[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
@@ -1344,8 +1502,21 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             has_broadphase=self._has_broadphase,
             has_rigid_contacts=self._rigid_coupler is not None,
             n_rigid_contacts_per_vert=ROD_RIGID_CONTACTS_PER_VERT,
+            is_deterministic=self.is_active and requires_deterministic_accumulation(),
         )
 
+        # The units of the carry-free sums (see CarryFreeSums), in m for the corrections of the rod-rod contacts and in
+        # m/s for their friction, which a vertex takes once per launch from each pair of edges in contact with one of
+        # its two edges, and for the weights of the contacts of the links, in [0, 1], which a link takes from at most
+        # 'ROD_RIGID_CONTACTS_PER_VERT' contacts per vertex. A correction or friction term is at most a few times the
+        # penetration of a contact (a few radii) or its relative velocity, far below 2^20, and the lowest units lie at
+        # most at half the spacing of the floating-point positions from 8 mm on, and of the weights from 1 on.
+        self._verts_sums_units = carry_free_sum_units(
+            n_terms_max=2 * max(self.n_edges - 1, 1), value_max=2.0**20, unit_min=2.0**-60
+        )
+        self._links_sums_units = carry_free_sum_units(
+            n_terms_max=max(self.n_verts, 1) * ROD_RIGID_CONTACTS_PER_VERT, value_max=2.0, unit_min=2.0**-53
+        )
         self.data_manager = RodData(self)
         self.rod_info = self.data_manager.rod_info
         self.rod_state = self.data_manager.rod_state
@@ -1364,6 +1535,12 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         if self.is_active:
             self._init_rod_data(edge_pairs_idx)
             self._build_gravity(self.rod_info.gravity)
+        if self.rod_config.is_deterministic:
+            if self.rod_config.has_edge_pairs:
+                self.rod_state.verts.dp_contact_sums.bins_unit.from_numpy(self._verts_sums_units)
+                self.rod_state.verts.dv_friction_sums.bins_unit.from_numpy(self._verts_sums_units)
+            if self.rod_config.has_rigid_contacts:
+                self.rod_state.rigid_contacts.links_contacts_weight_sums.bins_unit.from_numpy(self._links_sums_units)
         for entity in self._entities:
             entity._build()
 

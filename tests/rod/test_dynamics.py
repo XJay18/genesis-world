@@ -375,10 +375,23 @@ def test_vertex_constraints_reset_with_state(show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("contact_margin", [None, 1e-6])
-def test_rod_contacts_match_reference(contact_margin, show_viewer):
+def test_rod_contacts_match_reference(contact_margin, asset_tmp_path, show_viewer):
     # FIXME: the reference trajectory is a recorded GPU run of this scene. Replace with physics-informed assertions on
     # the contacts between the rods.
     ref = np.load(os.path.join(os.path.dirname(__file__), "data", "s1_hanging_gpu_200steps.npz"))
+    # A rod wound in a helix whose turns press on their neighbours, overlapping them by 0.5 % of the contact distance
+    spool_radius, segment_radius = 0.05, 0.005
+    spool_angle = 0.01 / spool_radius * np.arange(150)
+    spool = np.stack(
+        [
+            spool_radius * np.cos(spool_angle),
+            spool_radius * np.sin(spool_angle),
+            0.995 * segment_radius * spool_angle / np.pi,
+        ],
+        axis=-1,
+    )
+    file = str(asset_tmp_path / "rod_spool.npy")
+    np.save(file, spool)
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1e-3,
@@ -390,8 +403,8 @@ def test_rod_contacts_match_reference(contact_margin, show_viewer):
             contact_margin=contact_margin,
         ),
         viewer_options=gs.options.ViewerOptions(
-            camera_pos=(0.8, -0.5, 0.8),
-            camera_lookat=(0.8, 0.45, 0.2),
+            camera_pos=(0.3, -0.9, 1.0),
+            camera_lookat=(0.3, 0.45, 0.1),
         ),
         show_viewer=show_viewer,
     )
@@ -424,17 +437,37 @@ def test_rod_contacts_match_reference(contact_margin, show_viewer):
                 ),
             )
         )
-    scene.build(n_envs=1)
+    # The spool far from the hanging rods, which falls and settles on the ground, each of its vertices taking the
+    # corrections of several contacts
+    spool = scene.add_entity(
+        morph=gs.morphs.Rod(
+            file=file,
+            pos=(-0.5, 0.5, 0.01),
+        ),
+        material=gs.materials.Rod.Base(
+            E=1e5,
+            G=1e4,
+            segment_radius=segment_radius,
+        ),
+    )
+    # Three identical environments (see test_rod_mpm_coupling)
+    scene.build(n_envs=3)
     for rod, verts_idx in zip(rods, ([0, 1], [78, 79], [0, 1, 2], [0, 1, 2])):
         rod.set_verts_fixed(True, verts_idx)
     assert_equal([(rod.v_start, rod.n_verts, rod.e_start, rod.n_edges) for rod in rods], ref["rod_ranges"])
 
     pos = [torch.cat([rod.get_verts_pos() for rod in rods], dim=1)]
+    spool_states = [torch.cat([spool.get_verts_pos(), spool.get_verts_vel()], dim=-1)]
     for _ in range(ref["step"][-1] // 10):
         for _ in range(10):
             scene.step()
         pos.append(torch.cat([rod.get_verts_pos() for rod in rods], dim=1))
+        spool_states.append(torch.cat([spool.get_verts_pos(), spool.get_verts_vel()], dim=-1))
     assert_allclose(torch.stack(pos), ref["pos"], atol=1e-3)
+    # The contacts sum the corrections of a vertex in an order independent of the threads with deterministic
+    # algorithms, so identical environments stay bitwise identical
+    for state in (torch.stack(pos), torch.stack(spool_states)):
+        assert_equal(state, state[:, :1].expand_as(state))
 
 
 @pytest.mark.required
@@ -642,7 +675,9 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
         )
         for y, segment_mass in ((0.06, 0.02), (-0.06, 2e-4))
     ]
-    scene.build(n_envs=2)
+    # Three environments, a count that the lanes of a GPU warp do not divide, so that the threads of different
+    # environments interleave differently in the sums of the contacts
+    scene.build(n_envs=3)
 
     heights_landing = []
     for _ in range(250):
@@ -664,13 +699,15 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
             # surface, within half a grid spacing of the top of the block plus its radius. It is settled, sinking less
             # than a rod the material does not hold up
             i_landing = ((heights[1:] > heights[:-1]).cumsum(dim=0) == 0).sum(dim=0)
-            for i_b in range(2):
+            for i_b in range(3):
                 assert (heights[i_landing[i_b] :, i_b] < heights[i_landing[i_b], i_b] + 1e-3).all()
             assert_allclose(heights[-1], block_top + 0.005, atol=0.5 * dx)
             sink_rate = (heights[-n_steps_settled] - heights[-1]) / (n_steps_settled * 1e-3)
             assert (sink_rate.abs() < 5e-3).all()
-    # The impulses of the grid nodes on a vertex add up through atomics, whose order varies
-    assert_allclose(rod.get_verts_pos()[0], rod.get_verts_pos()[1], tol=1e-9)
+    # The contacts with the grid nodes sum their terms in an order independent of the threads with deterministic
+    # algorithms, so identical environments stay bitwise identical
+    for state in (scene.rod_solver.get_verts_pos(), block.get_particles_pos()):
+        assert_equal(state, state[:1].expand_as(state))
 
 
 @pytest.mark.required
@@ -1253,7 +1290,8 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
         ),
     )
     pad_half_size = np.array([float(x) for x in mjcf_box.find("worldbody/body/body/geom").get("size").split()])
-    scene.build(n_envs=2)
+    # Three environments, which identical contacts must leave identical (see test_rod_mpm_coupling)
+    scene.build(n_envs=3)
 
     slopes_tangent = []
     for rod, slope_angle, y in zip(rods_on_slope, slopes_angle, (0.5, 0.8)):
@@ -1341,6 +1379,11 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
     # back out at once: their penetration changes by the motion of the rope from one step to the next
     rims_penetration = np.array(rims_penetration)
     assert np.abs(np.diff(rims_penetration[n_close_steps:], axis=0)).max() < 1e-5
+
+    # The contacts sum their impulses on the vertices and on the links in an order independent of the threads with
+    # deterministic algorithms, so identical environments stay bitwise identical
+    for state in (scene.rod_solver.get_verts_pos(), scene.rigid_solver.get_qpos()):
+        assert_equal(state, state[:1].expand_as(state))
 
     # A rod stays on a slope below the friction angle, and slides down the other with the acceleration of Coulomb
     # friction, its positions integrated by symplectic Euler over the substeps
@@ -1815,3 +1858,112 @@ def test_rod_rigid_slow_grip_lifts_rod_from_ground(two_pad_gripper, show_viewer)
     assert carriage.get_pos()[2] > 0.0215 + 0.09
     assert_allclose(rod.get_verts_pos()[:, 2] - carriage.get_pos()[2], grasp_offset, atol=2e-3)
     assert speed_max < pads_speed_max + 0.1
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.gpu])
+def test_gpu_simulation_determinism(asset_tmp_path, show_viewer):
+    # Reproducibility on GPU under deterministic algorithms, where the threads add the contacts of the rods in an order
+    # that changes from one run to the next and from one environment to the next: every trial from the same initial
+    # state must reproduce a bit-identical trajectory of the rods, the rigid bodies and the MPM particles they push, in
+    # each of three identical environments (see test_rod_mpm_coupling)
+    n_trials, n_steps, spool_radius, radius = 3, 30, 0.05, 0.005
+    # A rod wound in a helix whose turns press on their neighbours (see test_rod_contacts_match_reference)
+    spool_angle = 0.01 / spool_radius * np.arange(150)
+    spool = np.stack(
+        [spool_radius * np.cos(spool_angle), spool_radius * np.sin(spool_angle), 0.995 * radius * spool_angle / np.pi],
+        axis=-1,
+    )
+    file = str(asset_tmp_path / "rod_spool.npy")
+    np.save(file, spool)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+        ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.1, -0.1, -0.05),
+            upper_bound=(0.1, 0.1, 0.15),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.25, -0.6, 0.4),
+            camera_lookat=(0.25, 0.0, 0.05),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.5,
+        ),
+    )
+    # The spool standing on a free box: the contacts of each vertex with the other turns and with the box, and the
+    # reactions of the contacts on the box
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.5, 0.0, 0.02),
+            size=(0.15, 0.15, 0.04),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.5,
+        ),
+    )
+    scene.add_entity(
+        morph=gs.morphs.Rod(
+            file=file,
+            pos=(0.5, 0.0, 0.04 + radius),
+        ),
+        material=gs.materials.Rod.Base(
+            E=1e5,
+            G=1e4,
+            segment_radius=radius,
+        ),
+    )
+    # A rod lying on an MPM block: the contacts of its vertices with the patches of material under them, and their
+    # impulses on the grid nodes
+    block = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.03),
+            size=(0.06, 0.06, 0.06),
+        ),
+        material=gs.materials.MPM.Elastic(),
+    )
+    scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=10,
+            interval=0.005,
+            pos=(-0.0225, 0.0, 0.06 + radius),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=radius,
+        ),
+    )
+    scene.build(n_envs=3)
+
+    trials = []
+    for _ in range(n_trials):
+        scene.reset()
+        steps = []
+        for _ in range(n_steps):
+            scene.step()
+            steps.append(
+                [
+                    tensor_to_array(state).copy()
+                    for state in (
+                        scene.rod_solver.get_verts_pos(),
+                        scene.rod_solver.get_verts_vel(),
+                        scene.rigid_solver.get_qpos(),
+                        block.get_particles_pos(),
+                    )
+                ]
+            )
+        trials.append(steps)
+    for states in trials[0]:
+        for state in states:
+            assert_equal(state, np.broadcast_to(state[:1], state.shape))
+    for steps in trials[1:]:
+        for states, states_ref in zip(steps, trials[0]):
+            for state, state_ref in zip(states, states_ref):
+                assert_equal(state, state_ref)
