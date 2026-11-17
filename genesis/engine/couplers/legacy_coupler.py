@@ -4124,6 +4124,130 @@ def kernel_rod_mpm_contact_pos(
         rod_mpm_contact.samples_contact_pos[i_s, i_b] = pos_contact
 
 
+@qd.func
+def func_rod_mpm_sample_touch(
+    i_s: int,
+    i_b: int,
+    mpm_state: MPMState,
+    rod_state: RodState,
+    rod_mpm_contact: RodMPMContact,
+    mpm_info: MPMInfo,
+    rod_info: RodInfo,
+    legacy_coupler_info: LegacyCouplerInfo,
+):
+    """
+    Return whether a sample of the edges of the rods touches the MPM materials (see 'kernel_rod_mpm_gather'), and where
+    it does the mass, momentum and outward normal the grid gives its contact point and the lowest cell of its stencil.
+    """
+    pos, radius, is_in_grid = func_rod_mpm_sample(i_s, i_b, mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+    is_touching = False
+    mass = gs.qd_float(0.0)
+    momentum = qd.Vector.zero(gs.qd_float, 3)
+    normal = qd.Vector.zero(gs.qd_float, 3)
+    cell_base = qd.Vector.zero(gs.qd_int, 3)
+    if is_in_grid:
+        mass_grid, momentum_grid, grad, mass_ref, cell_base_grid = func_rod_mpm_gather(
+            rod_mpm_contact.samples_contact_pos[i_s, i_b], i_b, mpm_state, mpm_info, is_gradient_only=False
+        )
+        grad_norm = grad.norm()
+        if (
+            mass_grid > rod_info.EPS[None]
+            and mass_grid > legacy_coupler_info.rod_mpm_surface_fill[None] * mass_ref
+            and grad_norm * mpm_info.dx[None] > legacy_coupler_info.rod_mpm_fill_grad_min[None] * mass_ref
+        ):
+            is_touching = True
+            mass = mass_grid
+            momentum = momentum_grid
+            normal = -grad / grad_norm
+            cell_base = cell_base_grid
+    return is_touching, mass, momentum, normal, cell_base
+
+
+@qd.func
+def func_rod_mpm_sample_share(
+    i_s: int, i_b: int, rod_state: RodState, rod_mpm_contact: RodMPMContact, rod_info: RodInfo
+):
+    """
+    Return the share of a sample of the edges of the rods that touches the MPM materials: the sum over the vertices of
+    its edge approaching their patches of the weight of the vertex in the sample over the mass of its patch (see
+    'kernel_rod_mpm_share').
+    """
+    i_e = rod_mpm_contact.samples_edge_idx[i_s]
+    t = rod_mpm_contact.samples_t[i_s]
+    i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
+    share = gs.qd_float(0.0)
+    for i_v, weight in qd.static(((i_v_s, 1.0 - t), (i_v_e, t))):
+        is_approaching, _, _ = func_rod_mpm_vert_contact(i_v, i_b, rod_state, rod_info)
+        if is_approaching:
+            share = share + weight / rod_state.verts.mpm_mass[i_v, i_b]
+    return share
+
+
+@qd.func
+def func_rod_mpm_sample_inv_mass(
+    i_s: int, i_b: int, mpm_state: MPMState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo
+) -> float:
+    """
+    Return the inverse mass of the stencil of a sample of the edges of the rods that touches the MPM materials: the sum
+    over its nodes of the weight of the node times its mass over the particle volume scale times its share (see
+    'kernel_rod_mpm_grid_inv_mass').
+    """
+    base, _, w = func_quadratic_bspline_stencil(rod_mpm_contact.samples_contact_pos[i_s, i_b], mpm_info)
+    cell_base = base - mpm_info.grid_offset[None]
+    inv_mass = gs.qd_float(0.0)
+    for offset in qd.static(qd.grouped(qd.ndrange(3, 3, 3))):
+        cell = cell_base + offset
+        weight_node = w[offset[0], 0] * w[offset[1], 1] * w[offset[2], 2]
+        inv_mass = inv_mass + (
+            weight_node
+            * mpm_state.grid.mass[cell[0], cell[1], cell[2], i_b]
+            / mpm_info.particle_volume_scale[None]
+            * rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b]
+        )
+    return inv_mass
+
+
+@qd.func
+def func_rod_mpm_sample_dv(i_s: int, i_b: int, rod_state: RodState, rod_mpm_contact: RodMPMContact, rod_info: RodInfo):
+    """
+    Return the change of velocity a sample of the edges of the rods that touches the MPM materials gives the nodes of
+    its stencil, before the weight of each node: the opposite of the impulse of each vertex of its edge times its weight
+    in the sample over the mass of its patch (see 'kernel_rod_mpm_scatter').
+    """
+    i_e = rod_mpm_contact.samples_edge_idx[i_s]
+    t = rod_mpm_contact.samples_t[i_s]
+    i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
+    dv = qd.Vector.zero(gs.qd_float, 3)
+    for i_v, weight in qd.static(((i_v_s, 1.0 - t), (i_v_e, t))):
+        dv = dv - weight / rod_state.verts.mpm_mass[i_v, i_b] * rod_state.verts.mpm_impulse[i_v, i_b]
+    return dv
+
+
+@qd.func
+def func_rod_mpm_vert_vel(i_v: int, i_b: int, rod_state: RodState, rod_info: RodInfo):
+    """Return the velocity of a vertex of the rods once it took its impulse from the MPM materials."""
+    return (
+        rod_state.verts.vel[i_v, i_b]
+        + func_inverse_mass(i_v, i_b, rod_state, rod_info) * rod_state.verts.mpm_impulse[i_v, i_b]
+    )
+
+
+@qd.func
+def func_rod_mpm_owned_node(i_k: int, i_b: int, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo):
+    """
+    Return whether key 'i_k', 27 times a sample plus the offset of a node in its stencil, owns that node, the sample
+    touching the MPM materials, and the node (see 'grid_owner' in RodMPMContact).
+    """
+    i_s = i_k // 27
+    is_owner = False
+    cell = qd.Vector.zero(gs.qd_int, 3)
+    if rod_mpm_contact.samples_is_touching[i_s, i_b]:
+        base, fx, w = func_quadratic_bspline_stencil(rod_mpm_contact.samples_contact_pos[i_s, i_b], mpm_info)
+        cell = base - mpm_info.grid_offset[None] + qd.Vector([i_k % 27 // 9, i_k % 9 // 3, i_k % 3], dt=gs.qd_int)
+        is_owner = rod_mpm_contact.grid_owner[cell[0], cell[1], cell[2], i_b] == i_k
+    return is_owner, cell
+
+
 @qd.kernel(fastcache=True)
 def kernel_rod_mpm_gather(
     mpm_state: MPMState,
@@ -4153,34 +4277,22 @@ def kernel_rod_mpm_gather(
     for i_s, i_b in qd.ndrange(
         *rod_mpm_contact.samples_is_touching.shape, axes=qd.static(eoa(rod_mpm_contact.samples_is_touching))
     ):
-        pos, radius, is_in_grid = func_rod_mpm_sample(
-            i_s, i_b, mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info
+        is_touching, mass, momentum, normal, cell_base = func_rod_mpm_sample_touch(
+            i_s, i_b, mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info, legacy_coupler_info
         )
-        is_touching = False
-        if is_in_grid:
-            mass, momentum, grad, mass_ref, cell_base = func_rod_mpm_gather(
-                rod_mpm_contact.samples_contact_pos[i_s, i_b], i_b, mpm_state, mpm_info, is_gradient_only=False
-            )
-            grad_norm = grad.norm()
-            if (
-                mass > rod_info.EPS[None]
-                and mass > legacy_coupler_info.rod_mpm_surface_fill[None] * mass_ref
-                and grad_norm * mpm_info.dx[None] > legacy_coupler_info.rod_mpm_fill_grad_min[None] * mass_ref
-            ):
-                is_touching = True
-                normal = -grad / grad_norm
-                i_e = rod_mpm_contact.samples_edge_idx[i_s]
-                t = rod_mpm_contact.samples_t[i_s]
-                i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
-                for i_v, weight in qd.static(((i_v_s, 1.0 - t), (i_v_e, t))):
-                    qd.atomic_add(rod_state.verts.mpm_mass[i_v, i_b], weight * mass)
-                    qd.atomic_add(rod_state.verts.mpm_momentum[i_v, i_b], weight * momentum)
-                    qd.atomic_add(rod_state.verts.mpm_normal[i_v, i_b], weight * mass * normal)
-                # The share of the grid nodes is gathered anew at every substep, over the stencils of the samples that
-                # touch (see 'kernel_rod_mpm_share')
-                for offset in qd.static(qd.grouped(qd.ndrange(3, 3, 3))):
-                    cell = cell_base + offset
-                    rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b] = 0.0
+        if is_touching:
+            i_e = rod_mpm_contact.samples_edge_idx[i_s]
+            t = rod_mpm_contact.samples_t[i_s]
+            i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
+            for i_v, weight in qd.static(((i_v_s, 1.0 - t), (i_v_e, t))):
+                qd.atomic_add(rod_state.verts.mpm_mass[i_v, i_b], weight * mass)
+                qd.atomic_add(rod_state.verts.mpm_momentum[i_v, i_b], weight * momentum)
+                qd.atomic_add(rod_state.verts.mpm_normal[i_v, i_b], weight * mass * normal)
+            # The share of the grid nodes is gathered anew at every substep, over the stencils of the samples that
+            # touch (see 'kernel_rod_mpm_share')
+            for offset in qd.static(qd.grouped(qd.ndrange(3, 3, 3))):
+                cell = cell_base + offset
+                rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b] = 0.0
         rod_mpm_contact.samples_is_touching[i_s, i_b] = is_touching
 
 
@@ -4195,8 +4307,8 @@ def kernel_rod_mpm_gather_exact(
     legacy_coupler_info: LegacyCouplerInfo,
 ):
     """
-    Twin of kernel_rod_mpm_gather whose sums are the same whatever the order of the threads (see 'RodMPMContact'),
-    its launches reversed by the autodiff of kernel_rod_mpm_gather.
+    Twin of kernel_rod_mpm_gather whose sums are the same whatever the order of the threads (see 'RodMPMContact'), its
+    launches reversed by the autodiff of kernel_rod_mpm_gather.
 
     Each sample that touches stores its terms, which every vertex then gathers in a fixed order, and claims the nodes of
     its stencil once their owners are reset.
@@ -4204,31 +4316,19 @@ def kernel_rod_mpm_gather_exact(
     for i_s, i_b in qd.ndrange(
         *rod_mpm_contact.samples_is_touching.shape, axes=qd.static(eoa(rod_mpm_contact.samples_is_touching))
     ):
-        pos, radius, is_in_grid = func_rod_mpm_sample(
-            i_s, i_b, mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info
+        is_touching, mass, momentum, normal, cell_base = func_rod_mpm_sample_touch(
+            i_s, i_b, mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info, legacy_coupler_info
         )
-        is_touching = False
-        if is_in_grid:
-            mass, momentum, grad, mass_ref, cell_base = func_rod_mpm_gather(
-                rod_mpm_contact.samples_contact_pos[i_s, i_b], i_b, mpm_state, mpm_info, is_gradient_only=False
-            )
-            grad_norm = grad.norm()
-            if (
-                mass > rod_info.EPS[None]
-                and mass > legacy_coupler_info.rod_mpm_surface_fill[None] * mass_ref
-                and grad_norm * mpm_info.dx[None] > legacy_coupler_info.rod_mpm_fill_grad_min[None] * mass_ref
-            ):
-                is_touching = True
-                normal = -grad / grad_norm
-                rod_mpm_contact.samples_mass[i_s, i_b] = mass
-                rod_mpm_contact.samples_momentum[i_s, i_b] = momentum
-                rod_mpm_contact.samples_normal[i_s, i_b] = mass * normal
-                # The share of the grid nodes is gathered anew at every substep (see kernel_rod_mpm_gather), and so are
-                # their owners, from a key above the key of every sample
-                for offset in qd.static(qd.grouped(qd.ndrange(3, 3, 3))):
-                    cell = cell_base + offset
-                    rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b] = 0.0
-                    rod_mpm_contact.grid_owner[cell[0], cell[1], cell[2], i_b] = 27 * rod_mpm_contact.samples_t.shape[0]
+        if is_touching:
+            rod_mpm_contact.samples_mass[i_s, i_b] = mass
+            rod_mpm_contact.samples_momentum[i_s, i_b] = momentum
+            rod_mpm_contact.samples_normal[i_s, i_b] = mass * normal
+            # The share of the grid nodes is gathered anew at every substep (see kernel_rod_mpm_gather), and so are
+            # their owners, from a key above the key of every sample
+            for offset in qd.static(qd.grouped(qd.ndrange(3, 3, 3))):
+                cell = cell_base + offset
+                rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b] = 0.0
+                rod_mpm_contact.grid_owner[cell[0], cell[1], cell[2], i_b] = 27 * rod_mpm_contact.samples_t.shape[0]
         rod_mpm_contact.samples_is_touching[i_s, i_b] = is_touching
 
     # The sample of the lowest key owns a node, whatever the order of the threads
@@ -4270,14 +4370,7 @@ def kernel_rod_mpm_share(
         *rod_mpm_contact.samples_is_touching.shape, axes=qd.static(eoa(rod_mpm_contact.samples_is_touching))
     ):
         if rod_mpm_contact.samples_is_touching[i_s, i_b]:
-            i_e = rod_mpm_contact.samples_edge_idx[i_s]
-            t = rod_mpm_contact.samples_t[i_s]
-            i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
-            share = gs.qd_float(0.0)
-            for i_v, weight in qd.static(((i_v_s, 1.0 - t), (i_v_e, t))):
-                is_approaching, _, _ = func_rod_mpm_vert_contact(i_v, i_b, rod_state, rod_info)
-                if is_approaching:
-                    share = share + weight / rod_state.verts.mpm_mass[i_v, i_b]
+            share = func_rod_mpm_sample_share(i_s, i_b, rod_state, rod_mpm_contact, rod_info)
             base, _, w = func_quadratic_bspline_stencil(rod_mpm_contact.samples_contact_pos[i_s, i_b], mpm_info)
             cell_base = base - mpm_info.grid_offset[None]
             for offset in qd.static(qd.grouped(qd.ndrange(3, 3, 3))):
@@ -4302,14 +4395,7 @@ def kernel_rod_mpm_share_exact(
         *rod_mpm_contact.samples_is_touching.shape, axes=qd.static(eoa(rod_mpm_contact.samples_is_touching))
     ):
         if rod_mpm_contact.samples_is_touching[i_s, i_b]:
-            i_e = rod_mpm_contact.samples_edge_idx[i_s]
-            t = rod_mpm_contact.samples_t[i_s]
-            i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
-            share = gs.qd_float(0.0)
-            for i_v, weight in qd.static(((i_v_s, 1.0 - t), (i_v_e, t))):
-                is_approaching, _, _ = func_rod_mpm_vert_contact(i_v, i_b, rod_state, rod_info)
-                if is_approaching:
-                    share = share + weight / rod_state.verts.mpm_mass[i_v, i_b]
+            share = func_rod_mpm_sample_share(i_s, i_b, rod_state, rod_mpm_contact, rod_info)
             base, fx, w = func_quadratic_bspline_stencil(rod_mpm_contact.samples_contact_pos[i_s, i_b], mpm_info)
             # A runtime loop over the stencil keeps a single inlined copy of the bin updates
             for i_o in range(27):
@@ -4324,15 +4410,12 @@ def kernel_rod_mpm_share_exact(
         rod_mpm_contact.samples_is_touching.shape[1],
         axes=qd.static(eoa(rod_mpm_contact.samples_is_touching)),
     ):
-        i_s = i_k // 27
-        if rod_mpm_contact.samples_is_touching[i_s, i_b]:
-            base, fx, w = func_quadratic_bspline_stencil(rod_mpm_contact.samples_contact_pos[i_s, i_b], mpm_info)
-            cell = base - mpm_info.grid_offset[None] + qd.Vector([i_k % 27 // 9, i_k % 9 // 3, i_k % 3], dt=gs.qd_int)
-            if rod_mpm_contact.grid_owner[cell[0], cell[1], cell[2], i_b] == i_k:
-                rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b] = func_carry_free_sum_read(
-                    3 * i_k, i_b, rod_mpm_contact.nodes_sums
-                )
-                func_carry_free_sum_clear(3 * i_k, i_b, rod_mpm_contact.nodes_sums)
+        is_owner, cell = func_rod_mpm_owned_node(i_k, i_b, rod_mpm_contact, mpm_info)
+        if is_owner:
+            rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b] = func_carry_free_sum_read(
+                3 * i_k, i_b, rod_mpm_contact.nodes_sums
+            )
+            func_carry_free_sum_clear(3 * i_k, i_b, rod_mpm_contact.nodes_sums)
 
 
 @qd.kernel(fastcache=True)
@@ -4354,18 +4437,7 @@ def kernel_rod_mpm_grid_inv_mass(
             i_e = rod_mpm_contact.samples_edge_idx[i_s]
             t = rod_mpm_contact.samples_t[i_s]
             i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
-            base, _, w = func_quadratic_bspline_stencil(rod_mpm_contact.samples_contact_pos[i_s, i_b], mpm_info)
-            cell_base = base - mpm_info.grid_offset[None]
-            inv_mass = gs.qd_float(0.0)
-            for offset in qd.static(qd.grouped(qd.ndrange(3, 3, 3))):
-                cell = cell_base + offset
-                weight_node = w[offset[0], 0] * w[offset[1], 1] * w[offset[2], 2]
-                inv_mass = inv_mass + (
-                    weight_node
-                    * mpm_state.grid.mass[cell[0], cell[1], cell[2], i_b]
-                    / mpm_info.particle_volume_scale[None]
-                    * rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b]
-                )
+            inv_mass = func_rod_mpm_sample_inv_mass(i_s, i_b, mpm_state, rod_mpm_contact, mpm_info)
             for i_v, weight in qd.static(((i_v_s, 1.0 - t), (i_v_e, t))):
                 is_approaching, _, _ = func_rod_mpm_vert_contact(i_v, i_b, rod_state, rod_info)
                 if is_approaching:
@@ -4380,8 +4452,8 @@ def kernel_rod_mpm_grid_inv_mass_exact(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):
     """
-    Twin of kernel_rod_mpm_grid_inv_mass whose sums are the same whatever the order of the threads (see
-    'RodMPMContact'), its launches reversed by the autodiff of kernel_rod_mpm_grid_inv_mass.
+    Twin of kernel_rod_mpm_grid_inv_mass whose sums are the same whatever the order of the threads (see 'RodMPMContact'), its
+    launches reversed by the autodiff of kernel_rod_mpm_grid_inv_mass.
 
     Each vertex gathers the samples of its two edges that touch in a fixed order, each sample computing the inverse mass
     of its stencil for both of its vertices.
@@ -4399,20 +4471,9 @@ def kernel_rod_mpm_grid_inv_mass_exact(
                     ):
                         if rod_mpm_contact.samples_is_touching[i_s, i_b]:
                             t = rod_mpm_contact.samples_t[i_s]
-                            base, fx, w = func_quadratic_bspline_stencil(
-                                rod_mpm_contact.samples_contact_pos[i_s, i_b], mpm_info
+                            inv_mass = inv_mass + qd.select(i_slot == 0, t, 1.0 - t) * func_rod_mpm_sample_inv_mass(
+                                i_s, i_b, mpm_state, rod_mpm_contact, mpm_info
                             )
-                            inv_mass_sample = gs.qd_float(0.0)
-                            for i_o in range(27):
-                                offset, weight_node = func_rod_mpm_stencil_offset(i_o, w)
-                                cell = base - mpm_info.grid_offset[None] + offset
-                                inv_mass_sample = inv_mass_sample + (
-                                    weight_node
-                                    * mpm_state.grid.mass[cell[0], cell[1], cell[2], i_b]
-                                    / mpm_info.particle_volume_scale[None]
-                                    * rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b]
-                                )
-                            inv_mass = inv_mass + qd.select(i_slot == 0, t, 1.0 - t) * inv_mass_sample
             rod_state.verts.mpm_inv_mass[i_v, i_b] = inv_mass / rod_state.verts.mpm_mass[i_v, i_b]
 
 
@@ -4455,12 +4516,7 @@ def kernel_rod_mpm_scatter(
         *rod_mpm_contact.samples_is_touching.shape, axes=qd.static(eoa(rod_mpm_contact.samples_is_touching))
     ):
         if rod_mpm_contact.samples_is_touching[i_s, i_b]:
-            i_e = rod_mpm_contact.samples_edge_idx[i_s]
-            t = rod_mpm_contact.samples_t[i_s]
-            i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
-            dv = qd.Vector.zero(gs.qd_float, 3)
-            for i_v, weight in qd.static(((i_v_s, 1.0 - t), (i_v_e, t))):
-                dv = dv - weight / rod_state.verts.mpm_mass[i_v, i_b] * rod_state.verts.mpm_impulse[i_v, i_b]
+            dv = func_rod_mpm_sample_dv(i_s, i_b, rod_state, rod_mpm_contact, rod_info)
             base, _, w = func_quadratic_bspline_stencil(rod_mpm_contact.samples_contact_pos[i_s, i_b], mpm_info)
             cell_base = base - mpm_info.grid_offset[None]
             for offset in qd.static(qd.grouped(qd.ndrange(3, 3, 3))):
@@ -4470,10 +4526,7 @@ def kernel_rod_mpm_scatter(
                     qd.atomic_add(mpm_state.grid.vel_out[cell[0], cell[1], cell[2], i_b], weight_node * dv)
 
     for i_v, i_b in qd.ndrange(*rod_state.verts.vel.shape, axes=qd.static(eoa(rod_state.verts.vel))):
-        rod_state.verts.vel[i_v, i_b] = (
-            rod_state.verts.vel[i_v, i_b]
-            + func_inverse_mass(i_v, i_b, rod_state, rod_info) * rod_state.verts.mpm_impulse[i_v, i_b]
-        )
+        rod_state.verts.vel[i_v, i_b] = func_rod_mpm_vert_vel(i_v, i_b, rod_state, rod_info)
 
 
 @register_custom_backward(lambda *args: kernel_rod_mpm_scatter.grad(*args))
@@ -4482,8 +4535,8 @@ def kernel_rod_mpm_scatter_exact(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):
     """
-    Twin of kernel_rod_mpm_scatter whose sums are the same whatever the order of the threads (see 'RodMPMContact'),
-    its launches reversed by the autodiff of kernel_rod_mpm_scatter.
+    Twin of kernel_rod_mpm_scatter whose sums are the same whatever the order of the threads (see 'RodMPMContact'), its
+    launches reversed by the autodiff of kernel_rod_mpm_scatter.
 
     Each sample that touches adds its change of velocity to the sums of the owners of the nodes of its stencil, and each
     owner then adds its sum to its node once.
@@ -4492,12 +4545,7 @@ def kernel_rod_mpm_scatter_exact(
         *rod_mpm_contact.samples_is_touching.shape, axes=qd.static(eoa(rod_mpm_contact.samples_is_touching))
     ):
         if rod_mpm_contact.samples_is_touching[i_s, i_b]:
-            i_e = rod_mpm_contact.samples_edge_idx[i_s]
-            t = rod_mpm_contact.samples_t[i_s]
-            i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
-            dv = qd.Vector.zero(gs.qd_float, 3)
-            for i_v, weight in qd.static(((i_v_s, 1.0 - t), (i_v_e, t))):
-                dv = dv - weight / rod_state.verts.mpm_mass[i_v, i_b] * rod_state.verts.mpm_impulse[i_v, i_b]
+            dv = func_rod_mpm_sample_dv(i_s, i_b, rod_state, rod_mpm_contact, rod_info)
             base, fx, w = func_quadratic_bspline_stencil(rod_mpm_contact.samples_contact_pos[i_s, i_b], mpm_info)
             # A runtime loop over the nodes of the stencil and the components keeps a single inlined copy of the bin
             # updates
@@ -4516,22 +4564,15 @@ def kernel_rod_mpm_scatter_exact(
         rod_mpm_contact.samples_is_touching.shape[1],
         axes=qd.static(eoa(rod_mpm_contact.samples_is_touching)),
     ):
-        i_s = i_k // 27
-        if rod_mpm_contact.samples_is_touching[i_s, i_b]:
-            base, fx, w = func_quadratic_bspline_stencil(rod_mpm_contact.samples_contact_pos[i_s, i_b], mpm_info)
-            cell = base - mpm_info.grid_offset[None] + qd.Vector([i_k % 27 // 9, i_k % 9 // 3, i_k % 3], dt=gs.qd_int)
-            if rod_mpm_contact.grid_owner[cell[0], cell[1], cell[2], i_b] == i_k:
-                if mpm_state.grid.mass[cell[0], cell[1], cell[2], i_b] > rod_info.EPS[None]:
-                    dv = qd.Vector.zero(gs.qd_float, 3)
-                    for k in range(3):
-                        dv[k] = func_carry_free_sum_read(3 * i_k + k, i_b, rod_mpm_contact.nodes_sums)
-                        func_carry_free_sum_clear(3 * i_k + k, i_b, rod_mpm_contact.nodes_sums)
-                    mpm_state.grid.vel_out[cell[0], cell[1], cell[2], i_b] = (
-                        mpm_state.grid.vel_out[cell[0], cell[1], cell[2], i_b] + dv
-                    )
+        is_owner, cell = func_rod_mpm_owned_node(i_k, i_b, rod_mpm_contact, mpm_info)
+        if is_owner and mpm_state.grid.mass[cell[0], cell[1], cell[2], i_b] > rod_info.EPS[None]:
+            dv = qd.Vector.zero(gs.qd_float, 3)
+            for k in range(3):
+                dv[k] = func_carry_free_sum_read(3 * i_k + k, i_b, rod_mpm_contact.nodes_sums)
+                func_carry_free_sum_clear(3 * i_k + k, i_b, rod_mpm_contact.nodes_sums)
+            mpm_state.grid.vel_out[cell[0], cell[1], cell[2], i_b] = (
+                mpm_state.grid.vel_out[cell[0], cell[1], cell[2], i_b] + dv
+            )
 
     for i_v, i_b in qd.ndrange(*rod_state.verts.vel.shape, axes=qd.static(eoa(rod_state.verts.vel))):
-        rod_state.verts.vel[i_v, i_b] = (
-            rod_state.verts.vel[i_v, i_b]
-            + func_inverse_mass(i_v, i_b, rod_state, rod_info) * rod_state.verts.mpm_impulse[i_v, i_b]
-        )
+        rod_state.verts.vel[i_v, i_b] = func_rod_mpm_vert_vel(i_v, i_b, rod_state, rod_info)
