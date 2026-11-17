@@ -463,16 +463,18 @@ def func_add_edge_pair_sums(
     """Add the moves of the four vertices of a pair of edges in contact to their slots of exact sums.
 
     Each vertex moves by its inverse mass times its weight in its closest point times the impulse, the vertices of the
-    second edge by the opposite impulse.
+    second edge by the opposite impulse. A vertex that does not move, of zero inverse mass or weight, adds nothing,
+    which leaves its slots empty where it takes part in no contact (see 'n_contacts' in RodVertsState).
     """
     # A runtime loop over the vertices and components keeps a single inlined copy of the bin updates
     for i_t in range(12):
         i_c_v = i_t // 3
         i_v = verts_idx[i_c_v]
         sign = qd.select(i_c_v < 2, 1.0, -1.0)
-        func_exact_sum_add(
-            3 * i_v + i_t % 3, i_b, sign * inv_masses[i_c_v] * weights[i_c_v] * impulse[i_t % 3], exact_sums
-        )
+        if inv_masses[i_c_v] * weights[i_c_v] > 0.0:
+            func_exact_sum_add(
+                3 * i_v + i_t % 3, i_b, sign * inv_masses[i_c_v] * weights[i_c_v] * impulse[i_t % 3], exact_sums
+            )
 
 
 @qd.func
@@ -1085,9 +1087,11 @@ def kernel_project_rod_contacts(
                             is_exact=IS_EXACT,
                         )
 
+    # A vertex moved by no contact holds empty sums and keeps its zero correction (see func_add_edge_pair_sums)
     if qd.static(IS_EXACT):
         for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
-            rod_state.verts.dp_contact[i_v, i_b] = func_take_verts_sums(i_v, i_b, rod_state.verts.dp_contact_sums)
+            if rod_state.verts.n_contacts[i_v, i_b] > 0:
+                rod_state.verts.dp_contact[i_v, i_b] = func_take_verts_sums(i_v, i_b, rod_state.verts.dp_contact_sums)
 
 
 @reversed_with(is_backward=True)
