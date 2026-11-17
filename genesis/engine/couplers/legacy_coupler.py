@@ -274,8 +274,9 @@ class RodMPMContact(Data, kind=DataKind.SCRATCH):
     # The owner of each node of the stencils of the samples that touch: the lowest key, 27 times the sample plus the
     # offset of the node in its stencil, of the samples whose stencils cover it (see 'func_rod_mpm_node_sum')
     grid_owner: qd.Tensor = field(int, shape=(GRID_X, GRID_Y, GRID_Z, ENVS), labels=ROD_MPM_DETERMINISTIC)
-    # The samples that touch sorted by the lowest cell of their stencil, a slot hashing each cell
-    hash_grid: SpatialHashGrid
+    # The samples that touch sorted by the lowest cell of their stencil, a slot hashing each cell, sorted anew at every
+    # substep
+    hash_grid: SpatialHashGrid = field(kind=DataKind.SCRATCH)
 
 
 class LegacyCouplerState(Data, kind=DataKind.STATE):
