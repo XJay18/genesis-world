@@ -375,10 +375,15 @@ def test_vertex_constraints_reset_with_state(show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("contact_margin", [None, 1e-6])
-def test_rod_contacts_match_reference(contact_margin, show_viewer):
+def test_rod_contacts_match_reference(contact_margin, asset_tmp_path, show_viewer):
     # FIXME: the reference trajectory is a recorded GPU run of this scene. Replace with physics-informed assertions on
     # the contacts between the rods.
     ref = np.load(os.path.join(os.path.dirname(__file__), "data", "s1_hanging_gpu_200steps.npz"))
+    coil_radius = 0.005
+    angle = np.linspace(0.0, 6.0 * np.pi, 60)
+    coil = np.stack([0.03 * np.cos(angle), 0.03 * np.sin(angle), 0.9 * coil_radius * angle / np.pi], axis=-1)
+    file = str(asset_tmp_path / "rod_coil_overlapping.npy")
+    np.save(file, coil)
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1e-3,
@@ -390,8 +395,8 @@ def test_rod_contacts_match_reference(contact_margin, show_viewer):
             contact_margin=contact_margin,
         ),
         viewer_options=gs.options.ViewerOptions(
-            camera_pos=(0.8, -0.5, 0.8),
-            camera_lookat=(0.8, 0.45, 0.2),
+            camera_pos=(0.3, -0.9, 1.0),
+            camera_lookat=(0.3, 0.45, 0.1),
         ),
         show_viewer=show_viewer,
     )
@@ -424,17 +429,34 @@ def test_rod_contacts_match_reference(contact_margin, show_viewer):
                 ),
             )
         )
-    scene.build(n_envs=1)
+    # A coil far from the hanging rods whose turns overlap their neighbours, which falls and settles in a pile, each of
+    # its vertices taking the corrections of several contacts
+    coil = scene.add_entity(
+        morph=gs.morphs.Rod(
+            file=file,
+            pos=(-0.5, 0.5, 0.05),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=coil_radius,
+        ),
+    )
+    scene.build(n_envs=2)
     for rod, verts_idx in zip(rods, ([0, 1], [78, 79], [0, 1, 2], [0, 1, 2])):
         rod.set_verts_fixed(True, verts_idx)
     assert_equal([(rod.v_start, rod.n_verts, rod.e_start, rod.n_edges) for rod in rods], ref["rod_ranges"])
 
     pos = [torch.cat([rod.get_verts_pos() for rod in rods], dim=1)]
+    coil_pos = [coil.get_verts_pos()]
     for _ in range(ref["step"][-1] // 10):
         for _ in range(10):
             scene.step()
         pos.append(torch.cat([rod.get_verts_pos() for rod in rods], dim=1))
+        coil_pos.append(coil.get_verts_pos())
     assert_allclose(torch.stack(pos), ref["pos"], atol=1e-3)
+    # The contacts sum the corrections of a vertex in an order independent of the threads with deterministic
+    # algorithms, so identical environments stay bitwise identical
+    for verts_pos in (torch.stack(pos), torch.stack(coil_pos)):
+        assert_equal(verts_pos[:, 0], verts_pos[:, 1])
 
 
 @pytest.mark.required
@@ -669,8 +691,10 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
             assert_allclose(heights[-1], block_top + 0.005, atol=0.5 * dx)
             sink_rate = (heights[-n_steps_settled] - heights[-1]) / (n_steps_settled * 1e-3)
             assert (sink_rate.abs() < 5e-3).all()
-    # The impulses of the grid nodes on a vertex add up through atomics, whose order varies
-    assert_allclose(rod.get_verts_pos()[0], rod.get_verts_pos()[1], tol=1e-9)
+    # The contacts with the grid nodes sum their terms in an order independent of the threads with deterministic
+    # algorithms, so identical environments stay bitwise identical
+    for state in (scene.rod_solver.get_verts_pos(), block.get_particles_pos()):
+        assert_equal(state[0], state[1])
 
 
 @pytest.mark.required
@@ -1342,6 +1366,11 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
     rims_penetration = np.array(rims_penetration)
     assert np.abs(np.diff(rims_penetration[n_close_steps:], axis=0)).max() < 1e-5
 
+    # The contacts sum their impulses on the vertices and on the links in an order independent of the threads with
+    # deterministic algorithms, so identical environments stay bitwise identical
+    for state in (scene.rod_solver.get_verts_pos(), scene.rigid_solver.get_qpos()):
+        assert_equal(state[0], state[1])
+
     # A rod stays on a slope below the friction angle, and slides down the other with the acceleration of Coulomb
     # friction, its positions integrated by symplectic Euler over the substeps
     n_substeps, substep_dt = 5 * (n_close_steps + n_lift_steps), 2e-4
@@ -1815,3 +1844,102 @@ def test_rod_rigid_slow_grip_lifts_rod_from_ground(two_pad_gripper, show_viewer)
     assert carriage.get_pos()[2] > 0.0215 + 0.09
     assert_allclose(rod.get_verts_pos()[:, 2] - carriage.get_pos()[2], grasp_offset, atol=2e-3)
     assert speed_max < pads_speed_max + 0.1
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.gpu])
+def test_gpu_simulation_determinism(asset_tmp_path, show_viewer):
+    # Run-to-run reproducibility on GPU under deterministic algorithms, where the threads add the contacts of the rods
+    # in an order that changes from one run to the next: every trial from the same initial state must reproduce a
+    # bit-identical trajectory of the rods, the rigid bodies and the MPM particles they push
+    n_trials, n_steps, radius = 3, 30, 0.005
+    angle = np.linspace(0.0, 6.0 * np.pi, 60)
+    coil = np.stack([0.03 * np.cos(angle), 0.03 * np.sin(angle), 0.9 * radius * angle / np.pi], axis=-1)
+    file = str(asset_tmp_path / "rod_coil_overlapping.npy")
+    np.save(file, coil)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+        ),
+        mpm_options=gs.options.MPMOptions(
+            lower_bound=(-0.1, -0.1, -0.05),
+            upper_bound=(0.1, 0.1, 0.15),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.25, -0.6, 0.4),
+            camera_lookat=(0.25, 0.0, 0.05),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.5,
+        ),
+    )
+    # A coil whose turns overlap their neighbours, lying on a free box: the contacts of each vertex with the other turns
+    # and with the box, and the reactions of the contacts on the box
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.5, 0.0, 0.02),
+            size=(0.1, 0.1, 0.04),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.5,
+        ),
+    )
+    scene.add_entity(
+        morph=gs.morphs.Rod(
+            file=file,
+            pos=(0.5, 0.0, 0.04 + radius),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=radius,
+        ),
+    )
+    # A rod lying on an MPM block: the contacts of its vertices with the patches of material under them, and their
+    # impulses on the grid nodes
+    block = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.03),
+            size=(0.06, 0.06, 0.06),
+        ),
+        material=gs.materials.MPM.Elastic(),
+    )
+    scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=10,
+            interval=0.005,
+            pos=(-0.0225, 0.0, 0.06 + radius),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=radius,
+        ),
+    )
+    scene.build()
+
+    trials = []
+    for _ in range(n_trials):
+        scene.reset()
+        steps = []
+        for _ in range(n_steps):
+            scene.step()
+            steps.append(
+                [
+                    tensor_to_array(state).copy()
+                    for state in (
+                        scene.rod_solver.get_verts_pos(),
+                        scene.rod_solver.get_verts_vel(),
+                        scene.rigid_solver.get_qpos(),
+                        block.get_particles_pos(),
+                    )
+                ]
+            )
+        trials.append(steps)
+    for steps in trials[1:]:
+        for states, states_ref in zip(steps, trials[0]):
+            for state, state_ref in zip(states, states_ref):
+                assert_equal(state, state_ref)
