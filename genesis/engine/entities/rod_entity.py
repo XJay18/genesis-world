@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -6,9 +7,14 @@ import torch
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.entities.rigid_entity import RigidLink
+from genesis.options.surfaces import Surface
 from genesis.utils.misc import broadcast_tensor
 
 from .base_entity import Entity
+
+if TYPE_CHECKING:
+    from genesis.engine.scene import Scene
+    from genesis.engine.solvers.rod_solver import RodSolver
 
 
 class RodEntity(Entity):
@@ -25,10 +31,6 @@ class RodEntity(Entity):
         The simulation scene that this entity belongs to.
     solver : RodSolver
         The solver simulating the entity.
-    material : gs.materials.Rod.Base
-        The material of the rod.
-    morph : gs.morphs.Rod | gs.morphs.ParameterizedRod
-        The morph specifying the initial shape of the rod.
     surface : Surface
         The surface the rod is rendered with.
     idx : int
@@ -37,12 +39,24 @@ class RodEntity(Entity):
         Index of the rod within the solver.
     v_start, e_start, h_start : int
         Index of the first vertex, edge and hinge of the rod within the solver.
+    spec : gs.entities.Rod
+        The entity spec the rod is constructed from, whose morph gives its initial shape.
     """
 
     def __init__(
-        self, scene, solver, material, morph, surface, idx, rod_idx, v_start, e_start, h_start, name: str | None = None
-    ):
-        super().__init__(idx, scene, morph, solver, material, surface, name=name)
+        self,
+        scene: "Scene",
+        solver: "RodSolver",
+        surface: Surface,
+        idx: int,
+        rod_idx: int,
+        v_start: int,
+        e_start: int,
+        h_start: int,
+        spec: "gs.entities.Rod",
+    ) -> None:
+        super().__init__(idx, scene, solver, surface, spec)
+        morph = spec.morph
 
         self._rod_idx = rod_idx
         self._v_start = v_start
@@ -83,6 +97,10 @@ class RodEntity(Entity):
         self.init_positions_COM_offset = torch.tensor(
             init_positions - (verts_COM + offset_shift), dtype=gs.tc_float, device=gs.device
         )
+
+    @gs.assert_unbuilt
+    def _build(self) -> None:
+        self._is_built = True
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- basic entity ops -------------------------------
@@ -232,14 +250,17 @@ class RodEntity(Entity):
         """Set the twisting stiffness of the rod in some environments, in Pa (see 'RodSolver.set_rods_stiffness')."""
         self._solver.set_rods_stiffness(stiffness, self._rod_idx, envs_idx, kind=2)
 
+    @gs.assert_built
     def get_stretching_stiffness(self, envs_idx=None):
         """Get the stretching stiffness of the rod in some environments, in Pa."""
         return self._solver.get_rods_stiffness(self._rod_idx, envs_idx, kind=0)[..., 0]
 
+    @gs.assert_built
     def get_bending_stiffness(self, envs_idx=None):
         """Get the bending stiffness of the rod in some environments, in Pa."""
         return self._solver.get_rods_stiffness(self._rod_idx, envs_idx, kind=1)[..., 0]
 
+    @gs.assert_built
     def get_twisting_stiffness(self, envs_idx=None):
         """Get the twisting stiffness of the rod in some environments, in Pa."""
         return self._solver.get_rods_stiffness(self._rod_idx, envs_idx, kind=2)[..., 0]
@@ -263,6 +284,7 @@ class RodEntity(Entity):
         verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True, batched_idx=True)
         self._solver.set_verts_fixed(fixed, verts_idx, envs_idx)
 
+    @gs.assert_built
     def get_verts_kinematic(self, verts_idx_local=None, envs_idx=None):
         """
         Get whether some vertices move kinematically, fixed or constrained (see 'RodSolver.get_verts_kinematic').
@@ -308,6 +330,7 @@ class RodEntity(Entity):
         verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True, batched_idx=True)
         self._solver.remove_vertex_constraints(verts_idx, envs_idx)
 
+    @gs.assert_built
     def get_verts_contact_geom_idx(self, verts_idx_local=None, envs_idx=None):
         """
         Get a rigid geom each vertex penetrated during the last step, -1 for none (see
@@ -323,6 +346,7 @@ class RodEntity(Entity):
         verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True)
         return self._solver.get_verts_contact_geom_idx(verts_idx, envs_idx)
 
+    @gs.assert_built
     def get_geodesic_distance(self, verts_idx_start, verts_idx_end, envs_idx=None):
         """
         Get the length of the rod between two of its vertices, the sum of the current lengths of the edges joining them.
@@ -347,12 +371,14 @@ class RodEntity(Entity):
         """
         if not 0 <= verts_idx_start < verts_idx_end <= self.n_edges:
             gs.raise_exception(
-                f"Expected vertex indices 0 <= start < end <= {self.n_edges}, got {verts_idx_start} and {verts_idx_end}."
+                f"Expected vertex indices 0 <= start < end <= {self.n_edges}, got {verts_idx_start} and "
+                f"{verts_idx_end}."
             )
         verts_idx = [self._v_start + i_v % self.n_verts for i_v in range(verts_idx_start, verts_idx_end + 1)]
         verts_pos = self._solver.get_verts_pos(verts_idx, envs_idx)
         return torch.linalg.norm(verts_pos[..., 1:, :] - verts_pos[..., :-1, :], dim=-1).sum(dim=-1)
 
+    @gs.assert_built
     def get_total_length(self, envs_idx=None):
         """
         Get the current length of the rod, the sum of the current lengths of its edges, closing edge of a loop included.
@@ -364,6 +390,7 @@ class RodEntity(Entity):
         """
         return self.get_geodesic_distance(verts_idx_start=0, verts_idx_end=self.n_edges, envs_idx=envs_idx)
 
+    @gs.assert_built
     def get_energy(self, envs_idx=None):
         """
         Get the stretching, bending and twisting energies of the rod at its current state, in J.

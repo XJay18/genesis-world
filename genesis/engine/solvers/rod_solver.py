@@ -1,7 +1,7 @@
 import math
 from collections.abc import Iterator
 from enum import auto
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import torch
@@ -13,10 +13,10 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.entities.rod_entity import RodEntity
-from genesis.engine.materials import Rod
 from genesis.engine.solvers.rigid.data import LinksState
 from genesis.engine.state_change import StateChange, mutates
 from genesis.grad.bridge import no_grad
+from genesis.options.surfaces import Surface
 from genesis.utils.data import ENVS, Config, ConfigItem, Data, DataItem, DataKind, Size, eoa, field, iter_data
 from genesis.utils.geom import qd_transform_by_trans_quat
 from genesis.utils.misc import broadcast_tensor, qd_from_torch, qd_isfinite, qd_to_torch, qd_zero_grad, tensor_to_array
@@ -25,7 +25,7 @@ from .base_solver import ErrorCode, GravityMixin, Solver, TimeBasedMixin
 
 if TYPE_CHECKING:
     from genesis.engine.couplers import LegacyCoupler
-    from genesis.engine.scene import Scene
+    from genesis.engine.entities.base_entity import EntityDescription
     from genesis.engine.simulator import Simulator
 
 
@@ -181,9 +181,9 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
     # The position of the vertex when the broadphase ran, compared with the projections of the substep against its
     # margin (see 'kernel_project_rod_contacts')
     pos_broadphase: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, labels=ROD_BROADPHASE)
-    # The patch of MPM material the vertex meets, gathered over the samples of its edges in contact, each sample weighted
-    # by the weight of the vertex in it: its mass, momentum and mass-weighted outward normal, the inverse mass of the
-    # patch seen by the vertex, and the impulse the vertex takes from it (see 'kernel_rod_mpm_gather' in
+    # The patch of MPM material the vertex meets, gathered over the samples of its edges in contact, each sample
+    # weighted by the weight of the vertex in it: its mass, momentum and mass-weighted outward normal, the inverse mass
+    # of the patch seen by the vertex, and the impulse the vertex takes from it (see 'kernel_rod_mpm_gather' in
     # legacy_coupler.py)
     mpm_mass: qd.Tensor = field(float, kind=DataKind.SCRATCH, grad=True, opt_in=True)
     mpm_momentum: qd.Tensor = field((float, 3), kind=DataKind.SCRATCH, grad=True, opt_in=True)
@@ -352,14 +352,14 @@ class RodData(Data):
         options = solver._options
         super().__init__(
             sizes=dict(
-                envs=solver._B,
+                envs=solver.n_envs_,
                 rods=solver.n_rods,
                 rod_verts=solver.n_verts,
                 rod_edges=solver.n_edges,
                 rod_hinges=solver.n_hinges,
                 rod_edge_pairs=solver.n_edge_pair_candidates,
                 rod_bvh_nodes=2 * solver.n_bvh_leaves,
-                rod_rigid_links=solver._sim.rigid_solver.n_links,
+                rod_rigid_links=solver.sim.rigid_solver.n_links,
             ),
             values=dict(
                 rod_info=dict(
@@ -1266,14 +1266,15 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
     rod-rod contacts. The backward pass of a step replays each substep from its start (see 'LaunchRecorder').
     """
 
+    entity_spec_cls: ClassVar[type[gs.entities.Spec]] = gs.entities.Rod
+
     # Its whole state lives in the arrays 'data' yields (see 'CheckpointMixin')
     is_checkpointable = True
 
-    material_cls = Rod.Base
     is_differentiable = True
 
-    def __init__(self, scene: "Scene", sim: "Simulator", options) -> None:
-        super().__init__(scene, sim, options)
+    def __init__(self, sim: "Simulator", options) -> None:
+        super().__init__(sim, options)
 
         self._n_pbd_iters = options.n_pbd_iters
         self._adjacent_gap = options.adjacent_gap
@@ -1294,19 +1295,19 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         self._edges_rod_idx: torch.Tensor | None = None
         self._hinges_rod_idx: torch.Tensor | None = None
 
-    def add_entity(self, idx, material, morph, surface, visualize_contact=False, name=None, desc=None) -> RodEntity:
+    def add_entity(
+        self, idx: int, surface: Surface, spec: "gs.entities.Rod", desc: "EntityDescription | None" = None
+    ) -> RodEntity:
         entity = RodEntity(
-            scene=self._scene,
+            scene=self._sim.scene,
             solver=self,
-            material=material,
-            morph=morph,
             surface=surface,
             idx=idx,
             rod_idx=self.n_rods,
             v_start=self.n_verts,
             e_start=self.n_edges,
             h_start=self.n_hinges,
-            name=name,
+            spec=spec,
         )
         self._entities.append(entity)
         return entity
@@ -1315,9 +1316,9 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
     # ------------------------------------ build -----------------------------------------
     # ------------------------------------------------------------------------------------
 
-    def build(self):
-        super().build()
-        self.n_envs = self._sim.n_envs
+    @gs.assert_unbuilt
+    def build(self, n_envs: int) -> None:
+        super().build(n_envs)
         edge_pairs_idx = np.zeros((0, 2), dtype=gs.np_int)
         if self.is_active:
             self._n_edge_pairs = self._count_edge_pairs()
@@ -1351,20 +1352,22 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         self.register_errors(
             self.data_manager.errno,
             {
-                RodErrorCode.INVALID_VERTEX_NAN: (
+                RodErrorCode.INVALID_VERTEX_NAN: lambda: (
                     "NaN detected in rod states. Try reducing the time step size or adjusting simulation parameters."
                 ),
-                RodErrorCode.OVERFLOW_ROD_CANDIDATES: (
+                RodErrorCode.OVERFLOW_ROD_CANDIDATES: lambda: (
                     f"Exceeding max number of candidate pairs of rod edges ({self._n_edge_pair_candidates}). Please "
                     "increase the value of RodOptions' option 'multiplier_contact_candidates'."
                 ),
             },
         )
-        if not self.is_active:
-            return
+        if self.is_active:
+            self._init_rod_data(edge_pairs_idx)
+            self._build_gravity(self.rod_info.gravity)
+        for entity in self._entities:
+            entity._build()
 
-        self._init_rod_data(edge_pairs_idx)
-        self._build_gravity(self.rod_info.gravity)
+        self._is_built = True
 
     def _compute_edge_pairs(self) -> np.ndarray:
         """Return the pairs of edges that can collide, all of them but those of a rod closer than the adjacent gap."""
@@ -1394,7 +1397,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
 
     def _init_rod_data(self, edge_pairs_idx: np.ndarray):
         """Fill the topology, the rest geometry, the material and the initial state of the rods."""
-        B = self._B
+        B = self.n_envs_
         topologies, verts_pos, edges_rest_length, edges_d1, hinges_kappa_rest = [], [], [], [], []
         for entity in self._entities:
             n_verts, is_loop = entity.n_verts, entity.is_loop
@@ -1715,7 +1718,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             target_poss = torch.gather(verts_pos, 1, verts_idx.clamp(min=0)[..., None].expand(-1, -1, 3))
         if link_idx >= 0:
             rigid_solver = self._sim.rigid_solver
-            links_envs_idx = envs_idx if self._scene.n_envs > 0 else None
+            links_envs_idx = envs_idx if self.n_envs > 0 else None
             link_pos = rigid_solver.get_links_pos(links_idx=link_idx, envs_idx=links_envs_idx)
             link_quat = rigid_solver.get_links_quat(links_idx=link_idx, envs_idx=links_envs_idx)
             link_pos = broadcast_tensor(link_pos, gs.tc_float, (len(envs_idx), 1, 3))
@@ -1746,10 +1749,10 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         Get a rigid geom each vertex of the rods penetrated during the last step, -1 for none.
 
         A vertex penetrates a geom where its sphere overlaps it, or the capsule of one of its edges does at a point
-        closer to it than to the other vertex of the edge. Each substep of the step in which a vertex penetrates some geom
-        records the geom it penetrates deepest, so that the geom of the latest such substep is reported, also when the
-        vertex left it before the end of the step. Fixed and constrained vertices, which do not collide with the rigid
-        geoms, never penetrate any. Only the geoms that need coupling are considered.
+        closer to it than to the other vertex of the edge. Each substep of the step in which a vertex penetrates some
+        geom records the geom it penetrates deepest, so that the geom of the latest such substep is reported, also when
+        the vertex left it before the end of the step. Fixed and constrained vertices, which do not collide with the
+        rigid geoms, never penetrate any. Only the geoms that need coupling are considered.
 
         Parameters
         ----------
