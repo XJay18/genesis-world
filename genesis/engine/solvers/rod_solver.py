@@ -673,8 +673,8 @@ def func_constraint_target(i_v: int, i_b: int, rod_state: RodState, links_state:
     return target_pos
 
 
-@qd.kernel(fastcache=True)
-def kernel_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
+@qd.func
+def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
     """Compute the geometry of the rods and the gradients of their elastic energies, from their current state.
 
     The material frames, the curvatures and the twists follow the discrete elastic rod model. Each edge and each hinge
@@ -768,7 +768,13 @@ def kernel_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
 
 
 @qd.kernel(fastcache=True)
-def kernel_update_rod_velocities(rod_state: RodState, rod_info: RodInfo):
+def kernel_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
+    """Compute the geometry of the rods and the gradients of their energies (see func_compute_rod_forces)."""
+    func_compute_rod_forces(rod_state, rod_info)
+
+
+@qd.func
+def func_update_rod_velocities(rod_state: RodState, rod_info: RodInfo):
     """Integrate the velocities and the twist rates of the rods over a substep, from the gradients of their energies.
 
     Every vertex and every edge gathers the gradients of the edges and hinges it belongs to, in a fixed order, which
@@ -807,6 +813,12 @@ def kernel_update_rod_velocities(rod_state: RodState, rod_info: RodInfo):
             rod_state.edges.omega[i_e, i_b] = omega * qd.exp(-dt * rod_info.angular_damping[None])
 
 
+@qd.kernel(fastcache=True)
+def kernel_update_rod_velocities(rod_state: RodState, rod_info: RodInfo):
+    """Integrate the velocities and twist rates of the rods over a substep (see func_update_rod_velocities)."""
+    func_update_rod_velocities(rod_state, rod_info)
+
+
 @qd.func
 def func_gather_inextensibility(i_v: int, i_b: int, rod_state: RodState, rod_info: RodInfo) -> qd.types.vector(3):
     """Return the sum of the corrections the edges of a vertex ask of its position to recover their rest length.
@@ -835,8 +847,8 @@ def func_gather_inextensibility(i_v: int, i_b: int, rod_state: RodState, rod_inf
     return dp
 
 
-@qd.kernel(fastcache=True)
-def kernel_integrate_rod_positions(rod_state: RodState, rod_info: RodInfo):
+@qd.func
+def func_integrate_rod_positions(rod_state: RodState, rod_info: RodInfo):
     """Integrate the positions and the twist angles of the rods over a substep, then compute the first corrections of
     the inextensibility constraints (see 'kernel_project_rod_inextensibility')."""
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
@@ -857,22 +869,44 @@ def kernel_integrate_rod_positions(rod_state: RodState, rod_info: RodInfo):
         rod_state.verts.dp_inextensibility[i_v, i_b] = func_gather_inextensibility(i_v, i_b, rod_state, rod_info)
 
 
+@qd.kernel(fastcache=True)
+def kernel_integrate_rod_positions(rod_state: RodState, rod_info: RodInfo):
+    """Integrate the positions and twist angles of the rods over a substep (see func_integrate_rod_positions)."""
+    func_integrate_rod_positions(rod_state, rod_info)
+
+
 # The projections of the inextensibility and contact constraints run as a chain of kernels, each applying the
 # corrections the previous one computed before computing its own from the positions this leaves. Within a kernel, the
 # positions are written once, linearly, before any loop reads them, so that autodiff reverses every loop at the values
 # it read. The chain of a substep is: 'kernel_integrate_rod_positions', then for each projection the contacts and the
 # inextensibility of the next one, then 'kernel_finalize_rod_positions'.
+@qd.func
+def func_project_rod_inextensibility(
+    rod_state: RodState, rod_info: RodInfo, rod_config: qd.template(), project_inextensibility: qd.template()
+):
+    """
+    Apply the corrections of the last projection, then compute the corrections of the inextensibility constraints.
+
+    Where `project_inextensibility` (a literal, or the argument of the kernel passed by reference, see
+    func_project_rod_contacts) is false, nothing is done: the last projection of a substep leaves the corrections of its
+    contacts to the next stage.
+    """
+    for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
+        if project_inextensibility:
+            rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + func_last_projection_correction(
+                i_v, i_b, rod_state, rod_config
+            )
+
+    for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
+        if project_inextensibility:
+            rod_state.verts.dp_inextensibility[i_v, i_b] = func_gather_inextensibility(i_v, i_b, rod_state, rod_info)
+
+
 @reversed_with_atomic_sums
 @qd.kernel(fastcache=True)
 def kernel_project_rod_inextensibility(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
-    """Apply the corrections of the last projection, then compute the corrections of the inextensibility constraints."""
-    for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
-        rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + func_last_projection_correction(
-            i_v, i_b, rod_state, rod_config
-        )
-
-    for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
-        rod_state.verts.dp_inextensibility[i_v, i_b] = func_gather_inextensibility(i_v, i_b, rod_state, rod_info)
+    """Run a projection of the inextensibility constraints (see func_project_rod_inextensibility)."""
+    func_project_rod_inextensibility(rod_state, rod_info, rod_config, project_inextensibility=True)
 
 
 @qd.func
@@ -943,9 +977,8 @@ def func_query_rod_bvh(
     return n_found
 
 
-@no_grad
-@qd.kernel(fastcache=True)
-def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo, errno: qd.Tensor):
+@qd.func
+def func_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo, errno: qd.Tensor):
     """Find the candidate pairs of edges of the rod-rod contacts of the substep, once the positions are integrated.
 
     The bounding boxes of the edges, grown by their radius and half of the margin, are the leaves of a hierarchy over
@@ -1052,6 +1085,13 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
         func_query_rod_bvh(i_e, i_b, i_start, rod_state, rod_info, is_filling=True)
 
 
+@no_grad
+@qd.kernel(fastcache=True)
+def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo, errno: qd.Tensor):
+    """Find the candidate pairs of edges of the substep (see func_update_rod_contact_candidates)."""
+    func_update_rod_contact_candidates(rod_state, rod_info, errno)
+
+
 @qd.func
 def func_project_rod_edge_pair(
     i_e_a: int,
@@ -1132,10 +1172,12 @@ def func_project_rod_edge_pair(
                     qd.atomic_add(rod_state.verts.n_contacts[i_v_c, i_b], 1)
 
 
-@reversed_with_atomic_sums
-@qd.kernel(fastcache=True)
-def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
+@qd.func
+def func_project_rod_contacts(i_iter: qd.template(), rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
     """Apply the corrections of the inextensibility constraints, then compute those of the rod-rod contacts.
+
+    `i_iter` is the index of the projection in the substep, the argument of the kernel passed by reference: a copy of a
+    runtime value at the top level of a kernel is a statement outside of its loops, which autodiff refuses.
 
     With a broadphase, the contacts are searched among its candidate pairs, and a vertex moved further than half of the
     margin from its position in the broadphase may bring a pair of edges outside of them into contact: its environment
@@ -1196,7 +1238,13 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
 
 @reversed_with_atomic_sums
 @qd.kernel(fastcache=True)
-def kernel_finalize_rod_positions(
+def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
+    """Run a projection of the rod-rod contacts (see func_project_rod_contacts)."""
+    func_project_rod_contacts(i_iter, rod_state, rod_info, rod_config)
+
+
+@qd.func
+def func_finalize_rod_positions(
     rod_state: RodState, links_state: LinksState, rod_info: RodInfo, rod_config: qd.template()
 ):
     """Apply the corrections of the last projection and the constraints of the vertices, then update the reference
@@ -1318,7 +1366,15 @@ def kernel_finalize_rod_positions(
 
 @reversed_with_atomic_sums
 @qd.kernel(fastcache=True)
-def kernel_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
+def kernel_finalize_rod_positions(
+    rod_state: RodState, links_state: LinksState, rod_info: RodInfo, rod_config: qd.template()
+):
+    """Apply the last correction of the projections of the rods (see func_finalize_rod_positions)."""
+    func_finalize_rod_positions(rod_state, links_state, rod_info, rod_config)
+
+
+@qd.func
+def func_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
     """Apply the friction of the rod-rod contacts and the constraints of the vertices to the velocities, then commit the
     reference frames and the rest curvatures the substep computed."""
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
@@ -1336,6 +1392,62 @@ def kernel_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, rod_c
 
     for i_h, i_b in qd.ndrange(*rod_state.hinges.twist.shape, axes=qd.static(eoa(rod_state.hinges.twist))):
         rod_state.hinges.kappa_rest[i_h, i_b] = rod_state.hinges.kappa_rest_next[i_h, i_b]
+
+
+@reversed_with_atomic_sums
+@qd.kernel(fastcache=True)
+def kernel_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
+    """Apply the friction of the rod-rod contacts to the velocities (see func_finalize_rod_velocities)."""
+    func_finalize_rod_velocities(rod_state, rod_info, rod_config)
+
+
+# The kernels below capture the stages of a substep as graphs, in a scene without gradients (see
+# 'RodSolver.substep_post_coupling')
+@qd.kernel(graph=True, fastcache=True)
+def kernel_update_rod_substep_velocities(rod_state: RodState, rod_info: RodInfo):
+    """Compute the elastic forces of the rods, then integrate their velocities over a substep, captured as one graph.
+
+    See func_compute_rod_forces and func_update_rod_velocities.
+    """
+    func_compute_rod_forces(rod_state, rod_info)
+    func_update_rod_velocities(rod_state, rod_info)
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_integrate_rod_substep(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template(), errno: qd.Tensor):
+    """Integrate the positions of the rods, then find the candidate pairs of edges of the substep, as one graph.
+
+    See func_integrate_rod_positions and func_update_rod_contact_candidates.
+    """
+    func_integrate_rod_positions(rod_state, rod_info)
+    if qd.static(rod_config.has_broadphase):
+        func_update_rod_contact_candidates(rod_state, rod_info, errno)
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_project_rod_iteration(
+    i_iter: int, rod_state: RodState, rod_info: RodInfo, rod_config: qd.template(), project_inextensibility: bool
+):
+    """Run a projection of the rod-rod contacts, then the inextensibility constraints of the next one, as one graph.
+
+    `i_iter` is the index of the projection in the substep, and `project_inextensibility` whether a projection follows
+    (see func_project_rod_contacts and func_project_rod_inextensibility).
+    """
+    if qd.static(rod_config.has_edge_pairs):
+        func_project_rod_contacts(i_iter, rod_state, rod_info, rod_config)
+    func_project_rod_inextensibility(rod_state, rod_info, rod_config, project_inextensibility)
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_finalize_rod_substep(
+    rod_state: RodState, links_state: LinksState, rod_info: RodInfo, rod_config: qd.template()
+):
+    """Apply the last correction of the projections, then update the velocities and frames of the rods, as one graph.
+
+    See func_finalize_rod_positions and func_finalize_rod_velocities.
+    """
+    func_finalize_rod_positions(rod_state, links_state, rod_info, rod_config)
+    func_finalize_rod_velocities(rod_state, rod_info, rod_config)
 
 
 @no_grad
@@ -1752,26 +1864,50 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
     # ------------------------------------------------------------------------------------
 
     def substep_pre_coupling(self):
-        if self.is_active:
+        if not self.is_active:
+            return
+        # A scene tracking gradients launches the kernels one by one (see 'substep_post_coupling')
+        if self._requires_grad:
             kernel_compute_rod_forces(self.rod_state, self.rod_info)
             kernel_update_rod_velocities(self.rod_state, self.rod_info)
+        else:
+            kernel_update_rod_substep_velocities(self.rod_state, self.rod_info)
 
     def substep_post_coupling(self):
         if not self.is_active:
             return
-        kernel_integrate_rod_positions(self.rod_state, self.rod_info)
-        if self.rod_config.has_broadphase:
-            kernel_update_rod_contact_candidates(self.rod_state, self.rod_info, self.data_manager.errno)
-        for i_iter in range(self._n_pbd_iters):
-            if self.rod_config.has_edge_pairs:
-                kernel_project_rod_contacts(i_iter, self.rod_state, self.rod_info, self.rod_config)
-            if i_iter < self._n_pbd_iters - 1:
-                kernel_project_rod_inextensibility(self.rod_state, self.rod_info, self.rod_config)
+        # A step is bound by the launches of its kernels, which a graph per stage of the substep replays at almost no
+        # cost per loop. The projections take a graph each rather than a loop on the device, whose passes cost more
+        # than the launches.
+        # FIXME: quadrants#946 - a graph refuses the ndarrays that own a gradient, so a scene tracking gradients
+        # launches the kernels one by one, which the backward pass reverses one by one too (see 'LaunchRecorder').
+        if self._requires_grad:
+            kernel_integrate_rod_positions(self.rod_state, self.rod_info)
+            if self.rod_config.has_broadphase:
+                kernel_update_rod_contact_candidates(self.rod_state, self.rod_info, self.data_manager.errno)
+            for i_iter in range(self._n_pbd_iters):
+                if self.rod_config.has_edge_pairs:
+                    kernel_project_rod_contacts(i_iter, self.rod_state, self.rod_info, self.rod_config)
+                if i_iter < self._n_pbd_iters - 1:
+                    kernel_project_rod_inextensibility(self.rod_state, self.rod_info, self.rod_config)
+        else:
+            kernel_integrate_rod_substep(self.rod_state, self.rod_info, self.rod_config, self.data_manager.errno)
+            for i_iter in range(self._n_pbd_iters):
+                kernel_project_rod_iteration(
+                    i_iter,
+                    self.rod_state,
+                    self.rod_info,
+                    self.rod_config,
+                    project_inextensibility=i_iter < self._n_pbd_iters - 1,
+                )
         if self.rod_config.has_rigid_contacts:
             self._rigid_coupler.project_rod_rigid_contacts()
         links_state = self._sim.rigid_solver.dyn_state.links
-        kernel_finalize_rod_positions(self.rod_state, links_state, self.rod_info, self.rod_config)
-        kernel_finalize_rod_velocities(self.rod_state, self.rod_info, self.rod_config)
+        if self._requires_grad:
+            kernel_finalize_rod_positions(self.rod_state, links_state, self.rod_info, self.rod_config)
+            kernel_finalize_rod_velocities(self.rod_state, self.rod_info, self.rod_config)
+        else:
+            kernel_finalize_rod_substep(self.rod_state, links_state, self.rod_info, self.rod_config)
         # The state is checked once per step, at its last substep
         if self._sim.cur_substep_global % self._substeps == self._substeps - 1:
             kernel_check_rod_finite(self.rod_state, self.data_manager.errno)
