@@ -4399,6 +4399,12 @@ def func_gather_rod_mpm_patches(
     surface is thus a level of the mass the grid carries, flat on a flat material whatever the position of the rod
     between the grid nodes. Each vertex sums, over the samples of its edges that touch, weighted by its weight in them,
     their mass, momentum and mass-weighted normal: the patch of material the vertex meets.
+
+    The level is as sharp as the grid, about one grid spacing. A layer thinner than about two spacings holds no node of
+    its full mass, so its largest node, the reference of the fill, is light and the level rises: a rod rests up to about
+    half a spacing above the layer. Near a side face of the material the mass a point gets falls over one to two
+    spacings, which rounds the edge of the surface, so a rod lying across the edge loses its support there and pivots.
+    A finer grid shrinks both.
     """
     for i_v, i_b in qd.ndrange(*rod_state.verts.mpm_mass.shape, axes=qd.static(eoa(rod_state.verts.mpm_mass))):
         rod_state.verts.mpm_mass[i_v, i_b] = 0.0
