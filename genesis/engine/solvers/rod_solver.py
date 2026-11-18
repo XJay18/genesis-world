@@ -72,15 +72,14 @@ ROD_ALL_PAIRS = "rod_all_pairs"
 
 
 class RodsInfo(Data, kind=DataKind.INFO, shape=(RODS,)):
-    """The material of each rod: inextensibility, bending plasticity and twist inertia, and its edge count and closure,
-    from which the broadphase reads the gap between two edges of the rod."""
+    """The material of each rod: inextensibility and bending plasticity, and its edge count and closure, from which the
+    broadphase reads the gap between two edges of the rod."""
 
     n_edges: qd.Tensor = field(int, kind=DataKind.CONSTANT)
     is_loop: qd.Tensor = field(bool, kind=DataKind.CONSTANT)
     is_inextensible: qd.Tensor = field(bool)
     plastic_yield: qd.Tensor = field(float)
     plastic_creep: qd.Tensor = field(float)
-    twist_inertia: qd.Tensor = field(float)
 
 
 class RodVertsInfo(Data, kind=DataKind.INFO, shape=(ROD_VERTS,)):
@@ -102,7 +101,7 @@ class RodVertsInfo(Data, kind=DataKind.INFO, shape=(ROD_VERTS,)):
 
 
 class RodEdgesInfo(Data, kind=DataKind.CONSTANT, shape=(ROD_EDGES,)):
-    """The topology and rest length of each edge of the rods."""
+    """The topology, rest length and twist inertia of each edge of the rods."""
 
     rod_idx: qd.Tensor = field(int)
     # The first and second vertex of the edge
@@ -111,6 +110,9 @@ class RodEdgesInfo(Data, kind=DataKind.CONSTANT, shape=(ROD_EDGES,)):
     # first edge of each of them respectively
     hinges_idx: qd.Tensor = field((int, 2))
     rest_length: qd.Tensor = field(float)
+    # The rotational inertia of the edge about its tangent, which the velocity update raises where the substep is too
+    # long for it (see func_update_rod_velocities)
+    twist_inertia: qd.Tensor = field(float, kind=DataKind.INFO)
 
 
 class RodHingesInfo(Data, kind=DataKind.CONSTANT, shape=(ROD_HINGES,)):
@@ -837,15 +839,29 @@ def func_update_rod_velocities(rod_state: RodState, rod_info: RodInfo):
     for i_e, i_b in qd.ndrange(*rod_state.edges.theta.shape, axes=qd.static(eoa(rod_state.edges.theta))):
         i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
         if func_is_free(i_v_s, i_b, rod_state) or func_is_free(i_v_e, i_b, rod_state):
+            i_r = rod_info.edges.rod_idx[i_e]
             energy_grad = gs.qd_float(0.0)
+            twisting_stiffness_sum = gs.qd_float(0.0)
             for i_slot in qd.static(range(2)):
                 i_h = rod_info.edges.hinges_idx[i_e][i_slot]
                 if i_h >= 0:
                     # The edge is the second and first edge of the two hinges respectively
                     energy_grad += rod_state.hinges.edges_torque[i_h, 1 - i_slot, i_b]
-            i_r = rod_info.edges.rod_idx[i_e]
+                    # The twisting modulus of the hinge over its rest length (see func_compute_rod_forces)
+                    i_v_m = rod_info.hinges.verts_idx[i_h][1]
+                    radius = rod_info.verts.radius[i_v_m]
+                    twisting_stiffness_sum += (
+                        rod_state.rods.twisting_stiffness[i_r, i_b]
+                        * math.pi
+                        * radius**4
+                        / (2.0 * rod_info.hinges.rest_length[i_h])
+                    )
             dt = rod_info.substep_dt[None]
-            omega = rod_state.edges.omega[i_e, i_b] - energy_grad / rod_info.rods.twist_inertia[i_r] * dt
+            # The explicit step of the twist is stable for a highest twist frequency w with w dt < 2, which the sum of
+            # the twisting stiffnesses of the hinges of each edge bounds (Gershgorin): an inertia of at least
+            # 2 dt^2 times that sum keeps w dt <= 1, the twist then following its energy within a few substeps.
+            twist_inertia = qd.max(rod_info.edges.twist_inertia[i_e], 2.0 * dt * dt * twisting_stiffness_sum)
+            omega = rod_state.edges.omega[i_e, i_b] - energy_grad / twist_inertia * dt
             rod_state.edges.omega[i_e, i_b] = omega * qd.exp(-dt * rod_info.angular_damping[None])
 
 
@@ -1870,6 +1886,15 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         rods_n_edges = [entity.n_edges for entity in self._entities]
         materials = [entity.material for entity in self._entities]
         edges_rod_idx = np.repeat(np.arange(self.n_rods), rods_n_edges)
+        verts_mass = np.repeat([material.segment_mass for material in materials], rods_n_verts)
+        verts_radius = np.repeat([material.segment_radius for material in materials], rods_n_verts)
+        # The twist inertia of a solid cylinder of the mass and radius of the edge, where the material leaves it unset
+        edges_twist_inertia = (
+            0.5 * verts_mass[edges_verts_idx].mean(axis=-1) * verts_radius[edges_verts_idx].mean(axis=-1) ** 2
+        )
+        for entity in self._entities:
+            if entity.material.twist_inertia is not None:
+                edges_twist_inertia[entity.e_start : entity.e_start + entity.n_edges] = entity.material.twist_inertia
 
         info, state = self.rod_info, self.rod_state
         for array, value, dtype in (
@@ -1878,12 +1903,11 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             (info.rods.is_inextensible, [material.inextensible for material in materials], gs.tc_bool),
             (info.rods.plastic_yield, [material.plastic_yield for material in materials], gs.tc_float),
             (info.rods.plastic_creep, [material.plastic_creep for material in materials], gs.tc_float),
-            (info.rods.twist_inertia, [material.twist_inertia for material in materials], gs.tc_float),
             (info.verts.rod_idx, np.repeat(np.arange(self.n_rods), rods_n_verts), gs.tc_int),
             (info.verts.edges_idx, verts_edges_idx, gs.tc_int),
             (info.verts.hinges_idx, verts_hinges_idx, gs.tc_int),
-            (info.verts.mass, np.repeat([material.segment_mass for material in materials], rods_n_verts), gs.tc_float),
-            (info.verts.radius, np.repeat([m.segment_radius for m in materials], rods_n_verts), gs.tc_float),
+            (info.verts.mass, verts_mass, gs.tc_float),
+            (info.verts.radius, verts_radius, gs.tc_float),
             (info.verts.mu_s, np.repeat([m.static_friction for m in materials], rods_n_verts), gs.tc_float),
             (info.verts.mu_k, np.repeat([m.kinetic_friction for m in materials], rods_n_verts), gs.tc_float),
             (info.verts.restitution, np.repeat([m.restitution for m in materials], rods_n_verts), gs.tc_float),
@@ -1892,6 +1916,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             (info.edges.verts_idx, edges_verts_idx, gs.tc_int),
             (info.edges.hinges_idx, edges_hinges_idx, gs.tc_int),
             (info.edges.rest_length, edges_rest_length, gs.tc_float),
+            (info.edges.twist_inertia, edges_twist_inertia, gs.tc_float),
             (info.hinges.verts_idx, hinges_verts_idx, gs.tc_int),
             (info.hinges.edges_idx, hinges_edges_idx, gs.tc_int),
             (info.hinges.rest_length, edges_rest_length[hinges_edges_idx].mean(axis=-1), gs.tc_float),

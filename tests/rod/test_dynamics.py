@@ -161,6 +161,55 @@ def test_elastic_energy_decays_with_damping(show_viewer):
 
 
 @pytest.mark.required
+def test_spinning_rod_keeps_angular_momentum(show_viewer):
+    n_verts, interval, n_steps = 20, 0.02, 50
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.0, -0.8, 0.8),
+            camera_lookat=(0.0, 0.0, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=n_verts,
+            interval=interval,
+            pos=(0.0, 0.0, 0.5),
+        ),
+        material=gs.materials.Rod.Base(),
+    )
+    scene.build()
+    # The rod is bent into a helix keeping its rest edge lengths, its edges twisted, and spun about an axis oblique to it
+    angle_step, pitch = 0.05, 0.02
+    helix_radius = math.sqrt(interval**2 - (pitch * angle_step) ** 2) / (2.0 * math.sin(0.5 * angle_step))
+    angles = angle_step * np.arange(n_verts)
+    pos = np.stack([helix_radius * np.cos(angles), helix_radius * np.sin(angles), 0.5 + pitch * angles], axis=-1)
+    pos -= pos.mean(axis=0) - (0.0, 0.0, 0.5)
+    rod.set_position(pos)
+    rod.set_edges_theta(0.5 * np.sin(np.linspace(0.0, 3.0, n_verts - 1)))
+    spin_axis = np.array([0.3, 0.5, 1.0]) / np.linalg.norm([0.3, 0.5, 1.0])
+    rod.set_velocity(5.0 * np.cross(spin_axis, pos - pos.mean(axis=0)))
+
+    def angular_momentum():
+        pos, vel = tensor_to_array(rod.get_verts_pos()), tensor_to_array(rod.get_verts_vel())
+        return rod.material.segment_mass * np.cross(pos, vel).sum(axis=0)
+
+    angular_momentum_init = angular_momentum()
+    angular_momentum_errors = []
+    for _ in range(n_steps):
+        scene.step()
+        angular_momentum_errors.append(np.linalg.norm(angular_momentum() - angular_momentum_init))
+    # The spin of the edges about their tangents takes little angular momentum at their physical inertia, and the
+    # projections of the edge lengths lose a little at each substep
+    assert max(angular_momentum_errors) < 2e-3 * np.linalg.norm(angular_momentum_init)
+
+
+@pytest.mark.required
 def test_inextensible_edge_lengths_and_checkpoint(show_viewer):
     n_verts, interval = 50, 0.01
     scene = gs.Scene(
@@ -1554,7 +1603,7 @@ def test_rod_rigid_friction_conserves_momentum(show_viewer):
         ),
     )
     # A rod turning about the vertical on a capsule free to turn about it, across the middle of an edge, turns it along
-    spin_center, spin_rate, capsule_radius, spinning_radius = np.array([0.5, 0.0]), 5.0, 0.0075, 0.01
+    spin_center, spin_rate, capsule_radius, spinning_radius = np.array([0.5, 0.0]), 5.0, 0.0075, 0.005
     mjcf = ET.Element("mujoco", model="turntable")
     turntable_body = ET.SubElement(ET.SubElement(mjcf, "worldbody"), "body", name="turntable", pos="0.5 0.0 0.1")
     ET.SubElement(turntable_body, "joint", name="spin", type="hinge", axis="0 0 1")
@@ -1584,7 +1633,7 @@ def test_rod_rigid_friction_conserves_momentum(show_viewer):
     )
     # A rod starting to slide along a light bar free to slide along it, which it touches inside an edge off its middle,
     # sticks to it: the friction of both vertices of the edge moves the bar once, wherever the point lies along the edge
-    bar_point_t, bar_interval, bar_slip_vel = 0.15, 0.04, 1e-3
+    bar_point_t, bar_interval, bar_slip_vel, bar_rod_radius = 0.15, 0.04, 1e-3, 0.01
     mjcf = ET.Element("mujoco", model="bar")
     bar_body = ET.SubElement(ET.SubElement(mjcf, "worldbody"), "body", name="bar", pos="1.0 0.0 0.1")
     ET.SubElement(bar_body, "joint", name="slide", type="slide", axis="0 1 0")
@@ -1603,11 +1652,11 @@ def test_rod_rigid_friction_conserves_momentum(show_viewer):
         morph=gs.morphs.ParameterizedRod(
             n_vertices=4,
             interval=bar_interval,
-            pos=(1.0 - (1.0 + bar_point_t) * bar_interval, 0.0, 0.1 + capsule_radius + spinning_radius - 2e-5),
+            pos=(1.0 - (1.0 + bar_point_t) * bar_interval, 0.0, 0.1 + capsule_radius + bar_rod_radius - 2e-5),
         ),
         material=gs.materials.Rod.Base(
             segment_mass=0.005,
-            segment_radius=spinning_radius,
+            segment_radius=bar_rod_radius,
         ),
     )
     scene.build()
@@ -1642,10 +1691,12 @@ def test_rod_rigid_friction_conserves_momentum(show_viewer):
     rod_momentum, box_momentum = momentum_x()
     assert box_momentum > 0.1 * momentum_init
     assert_allclose(rod_momentum + box_momentum, momentum_init, rtol=1e-3)
-    # The friction of the rod turns the capsule, the link taking the angular momentum the rod loses
+    # The friction of the rod turns the capsule, the link taking the angular momentum the rod loses. The thin rod sags
+    # over the capsule, which tilts its edges and lets them trade spin with the vertices, in proportion to their twist
+    # inertia.
     rod_angular_momentum, turntable_angular_momentum = angular_momentum_z()
     assert turntable_angular_momentum > 0.1 * angular_momentum_init
-    assert_allclose(rod_angular_momentum + turntable_angular_momentum, angular_momentum_init, rtol=2e-2)
+    assert_allclose(rod_angular_momentum + turntable_angular_momentum, angular_momentum_init, rtol=5e-3)
     # The rod and the bar move together, the friction cancelling their slip without reversing it
     assert bar_slip_vel_max < 0.5 * bar_slip_vel
 
