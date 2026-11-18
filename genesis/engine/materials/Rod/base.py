@@ -55,7 +55,9 @@ class Base(Material["RodEntity"]):
         the twist, which then lags the bending and takes angular momentum from the vertices, so that a spinning rod
         slows down. Where the substep is too long to integrate the twist stably at this inertia, as for the stiff twist
         of short edges at the default 10 ms step, the inertia is raised to the least stable value: a shorter substep
-        keeps it physical. Default is None.
+        keeps it physical. The raise counts the twisting stiffness alone. The stiffness the bending adds to the twist
+        stays stable while the turning angle phi of the rod at each vertex keeps 2 tan(phi / 2) below
+        (2 / dt) sqrt(m l / (pi E r^2)), with l the edge length and dt the substep. Default is None.
     """
 
     K: NonNegativeFloat = 0.0

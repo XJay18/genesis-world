@@ -113,6 +113,9 @@ class RodEdgesInfo(Data, kind=DataKind.CONSTANT, shape=(ROD_EDGES,)):
     # The rotational inertia of the edge about its tangent, which the velocity update raises where the substep is too
     # long for it (see func_update_rod_velocities)
     twist_inertia: qd.Tensor = field(float, kind=DataKind.INFO)
+    # The sum over the hinges of the edge of the polar moment of area of the rod over the rest length of the hinge,
+    # pi r^4 / (2 l), which the twisting stiffness of the rod turns into the twisting stiffness the edge feels
+    hinges_polar_moment: qd.Tensor = field(float, kind=DataKind.INFO)
 
 
 class RodHingesInfo(Data, kind=DataKind.CONSTANT, shape=(ROD_HINGES,)):
@@ -839,27 +842,20 @@ def func_update_rod_velocities(rod_state: RodState, rod_info: RodInfo):
     for i_e, i_b in qd.ndrange(*rod_state.edges.theta.shape, axes=qd.static(eoa(rod_state.edges.theta))):
         i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
         if func_is_free(i_v_s, i_b, rod_state) or func_is_free(i_v_e, i_b, rod_state):
-            i_r = rod_info.edges.rod_idx[i_e]
             energy_grad = gs.qd_float(0.0)
-            twisting_stiffness_sum = gs.qd_float(0.0)
             for i_slot in qd.static(range(2)):
                 i_h = rod_info.edges.hinges_idx[i_e][i_slot]
                 if i_h >= 0:
                     # The edge is the second and first edge of the two hinges respectively
                     energy_grad += rod_state.hinges.edges_torque[i_h, 1 - i_slot, i_b]
-                    # The twisting modulus of the hinge over its rest length (see func_compute_rod_forces)
-                    i_v_m = rod_info.hinges.verts_idx[i_h][1]
-                    radius = rod_info.verts.radius[i_v_m]
-                    twisting_stiffness_sum += (
-                        rod_state.rods.twisting_stiffness[i_r, i_b]
-                        * math.pi
-                        * radius**4
-                        / (2.0 * rod_info.hinges.rest_length[i_h])
-                    )
+            i_r = rod_info.edges.rod_idx[i_e]
             dt = rod_info.substep_dt[None]
             # The explicit step of the twist is stable for a highest twist frequency w with w dt < 2, which the sum of
             # the twisting stiffnesses of the hinges of each edge bounds (Gershgorin): an inertia of at least
             # 2 dt^2 times that sum keeps w dt <= 1, the twist then following its energy within a few substeps.
+            twisting_stiffness_sum = (
+                rod_state.rods.twisting_stiffness[i_r, i_b] * rod_info.edges.hinges_polar_moment[i_e]
+            )
             twist_inertia = qd.max(rod_info.edges.twist_inertia[i_e], 2.0 * dt * dt * twisting_stiffness_sum)
             omega = rod_state.edges.omega[i_e, i_b] - energy_grad / twist_inertia * dt
             rod_state.edges.omega[i_e, i_b] = omega * qd.exp(-dt * rod_info.angular_damping[None])
@@ -1895,6 +1891,9 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         for entity in self._entities:
             if entity.material.twist_inertia is not None:
                 edges_twist_inertia[entity.e_start : entity.e_start + entity.n_edges] = entity.material.twist_inertia
+        hinges_rest_length = edges_rest_length[hinges_edges_idx].mean(axis=-1)
+        hinges_polar_moment = math.pi * verts_radius[hinges_verts_idx[:, 1]] ** 4 / (2.0 * hinges_rest_length)
+        edges_hinges_polar_moment = np.where(edges_hinges_idx >= 0, hinges_polar_moment[edges_hinges_idx], 0.0)
 
         info, state = self.rod_info, self.rod_state
         for array, value, dtype in (
@@ -1917,9 +1916,10 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             (info.edges.hinges_idx, edges_hinges_idx, gs.tc_int),
             (info.edges.rest_length, edges_rest_length, gs.tc_float),
             (info.edges.twist_inertia, edges_twist_inertia, gs.tc_float),
+            (info.edges.hinges_polar_moment, edges_hinges_polar_moment.sum(axis=-1), gs.tc_float),
             (info.hinges.verts_idx, hinges_verts_idx, gs.tc_int),
             (info.hinges.edges_idx, hinges_edges_idx, gs.tc_int),
-            (info.hinges.rest_length, edges_rest_length[hinges_edges_idx].mean(axis=-1), gs.tc_float),
+            (info.hinges.rest_length, hinges_rest_length, gs.tc_float),
             (state.verts.pos, verts_pos, gs.tc_float),
             (state.verts.is_fixed, np.repeat([e.morph.fixed for e in self._entities], rods_n_verts), gs.tc_bool),
             (state.verts.link_idx, np.full(self.n_verts, -1), gs.tc_int),
