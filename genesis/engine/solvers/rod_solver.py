@@ -357,6 +357,13 @@ class RodRigidSlots(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_GEO
     # Whether the geom may reach the capsules of the edges of the vertex (see 'func_is_geom_near_rod_vertex' in
     # legacy_coupler.py), the slots being searched only then
     is_near: qd.Tensor = field(bool, shape=(ROD_VERTS, ROD_RIGID_GEOMS, ENVS))
+    # The near geoms of each vertex (their indices among the geoms that need coupling) in the first entries of its
+    # list, in any order, and their count, the largest count over the vertices bounding the loop over the slots. The
+    # list holds every geom that needs coupling, and the slots of a geom go to its own entries whatever its place in
+    # the list, so that the order the threads fill it in changes no result
+    near_geoms_idx: qd.Tensor = field(int, shape=(ROD_VERTS, ROD_RIGID_GEOMS, ENVS))
+    n_near_geoms: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))
+    n_near_geoms_max: qd.Tensor = field(int, shape=())
     # The parameter of the point along the edge of the slot (the edges ending and starting at the vertex, then its
     # sphere), the end of the edge its penetration counts from (see 'RodRigidContacts.t_end'), and the penetration, a
     # contact where positive

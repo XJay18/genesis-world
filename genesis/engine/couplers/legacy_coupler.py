@@ -3609,9 +3609,13 @@ def func_project_rod_rigid_normal(
         rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + func_last_projection_correction(
             i_v, i_b, rod_state, rod_config
         )
+        rod_state.rigid_slots.n_near_geoms[i_v, i_b] = 0
     for i_l, i_b in qd.ndrange(rod_state.rigid_contacts.links_contacts_weight.shape[0], rod_state.verts.pos.shape[1]):
         rod_state.rigid_contacts.links_contacts_weight[i_l, i_b] = 0.0
         rod_state.rigid_contacts.links_n_contacts[i_l, i_b] = 0
+        # The largest count of near geoms, which the near tests raise below
+        if i_l == 0 and i_b == 0:
+            rod_state.rigid_slots.n_near_geoms_max[None] = 0
         if qd.static(IS_EXACT):
             func_carry_free_sum_clear(i_l, i_b, rod_state.rigid_contacts.links_contacts_weight_sums)
 
@@ -3635,13 +3639,18 @@ def func_project_rod_rigid_normal(
                 collider_config,
             )
         rod_state.rigid_slots.is_near[i_v, i_gc, i_b] = is_near
+        if is_near:
+            i_k = qd.atomic_add(rod_state.rigid_slots.n_near_geoms[i_v, i_b], 1)
+            rod_state.rigid_slots.near_geoms_idx[i_v, i_k, i_b] = i_gc
+            qd.atomic_max(rod_state.rigid_slots.n_near_geoms_max[None], i_k + 1)
 
     # The slots are a dimension of the loop: their search carries no gradient, and their contacts are evaluated again
-    # below once kept
-    for i_v, i_gc, i_slot, i_b in qd.ndrange(
-        rod_state.verts.pos.shape[0], rod_state.rigid_slots.geoms_idx.shape[0], 3, rod_state.verts.pos.shape[1]
+    # below once kept. The loop runs over the near geoms of each vertex alone (see RodRigidSlots)
+    for i_v, i_k, i_slot, i_b in qd.ndrange(
+        rod_state.verts.pos.shape[0], rod_state.rigid_slots.n_near_geoms_max[None], 3, rod_state.verts.pos.shape[1]
     ):
-        if rod_state.rigid_slots.is_near[i_v, i_gc, i_b]:
+        if i_k < rod_state.rigid_slots.n_near_geoms[i_v, i_b]:
+            i_gc = rod_state.rigid_slots.near_geoms_idx[i_v, i_k, i_b]
             i_g = rod_state.rigid_slots.geoms_idx[i_gc]
             i_v_s, i_v_e, t, is_interior, t_end = func_rod_rigid_contact_search(
                 i_v,
