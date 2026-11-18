@@ -92,7 +92,10 @@ class LegacyCouplerOptions(BaseCouplerOptions):
         Whether to enable coupling between rod and MPM solvers: the rods rest on the surface of the MPM material, with
         friction (see 'mpm_friction' of the rod material), and they push each other apart where they meet. It costs time
         only in scenes holding both rods and MPM materials, growing with the total length of the rods over the grid
-        spacing. Defaults to True.
+        spacing. The surface is resolved to about one grid spacing of the MPM solver: a layer thinner than about two
+        spacings can hold a rod up to about half a spacing above it, and the edges of a block are rounded over about a
+        spacing, so a rod lying across an edge tips over it there. A finer grid ('grid_density') reduces both, at the
+        cost of the MPM step. Defaults to True.
     """
 
     rigid_mpm: StrictBool = True
