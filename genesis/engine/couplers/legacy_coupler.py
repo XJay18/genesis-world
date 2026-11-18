@@ -1235,23 +1235,37 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
             if self.legacy_coupler_config.has_rod_mpm:
                 mpm_state, mpm_info = self.mpm_solver.mpm_state, self.mpm_solver.mpm_info
                 rod_state, rod_info = self.rod_solver.rod_state, self.rod_solver.rod_info
-                kernel_rod_mpm_contact_pos(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
-                if self.rod_solver.rod_config.is_deterministic:
-                    kernel_rod_mpm_gather_exact(
-                        mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info, self.legacy_coupler_info
+                # A scene tracking gradients launches the kernels one by one (see 'RodSolver.substep_post_coupling')
+                if not self.rod_solver.requires_grad:
+                    kernel_couple_rod_mpm(
+                        mpm_state,
+                        rod_state,
+                        self.rod_mpm_contact,
+                        mpm_info,
+                        rod_info,
+                        self.legacy_coupler_info,
+                        self.rod_solver.rod_config,
                     )
-                    kernel_rod_mpm_share_exact(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
-                    kernel_rod_mpm_grid_inv_mass_exact(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
-                    kernel_rod_mpm_impulse(rod_state, rod_info)
-                    kernel_rod_mpm_scatter_exact(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
                 else:
-                    kernel_rod_mpm_gather(
-                        mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info, self.legacy_coupler_info
-                    )
-                    kernel_rod_mpm_share(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
-                    kernel_rod_mpm_grid_inv_mass(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
-                    kernel_rod_mpm_impulse(rod_state, rod_info)
-                    kernel_rod_mpm_scatter(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
+                    kernel_rod_mpm_contact_pos(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
+                    if self.rod_solver.rod_config.is_deterministic:
+                        kernel_rod_mpm_gather_exact(
+                            mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info, self.legacy_coupler_info
+                        )
+                        kernel_rod_mpm_share_exact(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
+                        kernel_rod_mpm_grid_inv_mass_exact(
+                            mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info
+                        )
+                        kernel_rod_mpm_impulse(rod_state, rod_info)
+                        kernel_rod_mpm_scatter_exact(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
+                    else:
+                        kernel_rod_mpm_gather(
+                            mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info, self.legacy_coupler_info
+                        )
+                        kernel_rod_mpm_share(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
+                        kernel_rod_mpm_grid_inv_mass(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
+                        kernel_rod_mpm_impulse(rod_state, rod_info)
+                        kernel_rod_mpm_scatter(mpm_state, rod_state, self.rod_mpm_contact, mpm_info, rod_info)
 
         # SPH <-> FEM and Rigid, ahead of the FEM vertices taking their share
         if (
@@ -1321,31 +1335,49 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
         """
         rigid_solver = self.rigid_solver
         is_step_start = self.sim.cur_substep_global % self.sim.substeps == 0
-        kernel_project_rod_rigid_normal(
-            self.rod_solver.rod_state,
-            rigid_solver.dyn_state.links,
-            rigid_solver.dyn_state.geoms,
-            self.rod_solver.rod_info,
-            rigid_solver.dyn_info.links,
-            rigid_solver.dyn_info.geoms,
-            rigid_solver.rigid_info,
-            rigid_solver.collider.sdf.sdf_info,
-            self.legacy_coupler_info,
-            rigid_solver.rigid_config,
-            rigid_solver.collider.collider_config,
-            self.rod_solver.rod_config,
-            is_step_start,
-        )
-        kernel_project_rod_rigid_friction(
-            self.rod_solver.rod_state,
-            rigid_solver.dyn_state.links,
-            self.rod_solver.rod_info,
-            rigid_solver.dyn_info.links,
-            rigid_solver.dyn_info.geoms,
-            self.legacy_coupler_info,
-            rigid_solver.rigid_config,
-            self.rod_solver.rod_config,
-        )
+        # A scene tracking gradients launches the kernels one by one (see 'RodSolver.substep_post_coupling')
+        if self.rod_solver.requires_grad:
+            kernel_project_rod_rigid_normal(
+                self.rod_solver.rod_state,
+                rigid_solver.dyn_state.links,
+                rigid_solver.dyn_state.geoms,
+                self.rod_solver.rod_info,
+                rigid_solver.dyn_info.links,
+                rigid_solver.dyn_info.geoms,
+                rigid_solver.rigid_info,
+                rigid_solver.collider.sdf.sdf_info,
+                self.legacy_coupler_info,
+                rigid_solver.rigid_config,
+                rigid_solver.collider.collider_config,
+                self.rod_solver.rod_config,
+                is_step_start,
+            )
+            kernel_project_rod_rigid_friction(
+                self.rod_solver.rod_state,
+                rigid_solver.dyn_state.links,
+                self.rod_solver.rod_info,
+                rigid_solver.dyn_info.links,
+                rigid_solver.dyn_info.geoms,
+                self.legacy_coupler_info,
+                rigid_solver.rigid_config,
+                self.rod_solver.rod_config,
+            )
+        else:
+            kernel_project_rod_rigid_contacts(
+                self.rod_solver.rod_state,
+                rigid_solver.dyn_state.links,
+                rigid_solver.dyn_state.geoms,
+                self.rod_solver.rod_info,
+                rigid_solver.dyn_info.links,
+                rigid_solver.dyn_info.geoms,
+                rigid_solver.rigid_info,
+                rigid_solver.collider.sdf.sdf_info,
+                self.legacy_coupler_info,
+                rigid_solver.rigid_config,
+                rigid_solver.collider.collider_config,
+                self.rod_solver.rod_config,
+                is_step_start,
+            )
 
     @property
     def is_differentiable(self) -> bool:
@@ -3496,9 +3528,8 @@ def func_rod_rigid_contact(
     return is_contact, i_v_s, i_v_e, t, weight, normal, penetration, slip, inv_mass_link
 
 
-@reversed_with_atomic_sums
-@qd.kernel(fastcache=True)
-def kernel_project_rod_rigid_normal(
+@qd.func
+def func_project_rod_rigid_normal(
     rod_state: RodState,
     links_state: LinksState,
     geoms_state: GeomsState,
@@ -3511,7 +3542,7 @@ def kernel_project_rod_rigid_normal(
     rigid_config: qd.template(),
     collider_config: qd.template(),
     rod_config: qd.template(),
-    is_step_start: bool,
+    is_step_start: qd.template(),
 ):
     """Apply the last correction of the projection of the rods, find their contacts with the rigid geoms that need
     coupling, and compute the normal impulses of the contacts and the normal corrections of the rods.
@@ -3543,8 +3574,9 @@ def kernel_project_rod_rigid_normal(
     meeting at the sphere of a vertex take the impulses of two free bodies.
 
     The geom each free vertex penetrates deepest is recorded where it penetrates one, through its sphere or an edge
-    contact on its half of the edge, the record being cleared at the first substep of a step ('is_step_start'), so
-    that it holds the contacts of the whole step.
+    contact on its half of the edge, the record being cleared at the first substep of a step ('is_step_start', the
+    argument of the kernel passed by reference, see 'func_project_rod_contacts' in rod_solver.py), so that it holds the
+    contacts of the whole step.
 
     The contacts of a link add their weights up through atomics, whose order varies across threads, and with
     `is_deterministic` (see RodConfig) to carry-free sums, which every contact of the link then reads.
@@ -3763,7 +3795,41 @@ def kernel_project_rod_rigid_normal(
 
 @reversed_with_atomic_sums
 @qd.kernel(fastcache=True)
-def kernel_project_rod_rigid_friction(
+def kernel_project_rod_rigid_normal(
+    rod_state: RodState,
+    links_state: LinksState,
+    geoms_state: GeomsState,
+    rod_info: RodInfo,
+    links_info: LinksInfo,
+    geoms_info: GeomsInfo,
+    rigid_info: RigidInfo,
+    sdf_info: SDFInfo,
+    legacy_coupler_info: LegacyCouplerInfo,
+    rigid_config: qd.template(),
+    collider_config: qd.template(),
+    rod_config: qd.template(),
+    is_step_start: bool,
+):
+    """Compute the normal impulses of the rod-rigid contacts (see func_project_rod_rigid_normal)."""
+    func_project_rod_rigid_normal(
+        rod_state,
+        links_state,
+        geoms_state,
+        rod_info,
+        links_info,
+        geoms_info,
+        rigid_info,
+        sdf_info,
+        legacy_coupler_info,
+        rigid_config,
+        collider_config,
+        rod_config,
+        is_step_start,
+    )
+
+
+@qd.func
+def func_project_rod_rigid_friction(
     rod_state: RodState,
     links_state: LinksState,
     rod_info: RodInfo,
@@ -3962,6 +4028,64 @@ def kernel_project_rod_rigid_friction(
         rod_state.verts.dp_rigid_stick[i_v, i_b] = dp_stick
 
 
+@reversed_with_atomic_sums
+@qd.kernel(fastcache=True)
+def kernel_project_rod_rigid_friction(
+    rod_state: RodState,
+    links_state: LinksState,
+    rod_info: RodInfo,
+    links_info: LinksInfo,
+    geoms_info: GeomsInfo,
+    legacy_coupler_info: LegacyCouplerInfo,
+    rigid_config: qd.template(),
+    rod_config: qd.template(),
+):
+    """Compute the friction of the rod-rigid contacts (see func_project_rod_rigid_friction)."""
+    func_project_rod_rigid_friction(
+        rod_state, links_state, rod_info, links_info, geoms_info, legacy_coupler_info, rigid_config, rod_config
+    )
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_project_rod_rigid_contacts(
+    rod_state: RodState,
+    links_state: LinksState,
+    geoms_state: GeomsState,
+    rod_info: RodInfo,
+    links_info: LinksInfo,
+    geoms_info: GeomsInfo,
+    rigid_info: RigidInfo,
+    sdf_info: SDFInfo,
+    legacy_coupler_info: LegacyCouplerInfo,
+    rigid_config: qd.template(),
+    collider_config: qd.template(),
+    rod_config: qd.template(),
+    is_step_start: bool,
+):
+    """Project the rods out of the rigid geoms that need coupling, with friction, captured as one graph.
+
+    See func_project_rod_rigid_normal and func_project_rod_rigid_friction.
+    """
+    func_project_rod_rigid_normal(
+        rod_state,
+        links_state,
+        geoms_state,
+        rod_info,
+        links_info,
+        geoms_info,
+        rigid_info,
+        sdf_info,
+        legacy_coupler_info,
+        rigid_config,
+        collider_config,
+        rod_config,
+        is_step_start,
+    )
+    func_project_rod_rigid_friction(
+        rod_state, links_state, rod_info, links_info, geoms_info, legacy_coupler_info, rigid_config, rod_config
+    )
+
+
 @qd.func
 def func_rod_mpm_gather(
     pos: qd.types.vector(3), i_b: int, mpm_state: MPMState, mpm_info: MPMInfo, is_gradient_only: qd.template()
@@ -4100,8 +4224,8 @@ def func_rod_mpm_stencil_offset(i_o: int, w):
     return offset, weight
 
 
-@qd.kernel(fastcache=True)
-def kernel_rod_mpm_contact_pos(
+@qd.func
+def func_find_rod_mpm_contact_pos(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):
     """
@@ -4122,6 +4246,14 @@ def kernel_rod_mpm_contact_pos(
             )
             pos_contact = pos + radius * qd_normalize(grad, rod_info.EPS[None])
         rod_mpm_contact.samples_contact_pos[i_s, i_b] = pos_contact
+
+
+@qd.kernel(fastcache=True)
+def kernel_rod_mpm_contact_pos(
+    mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
+):
+    """Find the contact points of the samples of the rods (see func_find_rod_mpm_contact_pos)."""
+    func_find_rod_mpm_contact_pos(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
 
 
 @qd.func
@@ -4248,8 +4380,8 @@ def func_rod_mpm_owned_node(i_k: int, i_b: int, rod_mpm_contact: RodMPMContact, 
     return is_owner, cell
 
 
-@qd.kernel(fastcache=True)
-def kernel_rod_mpm_gather(
+@qd.func
+def func_gather_rod_mpm_patches(
     mpm_state: MPMState,
     rod_state: RodState,
     rod_mpm_contact: RodMPMContact,
@@ -4296,9 +4428,21 @@ def kernel_rod_mpm_gather(
         rod_mpm_contact.samples_is_touching[i_s, i_b] = is_touching
 
 
-@register_custom_backward(lambda *args: kernel_rod_mpm_gather.grad(*args))
 @qd.kernel(fastcache=True)
-def kernel_rod_mpm_gather_exact(
+def kernel_rod_mpm_gather(
+    mpm_state: MPMState,
+    rod_state: RodState,
+    rod_mpm_contact: RodMPMContact,
+    mpm_info: MPMInfo,
+    rod_info: RodInfo,
+    legacy_coupler_info: LegacyCouplerInfo,
+):
+    """Gather the patches of MPM material of the vertices of the rods (see func_gather_rod_mpm_patches)."""
+    func_gather_rod_mpm_patches(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info, legacy_coupler_info)
+
+
+@qd.func
+def func_gather_rod_mpm_patches_exact(
     mpm_state: MPMState,
     rod_state: RodState,
     rod_mpm_contact: RodMPMContact,
@@ -4354,8 +4498,22 @@ def kernel_rod_mpm_gather_exact(
         rod_state.verts.mpm_inv_mass[i_v, i_b] = 0.0
 
 
+@register_custom_backward(lambda *args: kernel_rod_mpm_gather.grad(*args))
 @qd.kernel(fastcache=True)
-def kernel_rod_mpm_share(
+def kernel_rod_mpm_gather_exact(
+    mpm_state: MPMState,
+    rod_state: RodState,
+    rod_mpm_contact: RodMPMContact,
+    mpm_info: MPMInfo,
+    rod_info: RodInfo,
+    legacy_coupler_info: LegacyCouplerInfo,
+):
+    """Gather the patches of MPM material of the vertices, sums exact (see func_gather_rod_mpm_patches_exact)."""
+    func_gather_rod_mpm_patches_exact(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info, legacy_coupler_info)
+
+
+@qd.func
+def func_share_rod_mpm_nodes(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):
     """
@@ -4379,9 +4537,16 @@ def kernel_rod_mpm_share(
                 qd.atomic_add(rod_mpm_contact.grid_share[cell[0], cell[1], cell[2], i_b], weight_node * share)
 
 
-@register_custom_backward(lambda *args: kernel_rod_mpm_share.grad(*args))
 @qd.kernel(fastcache=True)
-def kernel_rod_mpm_share_exact(
+def kernel_rod_mpm_share(
+    mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
+):
+    """Add the shares of the vertices of the rods to the grid nodes (see func_share_rod_mpm_nodes)."""
+    func_share_rod_mpm_nodes(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+
+
+@qd.func
+def func_share_rod_mpm_nodes_exact(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):
     """
@@ -4418,8 +4583,17 @@ def kernel_rod_mpm_share_exact(
             func_carry_free_sum_clear(3 * i_k, i_b, rod_mpm_contact.nodes_sums)
 
 
+@register_custom_backward(lambda *args: kernel_rod_mpm_share.grad(*args))
 @qd.kernel(fastcache=True)
-def kernel_rod_mpm_grid_inv_mass(
+def kernel_rod_mpm_share_exact(
+    mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
+):
+    """Add the shares of the vertices to the grid nodes, sums exact (see func_share_rod_mpm_nodes_exact)."""
+    func_share_rod_mpm_nodes_exact(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+
+
+@qd.func
+def func_compute_rod_mpm_inv_mass(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):
     """
@@ -4446,9 +4620,16 @@ def kernel_rod_mpm_grid_inv_mass(
                     )
 
 
-@register_custom_backward(lambda *args: kernel_rod_mpm_grid_inv_mass.grad(*args))
 @qd.kernel(fastcache=True)
-def kernel_rod_mpm_grid_inv_mass_exact(
+def kernel_rod_mpm_grid_inv_mass(
+    mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
+):
+    """Compute the inverse masses of the patches of the vertices (see func_compute_rod_mpm_inv_mass)."""
+    func_compute_rod_mpm_inv_mass(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+
+
+@qd.func
+def func_compute_rod_mpm_inv_mass_exact(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):
     """
@@ -4477,8 +4658,17 @@ def kernel_rod_mpm_grid_inv_mass_exact(
             rod_state.verts.mpm_inv_mass[i_v, i_b] = inv_mass / rod_state.verts.mpm_mass[i_v, i_b]
 
 
+@register_custom_backward(lambda *args: kernel_rod_mpm_grid_inv_mass.grad(*args))
 @qd.kernel(fastcache=True)
-def kernel_rod_mpm_impulse(rod_state: RodState, rod_info: RodInfo):
+def kernel_rod_mpm_grid_inv_mass_exact(
+    mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
+):
+    """Compute the inverse masses of the patches, sums exact (see func_compute_rod_mpm_inv_mass_exact)."""
+    func_compute_rod_mpm_inv_mass_exact(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+
+
+@qd.func
+def func_compute_rod_mpm_impulse(rod_state: RodState, rod_info: RodInfo):
     """
     Compute the impulse each vertex of the rods takes from the patch of MPM material it approaches.
 
@@ -4502,7 +4692,13 @@ def kernel_rod_mpm_impulse(rod_state: RodState, rod_info: RodInfo):
 
 
 @qd.kernel(fastcache=True)
-def kernel_rod_mpm_scatter(
+def kernel_rod_mpm_impulse(rod_state: RodState, rod_info: RodInfo):
+    """Compute the impulses of the vertices of the rods from their patches (see func_compute_rod_mpm_impulse)."""
+    func_compute_rod_mpm_impulse(rod_state, rod_info)
+
+
+@qd.func
+def func_scatter_rod_mpm_impulse(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):
     """
@@ -4529,9 +4725,16 @@ def kernel_rod_mpm_scatter(
         rod_state.verts.vel[i_v, i_b] = func_rod_mpm_vert_vel(i_v, i_b, rod_state, rod_info)
 
 
-@register_custom_backward(lambda *args: kernel_rod_mpm_scatter.grad(*args))
 @qd.kernel(fastcache=True)
-def kernel_rod_mpm_scatter_exact(
+def kernel_rod_mpm_scatter(
+    mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
+):
+    """Apply the impulses to the grid nodes and to the vertices (see func_scatter_rod_mpm_impulse)."""
+    func_scatter_rod_mpm_impulse(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+
+
+@qd.func
+def func_scatter_rod_mpm_impulse_exact(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
 ):
     """
@@ -4576,3 +4779,45 @@ def kernel_rod_mpm_scatter_exact(
 
     for i_v, i_b in qd.ndrange(*rod_state.verts.vel.shape, axes=qd.static(eoa(rod_state.verts.vel))):
         rod_state.verts.vel[i_v, i_b] = func_rod_mpm_vert_vel(i_v, i_b, rod_state, rod_info)
+
+
+@register_custom_backward(lambda *args: kernel_rod_mpm_scatter.grad(*args))
+@qd.kernel(fastcache=True)
+def kernel_rod_mpm_scatter_exact(
+    mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
+):
+    """Apply the impulses to the grid nodes and the vertices, sums exact (see func_scatter_rod_mpm_impulse_exact)."""
+    func_scatter_rod_mpm_impulse_exact(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_couple_rod_mpm(
+    mpm_state: MPMState,
+    rod_state: RodState,
+    rod_mpm_contact: RodMPMContact,
+    mpm_info: MPMInfo,
+    rod_info: RodInfo,
+    legacy_coupler_info: LegacyCouplerInfo,
+    rod_config: qd.template(),
+):
+    """Run the contacts of the rods with the MPM materials over a substep, captured as one graph.
+
+    The stages are those the kernels of a scene tracking gradients launch one by one (see 'LegacyCoupler.couple'), the
+    twins whose sums are exact with `is_deterministic` (see RodConfig).
+    """
+    func_find_rod_mpm_contact_pos(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+    if qd.static(rod_config.is_deterministic):
+        func_gather_rod_mpm_patches_exact(
+            mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info, legacy_coupler_info
+        )
+        func_share_rod_mpm_nodes_exact(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+        func_compute_rod_mpm_inv_mass_exact(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+    else:
+        func_gather_rod_mpm_patches(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info, legacy_coupler_info)
+        func_share_rod_mpm_nodes(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+        func_compute_rod_mpm_inv_mass(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+    func_compute_rod_mpm_impulse(rod_state, rod_info)
+    if qd.static(rod_config.is_deterministic):
+        func_scatter_rod_mpm_impulse_exact(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)
+    else:
+        func_scatter_rod_mpm_impulse(mpm_state, rod_state, rod_mpm_contact, mpm_info, rod_info)

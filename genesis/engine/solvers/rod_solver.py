@@ -56,6 +56,8 @@ ROD_HINGES = Size("rod_hinges")
 # the edges in heap order, the first being unused
 ROD_EDGE_PAIRS = Size("rod_edge_pairs")
 ROD_BVH_NODES = Size("rod_bvh_nodes")
+# The subtrees of the hierarchy of the broadphase that its refit and its count of the slots take in parallel
+ROD_BVH_SUBTREES = Size("rod_bvh_subtrees")
 # The rigid links, of which the rods count their contacts
 ROD_RIGID_LINKS = Size("rod_rigid_links")
 
@@ -137,6 +139,8 @@ class RodInfo(Data):
     # The number of leaves of the hierarchy of the broadphase, a power of two, and its depth
     n_bvh_leaves: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
     bvh_depth: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
+    # The depth of the subtrees of the hierarchy of the broadphase, half of its depth rounded down (see RodBroadphase)
+    bvh_subtree_depth: qd.Tensor = field(int, shape=(), kind=DataKind.CONSTANT)
     damping: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
     angular_damping: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
     EPS: qd.Tensor = field(float, shape=(), kind=DataKind.CONSTANT)
@@ -272,9 +276,13 @@ class RodBroadphase(Data, kind=DataKind.SCRATCH):
 
     nodes_min: qd.Tensor = field((float, 3), shape=(ROD_BVH_NODES, ENVS), labels=ROD_BROADPHASE)
     nodes_max: qd.Tensor = field((float, 3), shape=(ROD_BVH_NODES, ENVS), labels=ROD_BROADPHASE)
-    # The candidate count of each edge, the pairs it starts, and the slot of its first candidate
+    # The candidate count of each edge, the pairs it starts, and the slot of its first candidate counted from the first
+    # slot of the edges of its subtree
     edges_n_candidates: qd.Tensor = field(int, shape=(ROD_EDGES, ENVS), labels=ROD_BROADPHASE)
     edges_candidates_start: qd.Tensor = field(int, shape=(ROD_EDGES, ENVS), labels=ROD_BROADPHASE)
+    # The candidate count of the edges of each subtree, and the slot of their first candidate
+    subtrees_n_candidates: qd.Tensor = field(int, shape=(ROD_BVH_SUBTREES, ENVS), labels=ROD_BROADPHASE)
+    subtrees_candidates_start: qd.Tensor = field(int, shape=(ROD_BVH_SUBTREES, ENVS), labels=ROD_BROADPHASE)
     # The number of candidates in each environment, which may exceed the capacity (see OVERFLOW_ROD_CANDIDATES)
     n_candidates: qd.Tensor = field(int, shape=(ENVS,), labels=ROD_BROADPHASE)
     # Whether a vertex of the environment moved further than half of the margin since the broadphase ran
@@ -377,6 +385,7 @@ class RodData(Data):
                 rod_hinges=solver.n_hinges,
                 rod_edge_pairs=solver.n_edge_pair_candidates,
                 rod_bvh_nodes=2 * solver.n_bvh_leaves,
+                rod_bvh_subtrees=solver.n_bvh_leaves >> solver._bvh_subtree_depth,
                 rod_rigid_links=solver.sim.rigid_solver.n_links,
                 rod_state=dict(
                     verts=dict(
@@ -407,6 +416,7 @@ class RodData(Data):
                     contact_margin=solver.contact_margin,
                     n_bvh_leaves=solver.n_bvh_leaves,
                     bvh_depth=solver.bvh_depth,
+                    bvh_subtree_depth=solver._bvh_subtree_depth,
                 )
             ),
             unused={
@@ -663,8 +673,8 @@ def func_constraint_target(i_v: int, i_b: int, rod_state: RodState, links_state:
     return target_pos
 
 
-@qd.kernel(fastcache=True)
-def kernel_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
+@qd.func
+def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
     """Compute the geometry of the rods and the gradients of their elastic energies, from their current state.
 
     The material frames, the curvatures and the twists follow the discrete elastic rod model. Each edge and each hinge
@@ -758,7 +768,13 @@ def kernel_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
 
 
 @qd.kernel(fastcache=True)
-def kernel_update_rod_velocities(rod_state: RodState, rod_info: RodInfo):
+def kernel_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
+    """Compute the geometry of the rods and the gradients of their energies (see func_compute_rod_forces)."""
+    func_compute_rod_forces(rod_state, rod_info)
+
+
+@qd.func
+def func_update_rod_velocities(rod_state: RodState, rod_info: RodInfo):
     """Integrate the velocities and the twist rates of the rods over a substep, from the gradients of their energies.
 
     Every vertex and every edge gathers the gradients of the edges and hinges it belongs to, in a fixed order, which
@@ -797,6 +813,12 @@ def kernel_update_rod_velocities(rod_state: RodState, rod_info: RodInfo):
             rod_state.edges.omega[i_e, i_b] = omega * qd.exp(-dt * rod_info.angular_damping[None])
 
 
+@qd.kernel(fastcache=True)
+def kernel_update_rod_velocities(rod_state: RodState, rod_info: RodInfo):
+    """Integrate the velocities and twist rates of the rods over a substep (see func_update_rod_velocities)."""
+    func_update_rod_velocities(rod_state, rod_info)
+
+
 @qd.func
 def func_gather_inextensibility(i_v: int, i_b: int, rod_state: RodState, rod_info: RodInfo) -> qd.types.vector(3):
     """Return the sum of the corrections the edges of a vertex ask of its position to recover their rest length.
@@ -825,8 +847,8 @@ def func_gather_inextensibility(i_v: int, i_b: int, rod_state: RodState, rod_inf
     return dp
 
 
-@qd.kernel(fastcache=True)
-def kernel_integrate_rod_positions(rod_state: RodState, rod_info: RodInfo):
+@qd.func
+def func_integrate_rod_positions(rod_state: RodState, rod_info: RodInfo):
     """Integrate the positions and the twist angles of the rods over a substep, then compute the first corrections of
     the inextensibility constraints (see 'kernel_project_rod_inextensibility')."""
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
@@ -847,22 +869,44 @@ def kernel_integrate_rod_positions(rod_state: RodState, rod_info: RodInfo):
         rod_state.verts.dp_inextensibility[i_v, i_b] = func_gather_inextensibility(i_v, i_b, rod_state, rod_info)
 
 
+@qd.kernel(fastcache=True)
+def kernel_integrate_rod_positions(rod_state: RodState, rod_info: RodInfo):
+    """Integrate the positions and twist angles of the rods over a substep (see func_integrate_rod_positions)."""
+    func_integrate_rod_positions(rod_state, rod_info)
+
+
 # The projections of the inextensibility and contact constraints run as a chain of kernels, each applying the
 # corrections the previous one computed before computing its own from the positions this leaves. Within a kernel, the
 # positions are written once, linearly, before any loop reads them, so that autodiff reverses every loop at the values
 # it read. The chain of a substep is: 'kernel_integrate_rod_positions', then for each projection the contacts and the
 # inextensibility of the next one, then 'kernel_finalize_rod_positions'.
+@qd.func
+def func_project_rod_inextensibility(
+    rod_state: RodState, rod_info: RodInfo, rod_config: qd.template(), project_inextensibility: qd.template()
+):
+    """
+    Apply the corrections of the last projection, then compute the corrections of the inextensibility constraints.
+
+    Where `project_inextensibility` (a literal, or the argument of the kernel passed by reference, see
+    func_project_rod_contacts) is false, nothing is done: the last projection of a substep leaves the corrections of its
+    contacts to the next stage.
+    """
+    for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
+        if project_inextensibility:
+            rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + func_last_projection_correction(
+                i_v, i_b, rod_state, rod_config
+            )
+
+    for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
+        if project_inextensibility:
+            rod_state.verts.dp_inextensibility[i_v, i_b] = func_gather_inextensibility(i_v, i_b, rod_state, rod_info)
+
+
 @reversed_with_atomic_sums
 @qd.kernel(fastcache=True)
 def kernel_project_rod_inextensibility(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
-    """Apply the corrections of the last projection, then compute the corrections of the inextensibility constraints."""
-    for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
-        rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + func_last_projection_correction(
-            i_v, i_b, rod_state, rod_config
-        )
-
-    for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
-        rod_state.verts.dp_inextensibility[i_v, i_b] = func_gather_inextensibility(i_v, i_b, rod_state, rod_info)
+    """Run a projection of the inextensibility constraints (see func_project_rod_inextensibility)."""
+    func_project_rod_inextensibility(rod_state, rod_info, rod_config, project_inextensibility=True)
 
 
 @qd.func
@@ -933,9 +977,8 @@ def func_query_rod_bvh(
     return n_found
 
 
-@no_grad
-@qd.kernel(fastcache=True)
-def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo, errno: qd.Tensor):
+@qd.func
+def func_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo, errno: qd.Tensor):
     """Find the candidate pairs of edges of the rod-rod contacts of the substep, once the positions are integrated.
 
     The bounding boxes of the edges, grown by their radius and half of the margin, are the leaves of a hierarchy over
@@ -944,32 +987,53 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
     no atomic appends and its order is the same in every run and on every backend. A list overflowing its capacity
     flags the environment, the candidates that fit being kept.
     """
-    # The leaves: the bounding box of each edge, and the empty boxes of the leaves past the last edge. The positions of
-    # its vertices, from which the projections of the substep are measured (see 'kernel_project_rod_contacts'), are
-    # saved with them, the vertices shared by two edges being written twice with the same value
-    for i_l, i_b in qd.ndrange(
-        rod_info.n_bvh_leaves[None], rod_state.verts.pos.shape[1], axes=qd.static(eoa(rod_state.broadphase.nodes_min))
+    # The hierarchy is refit in two levels, which bounds the serial work of a thread by about the square root of the
+    # number of edges: each subtree of half the depth computes the boxes of its leaves, then refits its nodes bottom-up,
+    # then each environment refits the nodes above the subtrees. The leaves are the bounding boxes of the edges, and
+    # the empty boxes of the leaves past the last edge. The positions of the vertices of the edges, from which the
+    # projections of the substep are measured (see 'kernel_project_rod_contacts'), are saved with them, the vertices
+    # shared by two edges being written twice with the same value
+    for i_t, i_b in qd.ndrange(
+        *rod_state.broadphase.subtrees_n_candidates.shape, axes=qd.static(eoa(rod_state.broadphase.nodes_min))
     ):
-        box_min = qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
-        box_max = -qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
-        if i_l < rod_info.edges.rod_idx.shape[0]:
-            i_v_s, i_v_e = rod_info.edges.verts_idx[i_l]
-            pos_s, pos_e = rod_state.verts.pos[i_v_s, i_b], rod_state.verts.pos[i_v_e, i_b]
-            rod_state.verts.pos_broadphase[i_v_s, i_b] = pos_s
-            rod_state.verts.pos_broadphase[i_v_e, i_b] = pos_e
-            reach = 0.5 * (rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e] + rod_info.contact_margin[None])
-            box_min = qd.min(pos_s, pos_e) - reach
-            box_max = qd.max(pos_s, pos_e) + reach
-        i_n = rod_info.n_bvh_leaves[None] + i_l
-        rod_state.broadphase.nodes_min[i_n, i_b] = box_min
-        rod_state.broadphase.nodes_max[i_n, i_b] = box_max
+        n_leaves, depth_subtree = rod_info.n_bvh_leaves[None], rod_info.bvh_subtree_depth[None]
+        n_subtrees = rod_state.broadphase.subtrees_n_candidates.shape[0]
+        for i_l_ in range(1 << depth_subtree):
+            i_l = (i_t << depth_subtree) + i_l_
+            box_min = qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
+            box_max = -qd.Vector.one(gs.qd_float, 3) * gs.qd_float(np.inf)
+            if i_l < rod_info.edges.rod_idx.shape[0]:
+                i_v_s, i_v_e = rod_info.edges.verts_idx[i_l]
+                pos_s, pos_e = rod_state.verts.pos[i_v_s, i_b], rod_state.verts.pos[i_v_e, i_b]
+                rod_state.verts.pos_broadphase[i_v_s, i_b] = pos_s
+                rod_state.verts.pos_broadphase[i_v_e, i_b] = pos_e
+                reach = 0.5 * (
+                    rod_info.verts.radius[i_v_s] + rod_info.verts.radius[i_v_e] + rod_info.contact_margin[None]
+                )
+                box_min = qd.min(pos_s, pos_e) - reach
+                box_max = qd.max(pos_s, pos_e) + reach
+            rod_state.broadphase.nodes_min[n_leaves + i_l, i_b] = box_min
+            rod_state.broadphase.nodes_max[n_leaves + i_l, i_b] = box_max
+        # The nodes of the subtree in decreasing heap order within it, a child being refit before its parent: the node
+        # of index i_m in the heap of the subtree lies at depth k below its root, the node of index (n_subtrees + i_t)
+        # in the hierarchy, hence at index ((n_subtrees + i_t) << k) + i_m - (1 << k) in the hierarchy
+        for i_m_ in range((1 << depth_subtree) - 1):
+            i_m = (1 << depth_subtree) - 1 - i_m_
+            k = 31 - qd.math.clz(i_m)
+            i_n = ((n_subtrees + i_t) << k) + i_m - (1 << k)
+            rod_state.broadphase.nodes_min[i_n, i_b] = qd.min(
+                rod_state.broadphase.nodes_min[2 * i_n, i_b], rod_state.broadphase.nodes_min[2 * i_n + 1, i_b]
+            )
+            rod_state.broadphase.nodes_max[i_n, i_b] = qd.max(
+                rod_state.broadphase.nodes_max[2 * i_n, i_b], rod_state.broadphase.nodes_max[2 * i_n + 1, i_b]
+            )
 
-    # The internal nodes, a child being refit before its parent
+    # The nodes above the subtrees, a child being refit before its parent
     for i_b in range(rod_state.verts.pos.shape[1]):
         rod_state.broadphase.is_stale[i_b] = False
         rod_state.broadphase.n_envs_fallback[None] = 0
-        for i_n_ in range(rod_info.n_bvh_leaves[None] - 1):
-            i_n = rod_info.n_bvh_leaves[None] - 1 - i_n_
+        for i_n_ in range(rod_state.broadphase.subtrees_n_candidates.shape[0] - 1):
+            i_n = rod_state.broadphase.subtrees_n_candidates.shape[0] - 1 - i_n_
             rod_state.broadphase.nodes_min[i_n, i_b] = qd.min(
                 rod_state.broadphase.nodes_min[2 * i_n, i_b], rod_state.broadphase.nodes_min[2 * i_n + 1, i_b]
             )
@@ -986,11 +1050,26 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
             i_e, i_b, i_start=0, rod_state=rod_state, rod_info=rod_info, is_filling=False
         )
 
-    for i_b in range(rod_state.broadphase.n_candidates.shape[0]):
+    # The slots are counted in two levels, within the edges of each subtree, then over the subtrees, as the refit
+    for i_t, i_b in qd.ndrange(
+        *rod_state.broadphase.subtrees_n_candidates.shape,
+        axes=qd.static(eoa(rod_state.broadphase.subtrees_n_candidates)),
+    ):
         n_candidates = 0
-        for i_e in range(rod_state.broadphase.edges_n_candidates.shape[0]):
+        i_e_start = i_t << rod_info.bvh_subtree_depth[None]
+        i_e_end = qd.min(
+            i_e_start + (1 << rod_info.bvh_subtree_depth[None]), rod_state.broadphase.edges_n_candidates.shape[0]
+        )
+        for i_e in range(i_e_start, i_e_end):
             rod_state.broadphase.edges_candidates_start[i_e, i_b] = n_candidates
             n_candidates += rod_state.broadphase.edges_n_candidates[i_e, i_b]
+        rod_state.broadphase.subtrees_n_candidates[i_t, i_b] = n_candidates
+
+    for i_b in range(rod_state.broadphase.n_candidates.shape[0]):
+        n_candidates = 0
+        for i_t in range(rod_state.broadphase.subtrees_n_candidates.shape[0]):
+            rod_state.broadphase.subtrees_candidates_start[i_t, i_b] = n_candidates
+            n_candidates += rod_state.broadphase.subtrees_n_candidates[i_t, i_b]
         rod_state.broadphase.n_candidates[i_b] = n_candidates
         if n_candidates > rod_state.edge_pairs.edges_idx.shape[0]:
             errno[i_b] = errno[i_b] | RodErrorCode.OVERFLOW_ROD_CANDIDATES
@@ -998,8 +1077,19 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
     for i_e, i_b in qd.ndrange(
         *rod_state.broadphase.edges_n_candidates.shape, axes=qd.static(eoa(rod_state.broadphase.edges_n_candidates))
     ):
-        i_start = rod_state.broadphase.edges_candidates_start[i_e, i_b]
+        i_t = i_e >> rod_info.bvh_subtree_depth[None]
+        i_start = (
+            rod_state.broadphase.subtrees_candidates_start[i_t, i_b]
+            + rod_state.broadphase.edges_candidates_start[i_e, i_b]
+        )
         func_query_rod_bvh(i_e, i_b, i_start, rod_state, rod_info, is_filling=True)
+
+
+@no_grad
+@qd.kernel(fastcache=True)
+def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo, errno: qd.Tensor):
+    """Find the candidate pairs of edges of the substep (see func_update_rod_contact_candidates)."""
+    func_update_rod_contact_candidates(rod_state, rod_info, errno)
 
 
 @qd.func
@@ -1082,10 +1172,12 @@ def func_project_rod_edge_pair(
                     qd.atomic_add(rod_state.verts.n_contacts[i_v_c, i_b], 1)
 
 
-@reversed_with_atomic_sums
-@qd.kernel(fastcache=True)
-def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
+@qd.func
+def func_project_rod_contacts(i_iter: qd.template(), rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
     """Apply the corrections of the inextensibility constraints, then compute those of the rod-rod contacts.
+
+    `i_iter` is the index of the projection in the substep, the argument of the kernel passed by reference: a copy of a
+    runtime value at the top level of a kernel is a statement outside of its loops, which autodiff refuses.
 
     With a broadphase, the contacts are searched among its candidate pairs, and a vertex moved further than half of the
     margin from its position in the broadphase may bring a pair of edges outside of them into contact: its environment
@@ -1146,7 +1238,13 @@ def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodI
 
 @reversed_with_atomic_sums
 @qd.kernel(fastcache=True)
-def kernel_finalize_rod_positions(
+def kernel_project_rod_contacts(i_iter: int, rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
+    """Run a projection of the rod-rod contacts (see func_project_rod_contacts)."""
+    func_project_rod_contacts(i_iter, rod_state, rod_info, rod_config)
+
+
+@qd.func
+def func_finalize_rod_positions(
     rod_state: RodState, links_state: LinksState, rod_info: RodInfo, rod_config: qd.template()
 ):
     """Apply the corrections of the last projection and the constraints of the vertices, then update the reference
@@ -1268,7 +1366,15 @@ def kernel_finalize_rod_positions(
 
 @reversed_with_atomic_sums
 @qd.kernel(fastcache=True)
-def kernel_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
+def kernel_finalize_rod_positions(
+    rod_state: RodState, links_state: LinksState, rod_info: RodInfo, rod_config: qd.template()
+):
+    """Apply the last correction of the projections of the rods (see func_finalize_rod_positions)."""
+    func_finalize_rod_positions(rod_state, links_state, rod_info, rod_config)
+
+
+@qd.func
+def func_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
     """Apply the friction of the rod-rod contacts and the constraints of the vertices to the velocities, then commit the
     reference frames and the rest curvatures the substep computed."""
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
@@ -1286,6 +1392,62 @@ def kernel_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, rod_c
 
     for i_h, i_b in qd.ndrange(*rod_state.hinges.twist.shape, axes=qd.static(eoa(rod_state.hinges.twist))):
         rod_state.hinges.kappa_rest[i_h, i_b] = rod_state.hinges.kappa_rest_next[i_h, i_b]
+
+
+@reversed_with_atomic_sums
+@qd.kernel(fastcache=True)
+def kernel_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
+    """Apply the friction of the rod-rod contacts to the velocities (see func_finalize_rod_velocities)."""
+    func_finalize_rod_velocities(rod_state, rod_info, rod_config)
+
+
+# The kernels below capture the stages of a substep as graphs, in a scene without gradients (see
+# 'RodSolver.substep_post_coupling')
+@qd.kernel(graph=True, fastcache=True)
+def kernel_update_rod_substep_velocities(rod_state: RodState, rod_info: RodInfo):
+    """Compute the elastic forces of the rods, then integrate their velocities over a substep, captured as one graph.
+
+    See func_compute_rod_forces and func_update_rod_velocities.
+    """
+    func_compute_rod_forces(rod_state, rod_info)
+    func_update_rod_velocities(rod_state, rod_info)
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_integrate_rod_substep(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template(), errno: qd.Tensor):
+    """Integrate the positions of the rods, then find the candidate pairs of edges of the substep, as one graph.
+
+    See func_integrate_rod_positions and func_update_rod_contact_candidates.
+    """
+    func_integrate_rod_positions(rod_state, rod_info)
+    if qd.static(rod_config.has_broadphase):
+        func_update_rod_contact_candidates(rod_state, rod_info, errno)
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_project_rod_iteration(
+    i_iter: int, rod_state: RodState, rod_info: RodInfo, rod_config: qd.template(), project_inextensibility: bool
+):
+    """Run a projection of the rod-rod contacts, then the inextensibility constraints of the next one, as one graph.
+
+    `i_iter` is the index of the projection in the substep, and `project_inextensibility` whether a projection follows
+    (see func_project_rod_contacts and func_project_rod_inextensibility).
+    """
+    if qd.static(rod_config.has_edge_pairs):
+        func_project_rod_contacts(i_iter, rod_state, rod_info, rod_config)
+    func_project_rod_inextensibility(rod_state, rod_info, rod_config, project_inextensibility)
+
+
+@qd.kernel(graph=True, fastcache=True)
+def kernel_finalize_rod_substep(
+    rod_state: RodState, links_state: LinksState, rod_info: RodInfo, rod_config: qd.template()
+):
+    """Apply the last correction of the projections, then update the velocities and frames of the rods, as one graph.
+
+    See func_finalize_rod_positions and func_finalize_rod_velocities.
+    """
+    func_finalize_rod_positions(rod_state, links_state, rod_info, rod_config)
+    func_finalize_rod_velocities(rod_state, rod_info, rod_config)
 
 
 @no_grad
@@ -1448,6 +1610,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         self._n_edge_pair_candidates = 0
         self._has_broadphase = False
         self._n_bvh_leaves = 0
+        self._bvh_subtree_depth = 0
         self._bvh_depth = 0
         # The rod of each edge and of each hinge, by which the energies sum per rod
         self._edges_rod_idx: torch.Tensor | None = None
@@ -1486,6 +1649,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             if self._has_broadphase:
                 self._bvh_depth = int(np.ceil(np.log2(self.n_edges)))
                 self._n_bvh_leaves = 1 << self._bvh_depth
+                self._bvh_subtree_depth = self._bvh_depth // 2
             elif self._n_edge_pairs > 0:
                 edge_pairs_idx = self._compute_edge_pairs()
         if self._contact_margin is None:
@@ -1700,26 +1864,50 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
     # ------------------------------------------------------------------------------------
 
     def substep_pre_coupling(self):
-        if self.is_active:
+        if not self.is_active:
+            return
+        # A scene tracking gradients launches the kernels one by one (see 'substep_post_coupling')
+        if self._requires_grad:
             kernel_compute_rod_forces(self.rod_state, self.rod_info)
             kernel_update_rod_velocities(self.rod_state, self.rod_info)
+        else:
+            kernel_update_rod_substep_velocities(self.rod_state, self.rod_info)
 
     def substep_post_coupling(self):
         if not self.is_active:
             return
-        kernel_integrate_rod_positions(self.rod_state, self.rod_info)
-        if self.rod_config.has_broadphase:
-            kernel_update_rod_contact_candidates(self.rod_state, self.rod_info, self.data_manager.errno)
-        for i_iter in range(self._n_pbd_iters):
-            if self.rod_config.has_edge_pairs:
-                kernel_project_rod_contacts(i_iter, self.rod_state, self.rod_info, self.rod_config)
-            if i_iter < self._n_pbd_iters - 1:
-                kernel_project_rod_inextensibility(self.rod_state, self.rod_info, self.rod_config)
+        # A step is bound by the launches of its kernels, which a graph per stage of the substep replays at almost no
+        # cost per loop. The projections take a graph each rather than a loop on the device, whose passes cost more
+        # than the launches.
+        # FIXME: quadrants#946 - a graph refuses the ndarrays that own a gradient, so a scene tracking gradients
+        # launches the kernels one by one, which the backward pass reverses one by one too (see 'LaunchRecorder').
+        if self._requires_grad:
+            kernel_integrate_rod_positions(self.rod_state, self.rod_info)
+            if self.rod_config.has_broadphase:
+                kernel_update_rod_contact_candidates(self.rod_state, self.rod_info, self.data_manager.errno)
+            for i_iter in range(self._n_pbd_iters):
+                if self.rod_config.has_edge_pairs:
+                    kernel_project_rod_contacts(i_iter, self.rod_state, self.rod_info, self.rod_config)
+                if i_iter < self._n_pbd_iters - 1:
+                    kernel_project_rod_inextensibility(self.rod_state, self.rod_info, self.rod_config)
+        else:
+            kernel_integrate_rod_substep(self.rod_state, self.rod_info, self.rod_config, self.data_manager.errno)
+            for i_iter in range(self._n_pbd_iters):
+                kernel_project_rod_iteration(
+                    i_iter,
+                    self.rod_state,
+                    self.rod_info,
+                    self.rod_config,
+                    project_inextensibility=i_iter < self._n_pbd_iters - 1,
+                )
         if self.rod_config.has_rigid_contacts:
             self._rigid_coupler.project_rod_rigid_contacts()
         links_state = self._sim.rigid_solver.dyn_state.links
-        kernel_finalize_rod_positions(self.rod_state, links_state, self.rod_info, self.rod_config)
-        kernel_finalize_rod_velocities(self.rod_state, self.rod_info, self.rod_config)
+        if self._requires_grad:
+            kernel_finalize_rod_positions(self.rod_state, links_state, self.rod_info, self.rod_config)
+            kernel_finalize_rod_velocities(self.rod_state, self.rod_info, self.rod_config)
+        else:
+            kernel_finalize_rod_substep(self.rod_state, links_state, self.rod_info, self.rod_config)
         # The state is checked once per step, at its last substep
         if self._sim.cur_substep_global % self._substeps == self._substeps - 1:
             kernel_check_rod_finite(self.rod_state, self.data_manager.errno)
