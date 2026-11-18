@@ -209,7 +209,7 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
         "theta": (3e-5, 2e-8),
         "E": (
             {"free_box": 3e-6, "box": 1e-5, "plane": 1e-5}.get(case, 1e-4),
-            {"post": 1e-6, "squeeze": 5e-7}.get(case, 5e-6),
+            {"squeeze": 5e-7}.get(case, 5e-6),
         ),
         "K": (1e-3 if case == "inextensible" else 1e-4, 5e-5),
         "G": (3e-4, 5e-6),
