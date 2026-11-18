@@ -58,8 +58,10 @@ ROD_EDGE_PAIRS = Size("rod_edge_pairs")
 ROD_BVH_NODES = Size("rod_bvh_nodes")
 # The subtrees of the hierarchy of the broadphase that its refit and its count of the slots take in parallel
 ROD_BVH_SUBTREES = Size("rod_bvh_subtrees")
-# The rigid links, of which the rods count their contacts
+# The rigid links, of which the rods count their contacts, and the rigid geoms that need coupling, whose contacts with
+# each vertex the rods search in parallel
 ROD_RIGID_LINKS = Size("rod_rigid_links")
+ROD_RIGID_GEOMS = Size("rod_rigid_geoms")
 
 # The arrays of the rod-rod contacts, which a scene without any pair of edges to test never reads
 ROD_CONTACTS = "rod_contacts"
@@ -336,6 +338,31 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     # The weights of the contacts of each link summed exactly, which its contacts read into 'links_contacts_weight' once
     # every contact added its weight (see 'RodConfig.is_deterministic')
     links_contacts_weight_sums: CarryFreeSums
+    # The end of the edge of a point inside an edge, 0 or 1 along it, which the search found deeper and from whose depth
+    # the penetration counts (see 'func_rod_rigid_contact' in legacy_coupler.py)
+    t_end: qd.Tensor = field(float)
+
+
+class RodRigidSlots(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_GEOMS, 3, ENVS)):
+    """The points of the two edges and of the sphere of each free vertex of the rods in each rigid geom near it that
+    needs coupling, in each environment, found once per substep in parallel, of which each vertex keeps one contact per
+    geom (see 'kernel_project_rod_rigid_normal' in legacy_coupler.py).
+
+    The search only compares values, so its parameters carry no gradient: the contacts kept are evaluated again at them
+    (see RodRigidContacts).
+    """
+
+    # The rigid geoms that need coupling, in their order
+    geoms_idx: qd.Tensor = field(int, shape=(ROD_RIGID_GEOMS,), kind=DataKind.CONSTANT)
+    # Whether the geom may reach the capsules of the edges of the vertex (see 'func_is_geom_near_rod_vertex' in
+    # legacy_coupler.py), the slots being searched only then
+    is_near: qd.Tensor = field(bool, shape=(ROD_VERTS, ROD_RIGID_GEOMS, ENVS))
+    # The parameter of the point along the edge of the slot (the edges ending and starting at the vertex, then its
+    # sphere), the end of the edge its penetration counts from (see 'RodRigidContacts.t_end'), and the penetration, a
+    # contact where positive
+    t: qd.Tensor = field(float)
+    t_end: qd.Tensor = field(float)
+    penetration: qd.Tensor = field(float)
 
 
 class RodRigidAnchors(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ROD_RIGID_CONTACTS_PER_VERT, ENVS)):
@@ -365,6 +392,7 @@ class RodState(Data):
     broadphase: RodBroadphase
     rigid_contacts: RodRigidContacts = field(opt_in=True)
     rigid_anchors: RodRigidAnchors = field(opt_in=True)
+    rigid_slots: RodRigidSlots = field(opt_in=True)
 
 
 class RodData(Data):
@@ -387,6 +415,7 @@ class RodData(Data):
                 rod_bvh_nodes=2 * solver.n_bvh_leaves,
                 rod_bvh_subtrees=solver.n_bvh_leaves >> solver._bvh_subtree_depth,
                 rod_rigid_links=solver.sim.rigid_solver.n_links,
+                rod_rigid_geoms=len(solver._rigid_geoms_idx),
                 rod_state=dict(
                     verts=dict(
                         dp_contact_sums=dict(
@@ -1604,8 +1633,10 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         self.rod_info: RodInfo | None = None
         self.rod_state: RodState | None = None
         self.rod_config: RodConfig | None = None
-        # The coupler projecting the rods out of the rigid geoms after their own projections, None if they do not couple
+        # The coupler projecting the rods out of the rigid geoms after their own projections, None if they do not
+        # couple, and the geoms that need coupling
         self._rigid_coupler: "LegacyCoupler | None" = None
+        self._rigid_geoms_idx = np.zeros((0,), dtype=gs.np_int)
         self._n_edge_pairs = 0
         self._n_edge_pair_candidates = 0
         self._has_broadphase = False
@@ -1660,7 +1691,19 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
 
         coupler = self._sim.coupler
         if self.is_active and isinstance(coupler, LegacyCoupler) and coupler.rigid_couplings[4]:
-            self._rigid_coupler = coupler
+            self._rigid_geoms_idx = np.array(
+                [
+                    geom.idx
+                    for entity in self._sim.rigid_solver.entities
+                    for link in entity.links
+                    for geom in link.geoms
+                    if geom.needs_coup
+                ],
+                dtype=gs.np_int,
+            )
+            # Rods meet no rigid geom where none needs coupling
+            if len(self._rigid_geoms_idx) > 0:
+                self._rigid_coupler = coupler
         self.rod_config = RodConfig(
             has_edge_pairs=self._n_edge_pairs > 0,
             has_broadphase=self._has_broadphase,
@@ -1705,6 +1748,8 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
                 self.rod_state.verts.dv_friction_sums.bins_unit.from_numpy(self._verts_sums_units)
             if self.rod_config.has_rigid_contacts:
                 self.rod_state.rigid_contacts.links_contacts_weight_sums.bins_unit.from_numpy(self._links_sums_units)
+        if self.rod_config.has_rigid_contacts:
+            self.rod_state.rigid_slots.geoms_idx.from_numpy(self._rigid_geoms_idx)
         for entity in self._entities:
             entity._build()
 

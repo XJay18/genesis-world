@@ -329,7 +329,7 @@ class LegacyCouplerInfo(Data, kind=DataKind.CONSTANT):
     # for the gradient of the mass to give a normal
     rod_mpm_fill_grad_min: qd.Tensor = field(float, shape=())
     # The evaluations of the search of the deepest point of an edge of the rods in a rigid geom: its two ends, three
-    # middle points, then five pairs of steps (see 'func_rod_rigid_contact')
+    # middle points, then five pairs of steps (see 'func_rod_rigid_contact_search')
     rod_edge_contact_n_evals: qd.Tensor = field(int, shape=())
     # How much deeper than the spheres of its two vertices, relative to the radius, the deepest point inside an edge
     # must be to make a contact of its own, its penetration counting from that depth. It keeps a face parallel to the
@@ -483,6 +483,7 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
             RodData.rod_state.verts.contact_geom_idx,
             RodData.rod_state.rigid_contacts,
             RodData.rod_state.rigid_anchors,
+            RodData.rod_state.rigid_slots,
         ):
             opt_in(field_ref, cond=lambda: self.rigid_couplings[4])
         for field_ref in (
@@ -3396,40 +3397,31 @@ def func_is_geom_near_rod_vertex(
 
 
 @qd.func
-def func_rod_rigid_contact(
+def func_rod_rigid_contact_search(
     i_v: int,
     i_slot: int,
     i_g: int,
     i_b: int,
     rod_state: RodState,
-    links_state: LinksState,
     geoms_state: GeomsState,
     rod_info: RodInfo,
-    links_info: LinksInfo,
     geoms_info: GeomsInfo,
     rigid_info: RigidInfo,
     sdf_info: SDFInfo,
     legacy_coupler_info: LegacyCouplerInfo,
-    rigid_config: qd.template(),
     collider_config: qd.template(),
 ):
-    """Find a contact of the capsule of a free vertex of the rods with a geom, with its masses and its slip.
+    """Find the point of the capsule of a free vertex of the rods where it meets a geom: the deepest point of one of its
+    edges, or its sphere.
 
-    Slots 0 and 1 are the edges ending and starting at the vertex, slot 2 the sphere of the vertex. The contact of
-    an edge is the deepest point of its capsule, where the penetration (the radius interpolated along the edge minus
-    the signed distance of the axis) is largest. It is searched among five points evenly spread along the edge, then
-    refined around the deepest one by pattern steps of halving size, a fixed number of evaluations. A point inside
-    the edge is a contact once it is deeper than the spheres of both vertices by 'rod_edge_contact_rel_depth' (see
-    LegacyCouplerInfo), and its penetration counts from that depth, so that the contact sets in at zero penetration
-    as the point deepens: a face parallel to an edge, no deeper inside it than at its ends, is met by the spheres
-    alone. The search only compares values, so the parameter it returns is piecewise constant, and the gradient of
-    the contact flows through its evaluations at that parameter and at the deeper end of the edge alone.
+    Slots 0 and 1 are the edges ending and starting at the vertex, slot 2 the sphere of the vertex. The point of an edge
+    is the deepest point of its capsule, where the penetration (the radius interpolated along the edge minus the signed
+    distance of the axis) is largest. It is searched among five points evenly spread along the edge, then refined around
+    the deepest one by pattern steps of halving size, a fixed number of evaluations. The search only compares values, so
+    the parameters it returns are piecewise constant, and carry no gradient.
 
-    Returns whether it is a contact, the first and second vertex of the edge (the vertex twice for its sphere), the
-    parameter of the point along the edge, the weight of the vertex in it, the outward normal of the geom, the
-    penetration, the slip of the point of the axis relative to the geom over the substep (its displacement minus the
-    one of the point of the geom), and the bound of the inverse mass of the link there (see
-    'func_link_inverse_mass_bound').
+    Returns the first and second vertex of the edge (the vertex twice for its sphere), the parameter of the point along
+    the edge, whether it lies inside the edge, and the end of the edge the search found deeper, 0 or 1 along it.
     """
     i_v_s, i_v_e = i_v, i_v
     n_evals = 0
@@ -3442,7 +3434,6 @@ def func_rod_rigid_contact(
             if geoms_info.type[i_g] != gs.GEOM_TYPE.PLANE:
                 n_evals = legacy_coupler_info.rod_edge_contact_n_evals[None]
 
-    # The search only finds the parameter of the contact, evaluated afterwards
     t = gs.qd_float(0.0)
     dist_min = gs.qd_float(qd.math.inf)
     dist_s, dist_e = gs.qd_float(0.0), gs.qd_float(0.0)
@@ -3495,19 +3486,53 @@ def func_rod_rigid_contact(
             if dist_eval < dist_min:
                 t, dist_min = t_eval, dist_eval
                 is_interior = i_eval >= 2
+    t_end = qd.select(dist_e < dist_s, 1.0, 0.0)
+    return i_v_s, i_v_e, t, is_interior, t_end
 
+
+@qd.func
+def func_rod_rigid_contact(
+    i_v_s: int,
+    i_v_e: int,
+    i_g: int,
+    i_b: int,
+    t: float,
+    t_end: float,
+    is_edge: bool,
+    is_interior: bool,
+    rod_state: RodState,
+    geoms_state: GeomsState,
+    rod_info: RodInfo,
+    geoms_info: GeomsInfo,
+    rigid_info: RigidInfo,
+    sdf_info: SDFInfo,
+    legacy_coupler_info: LegacyCouplerInfo,
+    collider_config: qd.template(),
+    compute_normal: qd.template(),
+):
+    """Evaluate the contact of the capsule of an edge of the rods, or of the sphere of a vertex, with a geom at the
+    point its search found (see 'func_rod_rigid_contact_search').
+
+    A point inside the edge is a contact once it is deeper than the spheres of both vertices by
+    'rod_edge_contact_rel_depth' (see LegacyCouplerInfo), and its penetration counts from that depth, so that the
+    contact sets in at zero penetration as the point deepens: a face parallel to an edge, no deeper inside it than at
+    its ends, is met by the spheres alone. The gradient of the contact flows through its evaluations at its parameter
+    and at the deeper end of the edge alone.
+
+    Returns the outward normal of the geom there, zero unless 'compute_normal' asks for it, and the penetration, a
+    contact where positive.
+    """
     pos = (1.0 - t) * rod_state.verts.pos[i_v_s, i_b] + t * rod_state.verts.pos[i_v_e, i_b]
     radius = (1.0 - t) * rod_info.verts.radius[i_v_s] + t * rod_info.verts.radius[i_v_e]
     signed_dist, normal = func_rod_geom_signed_distance(
-        i_g, i_b, pos, geoms_state, geoms_info, rigid_info, sdf_info, collider_config, compute_normal=True
+        i_g, i_b, pos, geoms_state, geoms_info, rigid_info, sdf_info, collider_config, compute_normal=compute_normal
     )
     penetration = radius - signed_dist
-    if i_slot < 2:
+    if is_edge:
         # A point at an end of the edge, or one that does not penetrate, makes no contact whatever its onset depth
         penetration_onset = gs.qd_float(0.0)
         if is_interior and penetration > 0.0:
             # The end of the edge the search found deeper, evaluated again so that the gradient flows through it
-            t_end = qd.select(dist_e < dist_s, 1.0, 0.0)
             pos_end = (1.0 - t_end) * rod_state.verts.pos[i_v_s, i_b] + t_end * rod_state.verts.pos[i_v_e, i_b]
             radius_end = (1.0 - t_end) * rod_info.verts.radius[i_v_s] + t_end * rod_info.verts.radius[i_v_e]
             signed_dist_end, _ = func_rod_geom_signed_distance(
@@ -3518,14 +3543,7 @@ def func_rod_rigid_contact(
                 legacy_coupler_info.rod_edge_contact_rel_depth[None] * radius_mean + radius_end - signed_dist_end, 0.0
             )
         penetration = qd.select(is_interior, penetration - penetration_onset, 0.0)
-    is_contact = penetration > 0.0
-    weight = 1.0 - t if i_v == i_v_s else t
-
-    i_l = geoms_info.link_idx[i_g]
-    pos_prev = (1.0 - t) * rod_state.verts.pos_prev[i_v_s, i_b] + t * rod_state.verts.pos_prev[i_v_e, i_b]
-    slip = pos - pos_prev - func_vel_at_point(i_l, i_b, pos, links_state) * rod_info.substep_dt[None]
-    inv_mass_link = func_link_inverse_mass_bound(i_l, i_b, pos, normal, links_state, links_info, rigid_config)
-    return is_contact, i_v_s, i_v_e, t, weight, normal, penetration, slip, inv_mass_link
+    return normal, penetration
 
 
 @qd.func
@@ -3548,15 +3566,19 @@ def func_project_rod_rigid_normal(
     coupling, and compute the normal impulses of the contacts and the normal corrections of the rods.
 
     A vertex has at most one contact with each geom (see 'RodRigidContacts'): its sphere where the sphere touches the
-    geom, and otherwise, of the deepest points of its two edges (see 'func_rod_rigid_contact'), the one pressing it
-    deepest, its penetration weighted by the weight of the vertex in the point along the edge. A vertex touching a geom
-    keeps that contact whatever the edges next to it do: the rim of a geom across an edge is held by the vertices whose
-    spheres miss it, and a vertex squeezed between two pads keeps both faces rather than trading one for the rim, over
-    which the rod would roll out of the grip. A point inside an edge is a contact of both vertices where neither sphere
-    touches, each resolving its share of the point (see 'func_rod_rigid_contact_share'), so that the two resolve the
-    whole point between them where they move, and the shares change continuously as the point moves along the edge.
-    The contact takes over the anchor of the contact of the vertex with the same geom at the last substep (see
+    geom, and otherwise, of the deepest points of its two edges (see 'func_rod_rigid_contact_search'), the one pressing
+    it deepest, its penetration weighted by the weight of the vertex in the point along the edge. A vertex touching a
+    geom keeps that contact whatever the edges next to it do: the rim of a geom across an edge is held by the vertices
+    whose spheres miss it, and a vertex squeezed between two pads keeps both faces rather than trading one for the rim,
+    over which the rod would roll out of the grip. A point inside an edge is a contact of both vertices where neither
+    sphere touches, each resolving its share of the point (see 'func_rod_rigid_contact_share'), so that the two resolve
+    the whole point between them where they move, and the shares change continuously as the point moves along the
+    edge. The contact takes over the anchor of the contact of the vertex with the same geom at the last substep (see
     'RodRigidAnchors'), whichever of its sphere and edges the point was on.
+
+    The points of the edges and of the sphere of every vertex are searched in every geom near it in parallel (see
+    RodRigidSlots), each vertex then keeps its contact with each geom, its first contacts in the order of the geoms, and
+    the contacts kept are evaluated again in parallel, so that the gradient flows through their evaluations alone.
 
     Each vertex takes the impulses of its contacts alone, as if their points were at the vertex, and its contacts are
     solved together, each impulse non-negative (see 'func_solve_nonnegative'). A vertex pressed by two geoms from
@@ -3593,126 +3615,177 @@ def func_project_rod_rigid_normal(
         if qd.static(IS_EXACT):
             func_carry_free_sum_clear(i_l, i_b, rod_state.rigid_contacts.links_contacts_weight_sums)
 
+    for i_v, i_gc, i_b in qd.ndrange(
+        rod_state.verts.pos.shape[0], rod_state.rigid_slots.geoms_idx.shape[0], rod_state.verts.pos.shape[1]
+    ):
+        is_near = False
+        if func_is_free(i_v, i_b, rod_state):
+            i_g = rod_state.rigid_slots.geoms_idx[i_gc]
+            is_near = func_is_geom_near_rod_vertex(
+                i_v,
+                i_g,
+                i_b,
+                rod_state,
+                geoms_state,
+                rod_info,
+                geoms_info,
+                rigid_info,
+                sdf_info,
+                legacy_coupler_info,
+                collider_config,
+            )
+        rod_state.rigid_slots.is_near[i_v, i_gc, i_b] = is_near
+
+    # The slots are a dimension of the loop: their search carries no gradient, and their contacts are evaluated again
+    # below once kept
+    for i_v, i_gc, i_slot, i_b in qd.ndrange(
+        rod_state.verts.pos.shape[0], rod_state.rigid_slots.geoms_idx.shape[0], 3, rod_state.verts.pos.shape[1]
+    ):
+        if rod_state.rigid_slots.is_near[i_v, i_gc, i_b]:
+            i_g = rod_state.rigid_slots.geoms_idx[i_gc]
+            i_v_s, i_v_e, t, is_interior, t_end = func_rod_rigid_contact_search(
+                i_v,
+                i_slot,
+                i_g,
+                i_b,
+                rod_state,
+                geoms_state,
+                rod_info,
+                geoms_info,
+                rigid_info,
+                sdf_info,
+                legacy_coupler_info,
+                collider_config,
+            )
+            _, penetration = func_rod_rigid_contact(
+                i_v_s,
+                i_v_e,
+                i_g,
+                i_b,
+                t,
+                t_end,
+                is_edge=i_slot < 2,
+                is_interior=is_interior,
+                rod_state=rod_state,
+                geoms_state=geoms_state,
+                rod_info=rod_info,
+                geoms_info=geoms_info,
+                rigid_info=rigid_info,
+                sdf_info=sdf_info,
+                legacy_coupler_info=legacy_coupler_info,
+                collider_config=collider_config,
+                compute_normal=False,
+            )
+            rod_state.rigid_slots.t[i_v, i_gc, i_slot, i_b] = t
+            rod_state.rigid_slots.t_end[i_v, i_gc, i_slot, i_b] = t_end
+            rod_state.rigid_slots.penetration[i_v, i_gc, i_slot, i_b] = penetration
+
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         n_contacts = 0
         contact_geom_idx = -1
         penetration_max = gs.qd_float(0.0)
-        if func_is_free(i_v, i_b, rod_state):
-            for i_g in range(geoms_info.needs_coup.shape[0]):
-                if geoms_info.needs_coup[i_g]:
-                    if func_is_geom_near_rod_vertex(
-                        i_v,
-                        i_g,
-                        i_b,
-                        rod_state,
-                        geoms_state,
-                        rod_info,
-                        geoms_info,
-                        rigid_info,
-                        sdf_info,
-                        legacy_coupler_info,
-                        collider_config,
-                    ):
-                        # The contact of the vertex with the geom: its sphere where it touches, otherwise the edge
-                        # contact pressing it deepest, its penetration weighted by the weight of the vertex in the point
-                        is_found = False
-                        penetration_share_max = gs.qd_float(0.0)
-                        contact_verts_idx = qd.Vector([i_v, i_v], dt=gs.qd_int)
-                        contact_t = gs.qd_float(0.0)
-                        contact_normal = qd.Vector.zero(gs.qd_float, 3)
-                        contact_penetration = gs.qd_float(0.0)
-                        contact_slip = qd.Vector.zero(gs.qd_float, 3)
-                        contact_inv_mass_link = gs.qd_float(0.0)
-                        contact_weight = gs.qd_float(0.0)
-                        # FIXME: quadrants autodiff - a runtime loop over the slots gets wrong adjoints of the geom
-                        # pose, see issue 4 of 'MV-quadrants-autodiff-issues.md' (DLO-Solver progress, 2026-11-04).
-                        # The unroll compiles the search of a contact 3 times.
-                        for i_slot in qd.static(range(3)):
-                            (
-                                is_contact,
-                                i_v_s,
-                                i_v_e,
-                                t,
-                                weight,
-                                normal,
-                                penetration,
-                                slip,
-                                inv_mass_link,
-                            ) = func_rod_rigid_contact(
-                                i_v,
-                                i_slot,
-                                i_g,
-                                i_b,
-                                rod_state,
-                                links_state,
-                                geoms_state,
-                                rod_info,
-                                links_info,
-                                geoms_info,
-                                rigid_info,
-                                sdf_info,
-                                legacy_coupler_info,
-                                rigid_config,
-                                collider_config,
-                            )
-                            if is_contact:
-                                if weight >= 0.5 and penetration > penetration_max:
-                                    penetration_max = penetration
-                                    contact_geom_idx = i_g
-                                is_chosen = weight * penetration > penetration_share_max
-                                # The sphere comes last among the slots
-                                if qd.static(i_slot == 2):
-                                    is_chosen = True
-                                if is_chosen:
-                                    is_found = True
-                                    penetration_share_max = weight * penetration
-                                    contact_verts_idx = qd.Vector([i_v_s, i_v_e], dt=gs.qd_int)
-                                    contact_t = t
-                                    contact_normal = normal
-                                    contact_penetration = penetration
-                                    contact_slip = slip
-                                    contact_inv_mass_link = inv_mass_link
-                                    contact_weight = weight
-                        if is_found and n_contacts < N_CONTACTS_MAX:
-                            rod_state.rigid_contacts.geom_idx[i_v, n_contacts, i_b] = i_g
-                            rod_state.rigid_contacts.verts_idx[i_v, n_contacts, i_b] = contact_verts_idx
-                            rod_state.rigid_contacts.t[i_v, n_contacts, i_b] = contact_t
-                            rod_state.rigid_contacts.normal[i_v, n_contacts, i_b] = contact_normal
-                            rod_state.rigid_contacts.penetration[i_v, n_contacts, i_b] = contact_penetration
-                            rod_state.rigid_contacts.penetration_start[i_v, n_contacts, i_b] = qd.max(
-                                contact_penetration + contact_slip.dot(contact_normal), 0.0
-                            )
-                            rod_state.rigid_contacts.inv_mass_link[i_v, n_contacts, i_b] = contact_inv_mass_link
-                            # The point of the geom the vertex sticks to, the one the vertex started the substep at
-                            # for a new contact
-                            i_l = geoms_info.link_idx[i_g]
-                            pos_prev = rod_state.verts.pos_prev[i_v, i_b]
-                            anchor = (
-                                pos_prev
-                                + func_vel_at_point(i_l, i_b, pos_prev, links_state) * (rod_info.substep_dt[None])
-                            )
-                            for i_a in qd.static(range(N_CONTACTS_MAX)):
-                                if i_a < rod_state.rigid_anchors.n_anchors[i_v, i_b]:
-                                    if rod_state.rigid_anchors.geom_idx[i_v, i_a, i_b] == i_g:
-                                        anchor = qd_transform_by_trans_quat(
-                                            rod_state.rigid_anchors.pos[i_v, i_a, i_b],
-                                            links_state.pos[i_l, i_b],
-                                            links_state.quat[i_l, i_b],
-                                        )
-                            rod_state.rigid_contacts.anchor[i_v, n_contacts, i_b] = anchor
-                            if qd.static(IS_EXACT):
-                                func_carry_free_sum_add(
-                                    i_l, i_b, contact_weight, rod_state.rigid_contacts.links_contacts_weight_sums
-                                )
-                            else:
-                                qd.atomic_add(rod_state.rigid_contacts.links_contacts_weight[i_l, i_b], contact_weight)
-                            qd.atomic_add(rod_state.rigid_contacts.links_n_contacts[i_l, i_b], 1)
-                            n_contacts += 1
+        for i_gc in range(rod_state.rigid_slots.geoms_idx.shape[0]):
+            if rod_state.rigid_slots.is_near[i_v, i_gc, i_b]:
+                # The contact of the vertex with the geom: its sphere where it touches, otherwise the edge contact
+                # pressing it deepest, its penetration weighted by the weight of the vertex in the point
+                is_found = False
+                penetration_share_max = gs.qd_float(0.0)
+                contact_verts_idx = qd.Vector([i_v, i_v], dt=gs.qd_int)
+                contact_t = gs.qd_float(0.0)
+                contact_t_end = gs.qd_float(0.0)
+                for i_slot in qd.static(range(3)):
+                    i_v_s, i_v_e = i_v, i_v
+                    if qd.static(i_slot < 2):
+                        i_e = rod_info.verts.edges_idx[i_v][i_slot]
+                        if i_e >= 0:
+                            edge_verts_idx = rod_info.edges.verts_idx[i_e]
+                            i_v_s, i_v_e = edge_verts_idx[0], edge_verts_idx[1]
+                    t = rod_state.rigid_slots.t[i_v, i_gc, i_slot, i_b]
+                    penetration = rod_state.rigid_slots.penetration[i_v, i_gc, i_slot, i_b]
+                    weight = 1.0 - t if i_v == i_v_s else t
+                    if penetration > 0.0:
+                        if weight >= 0.5 and penetration > penetration_max:
+                            penetration_max = penetration
+                            contact_geom_idx = rod_state.rigid_slots.geoms_idx[i_gc]
+                        is_chosen = weight * penetration > penetration_share_max
+                        # The sphere comes last among the slots
+                        if qd.static(i_slot == 2):
+                            is_chosen = True
+                        if is_chosen:
+                            is_found = True
+                            penetration_share_max = weight * penetration
+                            contact_verts_idx = qd.Vector([i_v_s, i_v_e], dt=gs.qd_int)
+                            contact_t = t
+                            contact_t_end = rod_state.rigid_slots.t_end[i_v, i_gc, i_slot, i_b]
+                if is_found and n_contacts < N_CONTACTS_MAX:
+                    rod_state.rigid_contacts.geom_idx[i_v, n_contacts, i_b] = rod_state.rigid_slots.geoms_idx[i_gc]
+                    rod_state.rigid_contacts.verts_idx[i_v, n_contacts, i_b] = contact_verts_idx
+                    rod_state.rigid_contacts.t[i_v, n_contacts, i_b] = contact_t
+                    rod_state.rigid_contacts.t_end[i_v, n_contacts, i_b] = contact_t_end
+                    n_contacts += 1
         rod_state.rigid_contacts.n_contacts[i_v, i_b] = n_contacts
         if contact_geom_idx >= 0:
             rod_state.verts.contact_geom_idx[i_v, i_b] = contact_geom_idx
         elif is_step_start:
             rod_state.verts.contact_geom_idx[i_v, i_b] = -1
+
+    for i_v, i_c, i_b in qd.ndrange(rod_state.verts.pos.shape[0], N_CONTACTS_MAX, rod_state.verts.pos.shape[1]):
+        if i_c < rod_state.rigid_contacts.n_contacts[i_v, i_b]:
+            i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
+            contact_verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
+            i_v_s, i_v_e = contact_verts_idx[0], contact_verts_idx[1]
+            t = rod_state.rigid_contacts.t[i_v, i_c, i_b]
+            # The contact of an edge lies inside it (see 'func_rod_rigid_contact')
+            is_edge = i_v_s != i_v_e
+            normal, penetration = func_rod_rigid_contact(
+                i_v_s,
+                i_v_e,
+                i_g,
+                i_b,
+                t,
+                rod_state.rigid_contacts.t_end[i_v, i_c, i_b],
+                is_edge,
+                is_edge,
+                rod_state,
+                geoms_state,
+                rod_info,
+                geoms_info,
+                rigid_info,
+                sdf_info,
+                legacy_coupler_info,
+                collider_config,
+                compute_normal=True,
+            )
+            weight = 1.0 - t if i_v == i_v_s else t
+            # The slip of the point of the axis relative to the geom over the substep, its displacement minus the one
+            # of the point of the geom
+            i_l = geoms_info.link_idx[i_g]
+            pos = (1.0 - t) * rod_state.verts.pos[i_v_s, i_b] + t * rod_state.verts.pos[i_v_e, i_b]
+            pos_point_prev = (1.0 - t) * rod_state.verts.pos_prev[i_v_s, i_b] + t * rod_state.verts.pos_prev[i_v_e, i_b]
+            slip = pos - pos_point_prev - func_vel_at_point(i_l, i_b, pos, links_state) * rod_info.substep_dt[None]
+            rod_state.rigid_contacts.normal[i_v, i_c, i_b] = normal
+            rod_state.rigid_contacts.penetration[i_v, i_c, i_b] = penetration
+            rod_state.rigid_contacts.penetration_start[i_v, i_c, i_b] = qd.max(penetration + slip.dot(normal), 0.0)
+            rod_state.rigid_contacts.inv_mass_link[i_v, i_c, i_b] = func_link_inverse_mass_bound(
+                i_l, i_b, pos, normal, links_state, links_info, rigid_config
+            )
+            # The point of the geom the vertex sticks to, the one the vertex started the substep at for a new contact
+            pos_prev = rod_state.verts.pos_prev[i_v, i_b]
+            anchor = pos_prev + func_vel_at_point(i_l, i_b, pos_prev, links_state) * (rod_info.substep_dt[None])
+            for i_a in qd.static(range(N_CONTACTS_MAX)):
+                if i_a < rod_state.rigid_anchors.n_anchors[i_v, i_b]:
+                    if rod_state.rigid_anchors.geom_idx[i_v, i_a, i_b] == i_g:
+                        anchor = qd_transform_by_trans_quat(
+                            rod_state.rigid_anchors.pos[i_v, i_a, i_b],
+                            links_state.pos[i_l, i_b],
+                            links_state.quat[i_l, i_b],
+                        )
+            rod_state.rigid_contacts.anchor[i_v, i_c, i_b] = anchor
+            if qd.static(IS_EXACT):
+                func_carry_free_sum_add(i_l, i_b, weight, rod_state.rigid_contacts.links_contacts_weight_sums)
+            else:
+                qd.atomic_add(rod_state.rigid_contacts.links_contacts_weight[i_l, i_b], weight)
+            qd.atomic_add(rod_state.rigid_contacts.links_n_contacts[i_l, i_b], 1)
 
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         n_contacts = rod_state.rigid_contacts.n_contacts[i_v, i_b]
