@@ -1116,6 +1116,56 @@ def test_rod_length_and_rigid_contacts(show_viewer):
 
 
 @pytest.mark.required
+def test_rod_passes_through_rigid_geoms_without_coupling(show_viewer):
+    dt, n_substeps, gravity, z_init = 1e-3, 5, -9.81, 0.104
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=dt,
+            substeps=n_substeps,
+            gravity=(0.0, 0.0, gravity),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.4, 0.2),
+            camera_lookat=(0.0, 0.0, 0.08),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.05),
+            size=(0.1, 0.1, 0.1),
+            fixed=True,
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=False,
+        ),
+    )
+    # A rod lying across the top of the box, its capsule overlapping it
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=10,
+            interval=0.01,
+            pos=(-0.035, 0.0, z_init),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=0.005,
+        ),
+    )
+    scene.build(n_envs=2)
+    assert_equal(rod.get_verts_contact_geom_idx(), -1)
+    for i_step in range(20):
+        scene.step()
+        # The rod falls freely into the box, each substep adding gravity to the velocity before the position moves
+        n_substeps_done = (i_step + 1) * n_substeps
+        z_fall = gravity * (dt / n_substeps) ** 2 * n_substeps_done * (n_substeps_done + 1) / 2
+        assert_allclose(rod.get_verts_pos()[..., 2], z_init + z_fall, tol=1e-13)
+        assert_equal(rod.get_verts_contact_geom_idx(), -1)
+    scene.reset()
+    assert_allclose(rod.get_verts_pos()[..., 2], z_init, tol=gs.EPS)
+    assert_equal(rod.get_verts_contact_geom_idx(), -1)
+
+
+@pytest.mark.required
 def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_viewer):
     radius, interval, friction, post_radius, squeeze_force = 0.01, 0.02, 0.5, 0.0075, 5.0
     n_close_steps, n_lift_steps, n_yaw_steps = 50, 100, 150

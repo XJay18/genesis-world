@@ -1750,6 +1750,10 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
                 self.rod_state.rigid_contacts.links_contacts_weight_sums.bins_unit.from_numpy(self._links_sums_units)
         if self.rod_config.has_rigid_contacts:
             self.rod_state.rigid_slots.geoms_idx.from_numpy(self._rigid_geoms_idx)
+        # No vertex penetrates a geom before the first step, nor ever where no geom needs coupling, which skips the
+        # projection recording the contacts (see 'RodConfig.has_rigid_contacts')
+        if self.rod_state.verts.contact_geom_idx.shape:
+            self.rod_state.verts.contact_geom_idx.fill(-1)
         for entity in self._entities:
             entity._build()
 
