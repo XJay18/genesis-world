@@ -4402,9 +4402,9 @@ def func_gather_rod_mpm_patches(
 
     The level is as sharp as the grid, about one grid spacing. A layer thinner than about two spacings holds no node of
     its full mass, so its largest node, the reference of the fill, is light and the level rises: a rod rests up to about
-    half a spacing above the layer. Near a side face of the material the mass a point gets falls over about a spacing,
-    which rounds the edge of the surface, so a rod lying across the edge loses its support there and pivots. A finer
-    grid shrinks both.
+    half a spacing above the layer. Near a side face of the material the mass a point gets falls over one to two
+    spacings, which rounds the edge of the surface, so a rod lying across the edge loses its support there and pivots.
+    A finer grid shrinks both.
     """
     for i_v, i_b in qd.ndrange(*rod_state.verts.mpm_mass.shape, axes=qd.static(eoa(rod_state.verts.mpm_mass))):
         rod_state.verts.mpm_mass[i_v, i_b] = 0.0
