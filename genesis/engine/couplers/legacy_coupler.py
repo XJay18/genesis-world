@@ -3192,28 +3192,36 @@ def func_rod_rigid_contact_link_inverse_mass(
 
 
 @qd.func
-def func_rod_rigid_contact_share(i_v: int, i_c: int, i_b: int, is_squeezed: bool, rod_state: RodState) -> float:
+def func_rod_rigid_contact_share(
+    i_v: int, i_c: int, i_b: int, is_squeezed: bool, rod_state: RodState, rod_config: qd.template()
+) -> float:
     """Return the share of a vertex of the rods in resolving the point of one of its contacts with a rigid geom (see
-    'RodRigidContacts'): its weight in the point over the sum of the squared weights of the two vertices of the edge,
-    or its weight alone for a vertex squeezed between geoms (see 'func_rod_rigid_contacts_are_squeezing').
+    'RodRigidContacts'): its weight in the point over the sum of the squared weights of the two vertices of the edge.
 
     A vertex the impulses move moves by its share of the correction of the point, so that the point, which each vertex
     moves by its weight, moves by the whole correction: the sum of the weights times the shares is one. The share is
     one for the sphere of a vertex and at the middle of an edge, and at most about 1.21, near a parameter of 0.29.
 
-    A squeezed vertex does not move, its impulses pushing the links back instead, and its share is its weight, so that
-    the links resolve a point inside an edge next to it over the substeps. A share above the weight raises its target,
-    its share times the penetration, by up to twice where its contact with a geom passes from its sphere to an edge
-    (see 'kernel_project_rod_rigid_normal'), and with it the impulses on the links pressing the vertex, which can let a
-    rod out of a grip in fast motion.
+    The share is zero for a point inside an edge of a vertex squeezed between geoms (see
+    'func_rod_rigid_contacts_are_squeezing') whose other vertex is free and unsqueezed. The squeezed vertex cannot move
+    along the normals of its contacts: an impulse it takes from one geom pushes it into the geoms on its other side,
+    which push back by as much, so that its share of the point would only push the links apart. The point then acts on
+    the rod through the other vertex alone, which turns the rod into the grip: the rims of two pads squeezing a rod
+    across their faces turn it until the faces reach it, where a share of the squeezed vertex stops the pads on the
+    rims. Where the other vertex is squeezed or held too, no vertex of the edge moves the point, and both resolve their
+    shares by pushing the link back.
 
-    FIXME: the share of a squeezed vertex is a stop-gap until the full share holds a grip in fast motion as well.
+    The contacts of the other vertex are those of the same substep, evaluated before the impulses.
     """
     verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
     t = rod_state.rigid_contacts.t[i_v, i_c, i_b]
-    share = qd.select(i_v == verts_idx[0], 1.0 - t, t)
-    if not is_squeezed:
-        share = share / ((1.0 - t) ** 2 + t**2)
+    share = qd.select(i_v == verts_idx[0], 1.0 - t, t) / ((1.0 - t) ** 2 + t**2)
+    if is_squeezed and verts_idx[0] != verts_idx[1]:
+        i_v_other = qd.select(i_v == verts_idx[0], verts_idx[1], verts_idx[0])
+        if func_is_free(i_v_other, i_b, rod_state):
+            n_contacts_other = rod_state.rigid_contacts.n_contacts[i_v_other, i_b]
+            if not func_rod_rigid_contacts_are_squeezing(i_v_other, i_b, n_contacts_other, rod_state, rod_config):
+                share = 0.0
     return share
 
 
@@ -3817,7 +3825,7 @@ def func_project_rod_rigid_normal(
             shares = qd.Vector.zero(gs.qd_float, N_CONTACTS_MAX)
             for i_c in qd.static(range(N_CONTACTS_MAX)):
                 if i_c < n_contacts:
-                    shares[i_c] = func_rod_rigid_contact_share(i_v, i_c, i_b, is_squeezed, rod_state)
+                    shares[i_c] = func_rod_rigid_contact_share(i_v, i_c, i_b, is_squeezed, rod_state, rod_config)
                     for j_c in qd.static(range(N_CONTACTS_MAX)):
                         if j_c < n_contacts:
                             coupling[i_c, j_c] = inv_mass * rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(

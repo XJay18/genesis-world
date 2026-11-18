@@ -1759,6 +1759,72 @@ def test_rod_rigid_grip_holds_twice_the_friction(two_pad_gripper, show_viewer):
 
 
 @pytest.mark.required
+def test_rod_rigid_pad_rims_turn_rod_into_grip(two_pad_gripper, show_viewer):
+    radius, interval, yaw, max_force = 0.01, 0.04, math.radians(10.0), 20.0
+    n_close_steps, n_hold_steps = 40, 20
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=0.0,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.0, -0.4, 0.5),
+            camera_lookat=(0.0, 0.0, 0.3),
+        ),
+        show_viewer=show_viewer,
+    )
+    gripper = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=two_pad_gripper,
+            pos=(0.0, 0.0, 0.3),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.5,
+        ),
+    )
+    # A rod held at its ends crossing the pads at a yaw about its middle vertex, the edges of which are longer than the
+    # pads are wide: the rims of each pad meet the edges on both sides of the middle vertex before the faces meet it
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=7,
+            interval=interval,
+            pos=(-3 * interval, 0.0, 0.3),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.005,
+            segment_radius=radius,
+        ),
+    )
+    scene.build(n_envs=2)
+    verts_offset = interval * (np.arange(7) - 3)[:, None] * np.array([math.cos(yaw), math.sin(yaw), 0.0])
+    rod.set_position(np.array([0.0, 0.0, 0.3]) + verts_offset)
+    rod.set_verts_fixed(True, verts_idx_local=[0, 6])
+    pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
+    lift_dof = gripper.get_joint("lift").dofs_idx_local
+    gripper.set_dofs_kp([4000.0, 4000.0, 1e4], [*pads_dof, *lift_dof])
+    gripper.set_dofs_kv([40.0, 40.0, 150.0], [*pads_dof, *lift_dof])
+    gripper.set_dofs_force_range([-max_force, -max_force], [max_force, max_force], pads_dof)
+    pads = [gripper.get_link(name) for name in ("left_pad", "right_pad")]
+    held_offset = []
+    for i_step in range(n_close_steps + n_hold_steps):
+        gripper.control_dofs_position([0.015, 0.015, 0.0], [*pads_dof, *lift_dof])
+        scene.step()
+        if i_step >= n_close_steps:
+            pads_center = 0.5 * (tensor_to_array(pads[0].get_pos()) + tensor_to_array(pads[1].get_pos()))
+            held_offset.append(tensor_to_array(rod.get_verts_pos())[:, 3] - pads_center)
+    # The rims turn the rod through the free vertices next to the middle vertex, which the pads squeeze, until both faces
+    # press the middle vertex: the pads close to less than the diameter of the rod. The scene is symmetric about the
+    # vertical axis through the middle vertex, which the grip keeps at the centre of the pads
+    assert (0.03 - gripper.get_dofs_position(pads_dof).sum(dim=-1) < 2.0 * radius).all()
+    assert np.linalg.norm(np.array(held_offset), axis=-1).max() < 2e-10
+
+
+@pytest.mark.required
 def test_rod_rests_on_supported_rigid_link(show_viewer):
     radius, n_steps = 0.005, 300
     scene = gs.Scene(
