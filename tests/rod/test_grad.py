@@ -224,7 +224,7 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
     steps_and_tols = {
         "pos": (1e-8 if is_rod_contact else 1e-7, 5e-5),
         "vel": (
-            {"free_box": 3e-7, "pressed_box": 1e-6, "box": 1e-6, "plane": 1e-6, "post": 2e-7, "squeeze": 5e-6}.get(
+            {"free_box": 3e-7, "pressed_box": 3e-7, "box": 1e-6, "plane": 1e-6, "post": 2e-7, "squeeze": 5e-6}.get(
                 case, 1e-5
             ),
             {"free_box": 5e-6, "pressed_box": 5e-4, "post": 5e-7, "squeeze": 1e-7}.get(case, 2e-6),
