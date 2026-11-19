@@ -1774,6 +1774,82 @@ def test_rod_rigid_pad_rims_turn_rod_into_grip(two_pad_gripper, show_viewer):
 
 
 @pytest.mark.required
+def test_rod_rigid_squeezed_vertex_stays_out_of_blocked_link(two_pad_gripper, show_viewer):
+    radius, squeeze_force, press_force, n_steps = 0.01, 20.0, 5.0, 50
+    box_size = (0.03, 0.012, 0.02)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=0.0,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.15, -0.25, 0.12),
+            camera_lookat=(0.0, 0.0, 0.02),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    gripper = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=two_pad_gripper,
+            pos=(0.0, 0.0, 0.031),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.6,
+        ),
+    )
+    # A free box of 30 g on the ground, under the middle vertex of the rod and narrower than the gap of the pads that
+    # squeeze it: pressed down by the pads, the vertex pushes the box into the ground, which holds it
+    box = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.5 * box_size[2]),
+            size=box_size,
+        ),
+        material=gs.materials.Rigid(
+            rho=0.03 / math.prod(box_size),
+            needs_coup=True,
+            coup_friction=0.6,
+        ),
+    )
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=7,
+            interval=0.02,
+            pos=(-0.06, 0.0, 0.031),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.001,
+            segment_radius=radius,
+        ),
+    )
+    scene.build(n_envs=2)
+    pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
+    lift_dof = gripper.get_joint("lift").dofs_idx_local
+    gripper.set_dofs_position(np.full((2, 2), 0.005 - 1e-5), pads_dof)
+    gripper.control_dofs_force([squeeze_force, squeeze_force, -press_force], [*pads_dof, *lift_dof])
+    carriage = gripper.get_link("carriage")
+    held_offset_start = tensor_to_array(rod.get_verts_pos())[:, 3] - tensor_to_array(carriage.get_pos())
+    depth, held_slip = [], []
+    for _ in range(n_steps):
+        scene.step()
+        verts_pos = tensor_to_array(rod.get_verts_pos())
+        box_top = tensor_to_array(box.get_pos())[:, 2] + 0.5 * box_size[2]
+        depth.append(box_top + radius - verts_pos[:, 3, 2])
+        held_slip.append(verts_pos[:, 3] - tensor_to_array(carriage.get_pos()) - held_offset_start)
+    # The pads press the vertex onto the box with the force of their carriage, and their friction holds it there. The
+    # box, held by the ground, stops the vertex at its surface
+    assert np.max(depth) < 5e-4
+    assert np.linalg.norm(held_slip, axis=-1).max() < 1e-6
+
+
+@pytest.mark.required
 def test_rod_rests_on_supported_rigid_link(show_viewer):
     radius, n_steps = 0.005, 300
     scene = gs.Scene(
