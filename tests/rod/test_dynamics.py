@@ -130,26 +130,33 @@ def test_elastic_energy_decays_with_damping(show_viewer):
             material=gs.materials.Rod.Base(
                 K=0.0,
                 E=1e5,
-                G=1e4,
+                G=G,
                 segment_radius=0.005,
             ),
         )
-        for y in (0.0, 0.5)
+        for y, G in ((0.0, 1e4), (0.5, 1e4), (1.0, 0.0))
     ]
     scene.build()
     # The first rod is released from a circular arc keeping its rest edge lengths, the second from a sine wave
-    # stretching them, which the inextensibility constraint first projects back
+    # stretching them, which the inextensibility constraint first projects back. The third, without twisting
+    # stiffness, is released from the same arc with the frames of every other edge turned by a quarter turn.
     angles = (np.arange(n_verts) - (n_verts - 1) / 2) * 2.0 * np.arcsin(0.5 * interval / radius)
     arc_z = 0.5 + radius * (1.0 - np.cos(angles))
     rods[0].set_position(np.stack([radius * np.sin(angles), np.zeros(n_verts), arc_z], -1))
     x = interval * np.arange(n_verts)
     rods[1].set_position(np.stack([x, 0.5 + np.zeros(n_verts), 0.5 + 0.01 * np.sin(2.0 * np.pi * x / x[-1])], -1))
+    rods[2].set_position(np.stack([radius * np.sin(angles), np.ones(n_verts), arc_z], -1))
+    rods[2].set_edges_theta(0.5 * np.pi * (np.arange(n_verts - 1) % 2))
+    # A round rod bends the same whatever the twist of its frames
+    assert_allclose(rods[2].get_energy(), rods[0].get_energy(), tol=gs.EPS)
 
     energies = []
     for _ in range(150):
         scene.step()
         energies.append(torch.stack([rod.get_energy().sum() for rod in rods]))
     energies = tensor_to_array(torch.stack(energies))
+    assert_allclose(energies[:, 2], energies[:, 0], tol=gs.EPS)
+    assert_allclose(rods[2].get_verts_pos() - rods[0].get_verts_pos(), (0.0, 1.0, 0.0), tol=gs.EPS)
     assert (energies[0] > 0.0).all()
     assert (np.diff(energies[:, 0]) < 0.0).all()
     assert energies[-1, 0] < 0.85 * energies[0, 0]
