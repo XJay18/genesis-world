@@ -48,9 +48,17 @@ class Base(Material["RodEntity"]):
         Mass of each vertex, in kg. Default is 0.02.
     segment_radius : float, optional
         Radius of the rod, in m. Default is 0.01.
-    twist_inertia : float, optional
-        Rotational inertia of each edge about its tangent, which sets how fast the twist responds to its energy. Default
-        is 1.
+    twist_inertia : float or None, optional
+        Rotational inertia of each edge about its tangent, in kg m^2, which sets how fast the twist follows its energy
+        and how much angular momentum the spin of the edges holds. None takes the inertia of a solid cylinder of the
+        mass of the edge (the mean of its two vertex masses) and the radius of the rod, m r^2 / 2. A larger value slows
+        the twist, which then lags the bending and takes angular momentum from the vertices, so that a spinning rod
+        slows down. Where the substep is too long to integrate the twist stably at this inertia, as for the stiff twist
+        of short edges at the default 10 ms step, the inertia is raised to the least stable value: a shorter substep
+        keeps it physical. The raise counts the twisting stiffness alone: the bending adds a twist stiffness only
+        through a rest curvature, which stays stable while |kb| |kappa_rest| < 8 m l / (pi E r^2 dt^2) at every hinge,
+        with kb the curvature binormal (2 tan(phi / 2) for a turning angle phi), kappa_rest the rest curvature, l the
+        edge length and dt the substep. Default is None.
     """
 
     K: NonNegativeFloat = 0.0
@@ -65,4 +73,4 @@ class Base(Material["RodEntity"]):
     inextensible: StrictBool = True
     segment_mass: PositiveFloat = 0.02
     segment_radius: PositiveFloat = 0.01
-    twist_inertia: PositiveFloat = 1.0
+    twist_inertia: PositiveFloat | None = None
