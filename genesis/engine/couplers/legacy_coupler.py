@@ -29,6 +29,7 @@ from genesis.engine.solvers.particle_solver import func_add_particles_momentum, 
 from genesis.engine.solvers.pbd_solver import PBDInfo, PBDState
 from genesis.engine.solvers.rigid.abd.forward_dynamics import func_vel_at_point
 from genesis.engine.solvers.rigid.abd.misc import func_add_external_wrench
+from genesis.engine.solvers.rigid.collider.data import ColliderState
 from genesis.engine.solvers.rigid.constraint.data import ConstraintState
 from genesis.engine.solvers.rigid.data import (
     DofsState,
@@ -57,7 +58,7 @@ from genesis.engine.solvers.sph_solver import (
     func_segment_dist,
     func_segment_volume,
 )
-from genesis.grad.bridge import no_grad, register_custom_backward, reversed_with
+from genesis.grad.bridge import register_custom_backward, reversed_with
 from genesis.options.solvers import LegacyCouplerOptions
 from genesis.repr_base import RBC
 from genesis.utils.data import ENVS, Config, Data, DataItem, DataKind, Size, eoa, field, is_opted_in, iter_data, opt_in
@@ -1353,21 +1354,16 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
         rigid_solver = self.rigid_solver
         is_step_start = self.sim.cur_substep_global % self.sim.substeps == 0
         constraint_state = rigid_solver.constraint_solver.constraint_state
+        collider_state = rigid_solver.collider.collider_state
         # A scene tracking gradients launches the kernels one by one (see 'RodSolver.substep_post_coupling')
         if self.rod_solver.requires_grad:
-            kernel_rod_rigid_links_response(
-                self.rod_solver.rod_state,
-                rigid_solver.dyn_state.links,
-                rigid_solver.dyn_state.dofs,
-                constraint_state,
-                rigid_solver.dyn_info.links,
-                rigid_solver.rigid_info,
-                rigid_solver.rigid_config,
-            )
             kernel_project_rod_rigid_normal(
                 self.rod_solver.rod_state,
                 rigid_solver.dyn_state.links,
+                rigid_solver.dyn_state.dofs,
                 rigid_solver.dyn_state.geoms,
+                collider_state,
+                constraint_state,
                 self.rod_solver.rod_info,
                 rigid_solver.dyn_info.links,
                 rigid_solver.dyn_info.geoms,
@@ -1395,6 +1391,7 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
                 rigid_solver.dyn_state.links,
                 rigid_solver.dyn_state.dofs,
                 rigid_solver.dyn_state.geoms,
+                collider_state,
                 constraint_state,
                 self.rod_solver.rod_info,
                 rigid_solver.dyn_info.links,
@@ -3602,13 +3599,14 @@ def func_rod_rigid_links_response(
     rod_state: RodState,
     links_state: LinksState,
     dofs_state: DofsState,
+    collider_state: ColliderState,
     constraint_state: ConstraintState,
     links_info: LinksInfo,
     rigid_info: RigidInfo,
     rigid_config: qd.template(),
 ):
-    """Compute the inverse inertia of each free link through the last constraint solve of the rigid solver (see
-    'links_inv_inertia' in RodRigidContacts).
+    """Compute the inverse inertia of each free link the rods touch through the last constraint solve of the rigid
+    solver (see 'links_inv_inertia' in RodRigidContacts).
 
     The constraint solve minimizes a cost whose Hessian over the accelerations of the dofs is H = M + J^T D J over its
     active rows, with M the mass matrix and J, D the Jacobian and the stiffness of the rows. While the active set holds,
@@ -3620,6 +3618,17 @@ def func_rod_rigid_links_response(
     'func_project_rod_rigid_normal'). Without active rows it is the inverse of the free-body inertia, the bound the other
     links keep (see 'func_link_inverse_mass_bound').
 
+    Only the links the contacts of the rods touch at the substep are computed, the others being read by no contact. The
+    rows touching the dofs of a free link are the equality and friction loss rows, which come first, and the rows of the
+    contacts of the links of its kinematic tree, which the constraint solve lays out contact by contact in the order of
+    the contacts of the collider, 'rows_per_contact' rows each, after the hibernated ones (see
+    '_add_collision_constraints_per_contact' in the constraint solver). A free joint has no limit row. The scan of these
+    rows alone, in the order of the solve, gives the sum over every row, the others adding exact zeros, at a cost set by
+    the contacts of the environment rather than by its rows.
+
+    Under the elliptic friction cone, the rows of a contact form one cone whose active set and Hessian are blocks per
+    contact, which the response does not read: a free link then keeps the bound of its inverse mass.
+
     The response is read from the solve as data and carries no gradient. Its derivative with respect to the state of
     the link is mostly the slope of the stiffness of its contact rows in their penetration (the impedance of the rigid
     contacts), which reaches the rods only through the gradients of the contacts of the collider, and the rigid backward
@@ -3629,9 +3638,12 @@ def func_rod_rigid_links_response(
     """
     # FIXME: the response carries no gradient. An exact one needs the rigid backward to accumulate the gradients of the
     # contacts of the collider rather than clear them before its collision reverse (see '_constraint_force_grad').
+    ROWS_PER_CONTACT = qd.static(rigid_config.rows_per_contact)
     for i_l, i_b in qd.ndrange(rod_state.rigid_contacts.links_inv_inertia.shape[0], links_state.pos.shape[1]):
-        inv_inertia = qd.Matrix.zero(gs.qd_float, 6, 6)
-        if func_is_free_link(i_l, i_b, links_info, rigid_config):
+        is_touched = False
+        if rod_state.rigid_contacts.links_n_contacts[i_l, i_b] > 0:
+            is_touched = func_is_free_link(i_l, i_b, links_info, rigid_config)
+        if is_touched:
             I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
             i_d0 = links_info.dof_start[I_l]
             H = qd.Matrix.zero(gs.qd_float, 6, 6)
@@ -3642,12 +3654,34 @@ def func_rod_rigid_links_response(
                         H[i, j] = rigid_info.mass_mat[i_d0 + i, i_d0 + j, i_b]
                     else:
                         H[i, j] = rigid_info.mass_mat[i_d0 + j, i_d0 + i, i_b]
-            for i_con in range(constraint_state.n_constraints[i_b]):
-                if constraint_state.active[i_con, i_b]:
-                    jac = qd.Vector.zero(gs.qd_float, 6)
-                    for i in qd.static(range(6)):
-                        jac[i] = constraint_state.jac[i_con, i_d0 + i, i_b]
-                    H = H + constraint_state.efc_D[i_con, i_b] * jac.outer_product(jac)
+            # The equality and friction loss rows one by one, then the rows of each contact of the tree of the link
+            n_rows_before = (
+                constraint_state.n_constraints_equality[i_b] + constraint_state.n_constraints_frictionloss[i_b]
+            )
+            n_contacts_hibernated = collider_state.n_contacts_hibernated[i_b]
+            n_contacts_live = collider_state.n_contacts[i_b] - n_contacts_hibernated
+            for i_item in range(n_rows_before + n_contacts_live):
+                i_row_start = i_item
+                n_rows = 1
+                if i_item >= n_rows_before:
+                    i_col_ = i_item - n_rows_before
+                    i_col = collider_state.contact_sort_idx[n_contacts_hibernated + i_col_, i_b]
+                    i_l_a = collider_state.contact_data.link_a[i_col, i_b]
+                    i_l_b = collider_state.contact_data.link_b[i_col, i_b]
+                    I_l_a = [i_l_a, i_b] if qd.static(rigid_config.batch_links_info) else i_l_a
+                    is_tree_contact = links_info.root_idx[I_l_a] == i_l
+                    if i_l_b >= 0:
+                        I_l_b = [i_l_b, i_b] if qd.static(rigid_config.batch_links_info) else i_l_b
+                        if links_info.root_idx[I_l_b] == i_l:
+                            is_tree_contact = True
+                    i_row_start = n_rows_before + i_col_ * ROWS_PER_CONTACT
+                    n_rows = ROWS_PER_CONTACT if is_tree_contact else 0
+                for i_row in range(i_row_start, i_row_start + n_rows):
+                    if constraint_state.active[i_row, i_b]:
+                        jac = qd.Vector.zero(gs.qd_float, 6)
+                        for i in qd.static(range(6)):
+                            jac[i] = constraint_state.jac[i_row, i_d0 + i, i_b]
+                        H = H + constraint_state.efc_D[i_row, i_b] * jac.outer_product(jac)
             # The Cholesky factor H = L L^T, then X = L^-1 S^T, so that S H^-1 S^T = X^T X
             L = qd.Matrix.zero(gs.qd_float, 6, 6)
             for j in qd.static(range(6)):
@@ -3673,33 +3707,17 @@ def func_rod_rigid_links_response(
                     for k in qd.static(range(i)):
                         val = val - L[i, k] * X[k, c]
                     X[i, c] = val / L[i, i]
-            inv_inertia = X.transpose() @ X
-        rod_state.rigid_contacts.links_inv_inertia[i_l, i_b] = inv_inertia
-
-
-@no_grad
-@qd.kernel(fastcache=True)
-def kernel_rod_rigid_links_response(
-    rod_state: RodState,
-    links_state: LinksState,
-    dofs_state: DofsState,
-    constraint_state: ConstraintState,
-    links_info: LinksInfo,
-    rigid_info: RigidInfo,
-    rigid_config: qd.template(),
-):
-    """Compute the inverse inertia of each free link through the last constraint solve (see
-    func_rod_rigid_links_response)."""
-    func_rod_rigid_links_response(
-        rod_state, links_state, dofs_state, constraint_state, links_info, rigid_info, rigid_config
-    )
+            rod_state.rigid_contacts.links_inv_inertia[i_l, i_b] = X.transpose() @ X
 
 
 @qd.func
 def func_project_rod_rigid_normal(
     rod_state: RodState,
     links_state: LinksState,
+    dofs_state: DofsState,
     geoms_state: GeomsState,
+    collider_state: ColliderState,
+    constraint_state: ConstraintState,
     rod_info: RodInfo,
     links_info: LinksInfo,
     geoms_info: GeomsInfo,
@@ -3949,13 +3967,11 @@ def func_project_rod_rigid_normal(
             rod_state.rigid_contacts.normal[i_v, i_c, i_b] = normal
             rod_state.rigid_contacts.penetration[i_v, i_c, i_b] = penetration
             rod_state.rigid_contacts.penetration_start[i_v, i_c, i_b] = qd.max(penetration + slip.dot(normal), 0.0)
-            inv_mass_link = func_link_inverse_mass_bound(i_l, i_b, pos, normal, links_state, links_info, rigid_config)
-            # A free link moves through the contacts that hold it in place (see 'func_rod_rigid_links_response')
-            if func_is_free_link(i_l, i_b, links_info, rigid_config):
-                torque_arm = (pos - links_state.root_COM[i_l, i_b]).cross(normal)
-                twist = qd.Vector([torque_arm[0], torque_arm[1], torque_arm[2], normal[0], normal[1], normal[2]])
-                inv_mass_link = twist.dot(rod_state.rigid_contacts.links_inv_inertia[i_l, i_b] @ twist)
-            rod_state.rigid_contacts.inv_mass_link[i_v, i_c, i_b] = inv_mass_link
+            # A free link reads its response once the contacts are counted, below
+            if not func_is_free_link(i_l, i_b, links_info, rigid_config):
+                rod_state.rigid_contacts.inv_mass_link[i_v, i_c, i_b] = func_link_inverse_mass_bound(
+                    i_l, i_b, pos, normal, links_state, links_info, rigid_config
+                )
             # The point of the geom the vertex sticks to, the one the vertex started the substep at for a new contact
             pos_prev = rod_state.verts.pos_prev[i_v, i_b]
             anchor = pos_prev + func_vel_at_point(i_l, i_b, pos_prev, links_state) * (rod_info.substep_dt[None])
@@ -3973,6 +3989,26 @@ def func_project_rod_rigid_normal(
             else:
                 qd.atomic_add(rod_state.rigid_contacts.links_contacts_weight[i_l, i_b], weight)
             qd.atomic_add(rod_state.rigid_contacts.links_n_contacts[i_l, i_b], 1)
+
+    # A free link moves through the contacts that hold it in place
+    func_rod_rigid_links_response(
+        rod_state, links_state, dofs_state, collider_state, constraint_state, links_info, rigid_info, rigid_config
+    )
+    for i_v, i_c, i_b in qd.ndrange(rod_state.verts.pos.shape[0], N_CONTACTS_MAX, rod_state.verts.pos.shape[1]):
+        if i_c < rod_state.rigid_contacts.n_contacts[i_v, i_b]:
+            i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
+            i_l = geoms_info.link_idx[i_g]
+            if func_is_free_link(i_l, i_b, links_info, rigid_config):
+                contact_verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
+                i_v_s, i_v_e = contact_verts_idx[0], contact_verts_idx[1]
+                t = rod_state.rigid_contacts.t[i_v, i_c, i_b]
+                normal = rod_state.rigid_contacts.normal[i_v, i_c, i_b]
+                pos = (1.0 - t) * rod_state.verts.pos[i_v_s, i_b] + t * rod_state.verts.pos[i_v_e, i_b]
+                torque_arm = (pos - links_state.root_COM[i_l, i_b]).cross(normal)
+                twist = qd.Vector([torque_arm[0], torque_arm[1], torque_arm[2], normal[0], normal[1], normal[2]])
+                rod_state.rigid_contacts.inv_mass_link[i_v, i_c, i_b] = twist.dot(
+                    rod_state.rigid_contacts.links_inv_inertia[i_l, i_b] @ twist
+                )
 
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         n_contacts = rod_state.rigid_contacts.n_contacts[i_v, i_b]
@@ -4147,7 +4183,10 @@ def func_project_rod_rigid_normal(
 def kernel_project_rod_rigid_normal(
     rod_state: RodState,
     links_state: LinksState,
+    dofs_state: DofsState,
     geoms_state: GeomsState,
+    collider_state: ColliderState,
+    constraint_state: ConstraintState,
     rod_info: RodInfo,
     links_info: LinksInfo,
     geoms_info: GeomsInfo,
@@ -4163,7 +4202,10 @@ def kernel_project_rod_rigid_normal(
     func_project_rod_rigid_normal(
         rod_state,
         links_state,
+        dofs_state,
         geoms_state,
+        collider_state,
+        constraint_state,
         rod_info,
         links_info,
         geoms_info,
@@ -4401,6 +4443,7 @@ def kernel_project_rod_rigid_contacts(
     links_state: LinksState,
     dofs_state: DofsState,
     geoms_state: GeomsState,
+    collider_state: ColliderState,
     constraint_state: ConstraintState,
     rod_info: RodInfo,
     links_info: LinksInfo,
@@ -4415,15 +4458,15 @@ def kernel_project_rod_rigid_contacts(
 ):
     """Project the rods out of the rigid geoms that need coupling, with friction, captured as one graph.
 
-    See func_rod_rigid_links_response, func_project_rod_rigid_normal and func_project_rod_rigid_friction.
+    See func_project_rod_rigid_normal and func_project_rod_rigid_friction.
     """
-    func_rod_rigid_links_response(
-        rod_state, links_state, dofs_state, constraint_state, links_info, rigid_info, rigid_config
-    )
     func_project_rod_rigid_normal(
         rod_state,
         links_state,
+        dofs_state,
         geoms_state,
+        collider_state,
+        constraint_state,
         rod_info,
         links_info,
         geoms_info,
