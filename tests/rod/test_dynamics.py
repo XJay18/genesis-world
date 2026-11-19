@@ -290,11 +290,11 @@ def test_bending_plasticity_at_yield(show_viewer):
     bending_modulus = material.E * math.pi * material.segment_radius**4 / 4.0
     energy_elastic = (n_verts - 2) * bending_modulus / (2.0 * interval) * (curvature * interval) ** 2
     energies = [rod.get_energy()[1] for rod in rods]
-    assert_allclose(energies[0], energy_elastic, tol=1e-10)
-    assert_allclose(energies[2], energy_elastic, tol=1e-10)
+    assert_allclose(energies[0], energy_elastic, tol=1e-14)
+    assert_allclose(energies[2], energy_elastic, tol=1e-14)
     # Beyond the yield the rest curvature creeps toward the curvature, by all of its excess at the default creep rate of
     # 1: the elastic curvature left, yield^2 / curvature, stays below the yield, and the creep stops
-    assert_allclose(energies[1], energy_elastic * 0.8**4, tol=1e-10)
+    assert_allclose(energies[1], energy_elastic * 0.8**4, tol=1e-14)
 
 
 @pytest.mark.required
