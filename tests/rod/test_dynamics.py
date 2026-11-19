@@ -2017,6 +2017,40 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
             segment_radius=radius,
         ),
     )
+    # Far from the first, the same with a box of 0.86 g, lighter than a vertex of the rod, which the ground holds as
+    # firmly as the heavy one
+    gripper_light = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=two_pad_gripper,
+            pos=(-0.5, 0.0, 0.031),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.6,
+        ),
+    )
+    box_light = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(-0.5, 0.0, 0.5 * box_size[2]),
+            size=box_size,
+        ),
+        material=gs.materials.Rigid(
+            rho=120.0,
+            needs_coup=True,
+            coup_friction=0.6,
+        ),
+    )
+    rod_light = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=7,
+            interval=0.02,
+            pos=(-0.56, 0.0, 0.031),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.001,
+            segment_radius=radius,
+        ),
+    )
     # Far from the first, a rod with fixed ends squeezed at its middle vertex by held pads, and a ball pushed up into the
     # edge after that vertex, under its point near the free vertex of the edge, whose sphere also reaches the ball
     gripper_held = scene.add_entity(
@@ -2054,24 +2088,31 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
     rod_held.set_verts_fixed(True, verts_idx_local=[0, 6])
     pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
     lift_dof = gripper.get_joint("lift").dofs_idx_local
-    for entity in (gripper, gripper_held):
+    for entity in (gripper, gripper_light, gripper_held):
         entity.set_dofs_position(np.full((2, 2), 0.005 - 1e-5), pads_dof)
-    gripper.control_dofs_force([squeeze_force, squeeze_force, -press_force], [*pads_dof, *lift_dof])
+    for entity in (gripper, gripper_light):
+        entity.control_dofs_force([squeeze_force, squeeze_force, -press_force], [*pads_dof, *lift_dof])
     gripper_held.set_dofs_kp([1e4], lift_dof)
     gripper_held.set_dofs_kv([150.0], lift_dof)
     gripper_held.control_dofs_force([squeeze_force, squeeze_force], pads_dof)
     gripper_held.control_dofs_position([0.0], lift_dof)
     ball.control_dofs_force([push_force], ball.get_joint("push").dofs_idx_local)
     ball_radius = ball.geoms[0].data[0]
-    carriage = gripper.get_link("carriage")
-    held_offset_start = tensor_to_array(rod.get_verts_pos())[:, 3] - tensor_to_array(carriage.get_pos())
+    pressed = ((gripper, box, rod), (gripper_light, box_light, rod_light))
+    held_offsets_start = [
+        tensor_to_array(rod_pressed.get_verts_pos())[:, 3]
+        - tensor_to_array(gripper_pressed.get_link("carriage").get_pos())
+        for gripper_pressed, _, rod_pressed in pressed
+    ]
     depth, held_slip, edge_depth = [], [], []
     for i_step in range(n_steps):
         scene.step()
-        verts_pos = tensor_to_array(rod.get_verts_pos())
-        box_top = tensor_to_array(box.get_pos())[:, 2] + 0.5 * box_size[2]
-        depth.append(box_top + radius - verts_pos[:, 3, 2])
-        held_slip.append(verts_pos[:, 3] - tensor_to_array(carriage.get_pos()) - held_offset_start)
+        for (gripper_pressed, box_pressed, rod_pressed), held_offset_start in zip(pressed, held_offsets_start):
+            verts_pos = tensor_to_array(rod_pressed.get_verts_pos())
+            box_top = tensor_to_array(box_pressed.get_pos())[:, 2] + 0.5 * box_size[2]
+            depth.append(box_top + radius - verts_pos[:, 3, 2])
+            carriage_pos = tensor_to_array(gripper_pressed.get_link("carriage").get_pos())
+            held_slip.append(verts_pos[:, 3] - carriage_pos - held_offset_start)
         if i_step >= n_settle_steps:
             # The deepest point of the capsule of the edge in the ball, from the distance of the centre to its axis
             edge_start, edge_end = tensor_to_array(rod_held.get_verts_pos())[:, 3:5].transpose(1, 0, 2)
@@ -2081,7 +2122,8 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
             edge_dist = np.linalg.norm(ball_pos - edge_start - t[:, None] * edge, axis=-1)
             edge_depth.append(radius + ball_radius - edge_dist)
     # The pads press the vertex onto the box with the force of their carriage, and their friction holds it there. The
-    # box, held by the ground, stops the vertex at its surface
+    # box, held by the ground, stops the vertex at its surface, however light it is: the contact sees it through the
+    # ground holding it
     assert np.max(depth) < 5e-4
     assert np.linalg.norm(held_slip, axis=-1).max() < 1e-6
     # The squeezed vertex leaves the point of the edge to the free vertex, whose contact with the ball, its sphere, pushes
