@@ -3619,12 +3619,14 @@ def func_rod_rigid_links_response(
     links keep (see 'func_link_inverse_mass_bound').
 
     Only the links the contacts of the rods touch at the substep are computed, the others being read by no contact. The
-    rows touching the dofs of a free link are the equality and friction loss rows, which come first, and the rows of the
-    contacts of the links of its kinematic tree, which the constraint solve lays out contact by contact in the order of
-    the contacts of the collider, 'rows_per_contact' rows each, after the hibernated ones (see
-    '_add_collision_constraints_per_contact' in the constraint solver). A free joint has no limit row. The scan of these
-    rows alone, in the order of the solve, gives the sum over every row, the others adding exact zeros, at a cost set by
-    the contacts of the environment rather than by its rows.
+    constraint solve lays its rows out as the equality rows, the friction loss rows, the rows of the contacts of the
+    collider contact by contact in their order after the hibernated ones, 'rows_per_contact' rows each (see
+    '_add_collision_constraints_per_contact' in the constraint solver), then the limit rows: those of the joints and
+    those of the dynamic constraints, a screw limit walking the chains of both of its links (see
+    'func_add_dynamic_constraint_rows_batch'). The scan reads every row in that order but the rows of the contacts that
+    no link of the kinematic tree of the free link takes part in, whose Jacobian is zero on its dofs, so that they add
+    exact zeros: the sum equals the one over every row, at a cost set by the contacts of the environment rather than by
+    all of its rows.
 
     Under the elliptic friction cone, the rows of a contact form one cone whose active set and Hessian are blocks per
     contact, which the response does not read: a free link then keeps the bound of its inverse mass.
@@ -3654,16 +3656,21 @@ def func_rod_rigid_links_response(
                         H[i, j] = rigid_info.mass_mat[i_d0 + i, i_d0 + j, i_b]
                     else:
                         H[i, j] = rigid_info.mass_mat[i_d0 + j, i_d0 + i, i_b]
-            # The equality and friction loss rows one by one, then the rows of each contact of the tree of the link
+            # The equality and friction loss rows one by one, the rows of each contact of the tree of the link, then
+            # the limit rows
             n_rows_before = (
                 constraint_state.n_constraints_equality[i_b] + constraint_state.n_constraints_frictionloss[i_b]
             )
             n_contacts_hibernated = collider_state.n_contacts_hibernated[i_b]
             n_contacts_live = collider_state.n_contacts[i_b] - n_contacts_hibernated
-            for i_item in range(n_rows_before + n_contacts_live):
+            i_row_limits = n_rows_before + n_contacts_live * ROWS_PER_CONTACT
+            for i_item in range(n_rows_before + n_contacts_live + 1):
                 i_row_start = i_item
                 n_rows = 1
-                if i_item >= n_rows_before:
+                if i_item == n_rows_before + n_contacts_live:
+                    i_row_start = i_row_limits
+                    n_rows = constraint_state.n_constraints[i_b] - i_row_limits
+                elif i_item >= n_rows_before:
                     i_col_ = i_item - n_rows_before
                     i_col = collider_state.contact_sort_idx[n_contacts_hibernated + i_col_, i_b]
                     i_l_a = collider_state.contact_data.link_a[i_col, i_b]
