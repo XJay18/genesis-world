@@ -732,6 +732,9 @@ def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
     round rod bends the same at any twist, which reaches the bending energy through the rest curvature alone. A
     curvature in a frame shared by the two edges would shrink as their frames turn apart, leaving a rod without twisting
     stiffness free to untwist its bending away.
+
+    The binormal depends on each edge through its tangent, whose derivative with respect to the edge divides by the
+    current length of the edge: the forces are the gradients of the energies whatever the stretch of the edges.
     """
     for i_e, i_b in qd.ndrange(*rod_state.edges.theta.shape, axes=qd.static(eoa(rod_state.edges.theta))):
         i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
@@ -759,7 +762,7 @@ def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
         i_v_m = rod_info.hinges.verts_idx[i_h][1]
         i_r = rod_info.verts.rod_idx[i_v_m]
         t_s, t_e = rod_state.edges.tangent[i_e_s, i_b], rod_state.edges.tangent[i_e_e, i_b]
-        rest_length_s, rest_length_e = rod_info.edges.rest_length[i_e_s], rod_info.edges.rest_length[i_e_e]
+        length_s, length_e = rod_state.edges.length[i_e_s, i_b], rod_state.edges.length[i_e_e, i_b]
         rest_length = rod_info.hinges.rest_length[i_h]
         radius = rod_info.verts.radius[i_v_m]
         area = math.pi * radius * radius
@@ -778,8 +781,8 @@ def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
         twisting_modulus = rod_state.rods.twisting_stiffness[i_r, i_b] * area * radius * radius / 2.0
         twisting_scale = twisting_modulus * twist / rest_length
         rod_state.hinges.twisting_energy[i_h, i_b] = 0.5 * twisting_modulus * twist * twist / rest_length
-        twisting_dx_s = -twisting_scale * kb / (2.0 * rod_state.edges.length[i_e_s, i_b])
-        twisting_dx_e = twisting_scale * kb / (2.0 * rod_state.edges.length[i_e_e, i_b])
+        twisting_dx_s = -twisting_scale * kb / (2.0 * length_s)
+        twisting_dx_e = twisting_scale * kb / (2.0 * length_e)
 
         # Bending, each side carrying half of it, through the curvature in the material frame of its edge with respect
         # to the rest curvature of that side, which moves toward the curvature when their difference exceeds the plastic
@@ -813,8 +816,8 @@ def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
             rod_state.hinges.edges_torque[i_h, i_side, i_b] = bending_dtheta + (2.0 * i_side - 1.0) * twisting_scale
         rod_state.hinges.bending_energy[i_h, i_b] = bending_energy
         bending_t_tilde = bending_kappa_dot * (t_s + t_e) / chi
-        bending_de_s = bending_scale * (2.0 * t_e.cross(bending_axis) / chi - bending_t_tilde) / rest_length_s
-        bending_de_e = -bending_scale * (2.0 * t_s.cross(bending_axis) / chi + bending_t_tilde) / rest_length_e
+        bending_de_s = bending_scale * (2.0 * t_e.cross(bending_axis) / chi - bending_t_tilde) / length_s
+        bending_de_e = -bending_scale * (2.0 * t_s.cross(bending_axis) / chi + bending_t_tilde) / length_e
 
         rod_state.hinges.verts_force[i_h, 0, i_b] = -bending_de_s + twisting_dx_s
         rod_state.hinges.verts_force[i_h, 1, i_b] = bending_de_s - bending_de_e - twisting_dx_s - twisting_dx_e

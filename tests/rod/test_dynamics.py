@@ -128,18 +128,20 @@ def test_elastic_energy_decays_with_damping(show_viewer):
                 pos=(0.0, y, 0.5),
             ),
             material=gs.materials.Rod.Base(
-                K=0.0,
+                K=K,
                 E=1e5,
                 G=G,
                 segment_radius=0.005,
+                inextensible=K == 0.0,
             ),
         )
-        for y, G in ((0.0, 1e4), (0.5, 1e4), (1.0, 0.0))
+        for y, K, G in ((0.0, 0.0, 1e4), (0.5, 0.0, 1e4), (1.0, 0.0, 0.0), (1.5, 1e3, 0.0))
     ]
     scene.build()
     # The first rod is released from a circular arc keeping its rest edge lengths, the second from a sine wave
     # stretching them, which the inextensibility constraint first projects back. The third, without twisting
-    # stiffness, is released from the same arc with the frames of every other edge turned by a quarter turn.
+    # stiffness, is released from the same arc with the frames of every other edge turned by a quarter turn. The
+    # fourth, extensible, is released from the same arc with its edges stretched by a fifth.
     angles = (np.arange(n_verts) - (n_verts - 1) / 2) * 2.0 * np.arcsin(0.5 * interval / radius)
     arc_z = 0.5 + radius * (1.0 - np.cos(angles))
     rods[0].set_position(np.stack([radius * np.sin(angles), np.zeros(n_verts), arc_z], -1))
@@ -149,12 +151,19 @@ def test_elastic_energy_decays_with_damping(show_viewer):
     rods[2].set_edges_theta(0.5 * np.pi * (np.arange(n_verts - 1) % 2))
     # A round rod bends the same whatever the twist of its frames
     assert_allclose(rods[2].get_energy(), rods[0].get_energy(), tol=gs.EPS)
+    angles_stretched = (np.arange(n_verts) - (n_verts - 1) / 2) * 2.0 * np.arcsin(0.6 * interval / radius)
+    arc_stretched_z = 0.5 + radius * (1.0 - np.cos(angles_stretched))
+    rods[3].set_position(np.stack([radius * np.sin(angles_stretched), np.full(n_verts, 1.5), arc_stretched_z], -1))
 
-    energies = []
+    energies, energies_stretched = [], []
     for _ in range(150):
         scene.step()
         energies.append(torch.stack([rod.get_energy().sum() for rod in rods]))
+        vel = rods[3].get_verts_vel()
+        energies_stretched.append(energies[-1][3] + 0.5 * rods[3].material.segment_mass * (vel**2).sum())
     energies = tensor_to_array(torch.stack(energies))
+    # The energy of the stretched rod moves between its edges, its bending and its vertices, while the damping drains it
+    assert (torch.stack(energies_stretched).diff() < 0.0).all()
     assert_allclose(energies[:, 2], energies[:, 0], tol=gs.EPS)
     assert_allclose(rods[2].get_verts_pos() - rods[0].get_verts_pos(), (0.0, 1.0, 0.0), tol=gs.EPS)
     assert (energies[0] > 0.0).all()
@@ -165,6 +174,56 @@ def test_elastic_energy_decays_with_damping(show_viewer):
     # The projection of the stretched edges onto their rest length moves energy into bending, which stays of the order
     # of the initial energy
     assert energies[:, 1].max() < 2.0 * energies[0, 1]
+
+
+@pytest.mark.required
+def test_elastic_forces_conserve_energy(show_viewer):
+    n_verts, interval, radius, n_steps = 30, 0.01, 0.15, 50
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.0, -0.8, 0.8),
+            camera_lookat=(0.0, 0.0, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=n_verts,
+            interval=interval,
+            pos=(0.0, 0.0, 0.5),
+        ),
+        material=gs.materials.Rod.Base(
+            K=1e3,
+            E=1e5,
+            G=0.0,
+            segment_radius=0.005,
+            inextensible=False,
+        ),
+    )
+    scene.build()
+    # The rod is released from a circular arc stretching its edges by a fifth, which keep about that strain while the
+    # rod unbends. Without twisting stiffness nor rest curvature its edges take no torque, so that the vertices alone
+    # hold the kinetic energy.
+    angles = (np.arange(n_verts) - (n_verts - 1) / 2) * 2.0 * np.arcsin(0.6 * interval / radius)
+    arc_z = 0.5 + radius * (1.0 - np.cos(angles))
+    rod.set_position(np.stack([radius * np.sin(angles), np.zeros(n_verts), arc_z], -1))
+
+    def total_energy():
+        return rod.get_energy().sum() + 0.5 * rod.material.segment_mass * (rod.get_verts_vel() ** 2).sum()
+
+    energy_init = total_energy()
+    energy_errors = []
+    for _ in range(n_steps):
+        scene.step()
+        energy_errors.append(abs(total_energy() - energy_init))
+    # The forces are the gradients of the energy at any stretch of the edges, so the total energy only oscillates by
+    # the error of the explicit time integration
+    assert max(energy_errors) < 5e-4 * energy_init
 
 
 @pytest.mark.required
