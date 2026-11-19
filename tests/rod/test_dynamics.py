@@ -2104,7 +2104,10 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
         - tensor_to_array(gripper_pressed.get_link("carriage").get_pos())
         for gripper_pressed, _, rod_pressed in pressed
     ]
-    depth, held_slip, edge_depth = [], [], []
+    rigid_solver = scene.sim.rigid_solver
+    constraint_state = rigid_solver.constraint_solver.constraint_state
+    rod_state = scene.sim.rod_solver.rod_state
+    depth, held_slip, edge_depth, response_err = [], [], [], []
     for i_step in range(n_steps):
         scene.step()
         for (gripper_pressed, box_pressed, rod_pressed), held_offset_start in zip(pressed, held_offsets_start):
@@ -2113,6 +2116,30 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
             depth.append(box_top + radius - verts_pos[:, 3, 2])
             carriage_pos = tensor_to_array(gripper_pressed.get_link("carriage").get_pos())
             held_slip.append(verts_pos[:, 3] - carriage_pos - held_offset_start)
+            # A box the rods touch at the last substep is seen through its response at the last constraint solve,
+            # S (M + J^T D J)^-1 S^T over every active row of the solve, S the motion subspace of its dofs, whatever the
+            # order in which the solve lays out its rows
+            link = box_pressed.links[0]
+            dofs = slice(link.dof_start, link.dof_end)
+            links_n_contacts = qd_to_numpy(rod_state.rigid_contacts.links_n_contacts)
+            for i_b in np.flatnonzero(links_n_contacts[link.idx] > 0):
+                rows = np.flatnonzero(
+                    qd_to_numpy(constraint_state.active)[: qd_to_numpy(constraint_state.n_constraints)[i_b], i_b]
+                )
+                rows_jac = qd_to_numpy(constraint_state.jac)[rows, dofs, i_b]
+                mass_mat = qd_to_numpy(rigid_solver.rigid_info.mass_mat)[dofs, dofs, i_b]
+                hessian = np.tril(mass_mat) + np.tril(mass_mat, -1).T
+                hessian = hessian + (rows_jac.T * qd_to_numpy(constraint_state.efc_D)[rows, i_b]) @ rows_jac
+                motion = np.concatenate(
+                    (
+                        qd_to_numpy(rigid_solver.dyn_state.dofs.cdof_ang),
+                        qd_to_numpy(rigid_solver.dyn_state.dofs.cdof_vel),
+                    ),
+                    axis=-1,
+                )[dofs, i_b].T
+                inv_inertia = motion @ np.linalg.solve(hessian, motion.T)
+                inv_inertia_rods = qd_to_numpy(rod_state.rigid_contacts.links_inv_inertia)[link.idx, i_b]
+                response_err.append(np.abs(inv_inertia_rods - inv_inertia).max() / np.abs(inv_inertia).max())
         if i_step >= n_settle_steps:
             # The deepest point of the capsule of the edge in the ball, from the distance of the centre to its axis
             edge_start, edge_end = tensor_to_array(rod_held.get_verts_pos())[:, 3:5].transpose(1, 0, 2)
@@ -2129,6 +2156,9 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
     # The squeezed vertex leaves the point of the edge to the free vertex, whose contact with the ball, its sphere, pushes
     # the point out too: the ball stops near the surface of the rod
     assert np.max(edge_depth) < 5e-4
+    # The response the contacts read equals the one over every row to the rounding of the sums
+    assert response_err
+    assert np.max(response_err) < 5e-15
 
 
 @pytest.mark.required
