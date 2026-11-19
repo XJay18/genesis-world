@@ -607,13 +607,14 @@ def func_last_projection_correction(
 
 
 @nb.jit(nopython=True, cache=True)
-def compute_rod_frames(tangents: np.ndarray, is_loop: bool, eps: float) -> np.ndarray:
+def compute_rod_frames(tangents: np.ndarray, lengths: np.ndarray, is_loop: bool, eps: float) -> np.ndarray:
     """
     Return the first director of a frame of each edge of a rod, carried from edge to edge by parallel transport.
 
     The frame of the first edge is perpendicular to its tangent, along the axis least aligned with it. For a loop, the
-    rotation the transport around the loop accumulates (its holonomy) is spread evenly over the edges, so that the frame
-    closes on itself.
+    rotation the transport around the loop accumulates (its holonomy) is spread over the edges in proportion to the
+    length along the loop, 'lengths' being the lengths of the edges: the frame closes on itself, turning by the same
+    angle per unit length at every hinge, which is the least twisting energy a loop of that holonomy can have.
     """
     n_edges = tangents.shape[0]
     d1 = np.zeros_like(tangents)
@@ -637,8 +638,12 @@ def compute_rod_frames(tangents: np.ndarray, is_loop: bool, eps: float) -> np.nd
             sin_holonomy = min(max(np.dot(np.cross(v, d1[0]), t0), -1.0), 1.0)
             cos_holonomy = min(max(np.dot(v, d1[0]), -1.0), 1.0)
             holonomy = math.atan2(sin_holonomy, cos_holonomy)
-            for i_c in range(n_edges):
-                angle = -holonomy * i_c / n_edges
+            # The length along the loop from the middle of the first edge to the middle of each edge, the sum of the
+            # Voronoi lengths of the hinges in between
+            length_along, length_loop = 0.0, lengths.sum()
+            for i_c in range(1, n_edges):
+                length_along += 0.5 * (lengths[i_c - 1] + lengths[i_c])
+                angle = holonomy * length_along / length_loop
                 d2 = np.cross(tangents[i_c], d1[i_c])
                 d1[i_c] = math.cos(angle) * d1[i_c] + math.sin(angle) * d2
     return d1
@@ -732,6 +737,9 @@ def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
     round rod bends the same at any twist, which reaches the bending energy through the rest curvature alone. A
     curvature in a frame shared by the two edges would shrink as their frames turn apart, leaving a rod without twisting
     stiffness free to untwist its bending away.
+
+    The binormal depends on each edge through its tangent, whose derivative with respect to the edge divides by the
+    current length of the edge: the forces are the gradients of the energies whatever the stretch of the edges.
     """
     for i_e, i_b in qd.ndrange(*rod_state.edges.theta.shape, axes=qd.static(eoa(rod_state.edges.theta))):
         i_v_s, i_v_e = rod_info.edges.verts_idx[i_e]
@@ -759,7 +767,7 @@ def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
         i_v_m = rod_info.hinges.verts_idx[i_h][1]
         i_r = rod_info.verts.rod_idx[i_v_m]
         t_s, t_e = rod_state.edges.tangent[i_e_s, i_b], rod_state.edges.tangent[i_e_e, i_b]
-        rest_length_s, rest_length_e = rod_info.edges.rest_length[i_e_s], rod_info.edges.rest_length[i_e_e]
+        length_s, length_e = rod_state.edges.length[i_e_s, i_b], rod_state.edges.length[i_e_e, i_b]
         rest_length = rod_info.hinges.rest_length[i_h]
         radius = rod_info.verts.radius[i_v_m]
         area = math.pi * radius * radius
@@ -778,8 +786,8 @@ def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
         twisting_modulus = rod_state.rods.twisting_stiffness[i_r, i_b] * area * radius * radius / 2.0
         twisting_scale = twisting_modulus * twist / rest_length
         rod_state.hinges.twisting_energy[i_h, i_b] = 0.5 * twisting_modulus * twist * twist / rest_length
-        twisting_dx_s = -twisting_scale * kb / (2.0 * rod_state.edges.length[i_e_s, i_b])
-        twisting_dx_e = twisting_scale * kb / (2.0 * rod_state.edges.length[i_e_e, i_b])
+        twisting_dx_s = -twisting_scale * kb / (2.0 * length_s)
+        twisting_dx_e = twisting_scale * kb / (2.0 * length_e)
 
         # Bending, each side carrying half of it, through the curvature in the material frame of its edge with respect
         # to the rest curvature of that side, which moves toward the curvature when their difference exceeds the plastic
@@ -799,7 +807,9 @@ def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
             if bending_stiffness > 0.0:
                 kappa_elastic = kappa - kappa_rest
                 kappa_elastic_sq = kappa_elastic.dot(kappa_elastic)
-                plastic_yield = rod_info.rods.plastic_yield[i_r]
+                # The yield is a curvature per unit length and the curvature of a hinge its integral over the rest
+                # Voronoi length of the hinge
+                plastic_yield = rod_info.rods.plastic_yield[i_r] * rest_length
                 kappa_excess_sq = qd.max(0.0, kappa_elastic_sq - plastic_yield * plastic_yield)
                 creep = rod_info.rods.plastic_creep[i_r] * kappa_excess_sq / (kappa_elastic_sq + rod_info.EPS[None])
                 kappa_rest = kappa_rest + creep * kappa_elastic
@@ -813,8 +823,8 @@ def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
             rod_state.hinges.edges_torque[i_h, i_side, i_b] = bending_dtheta + (2.0 * i_side - 1.0) * twisting_scale
         rod_state.hinges.bending_energy[i_h, i_b] = bending_energy
         bending_t_tilde = bending_kappa_dot * (t_s + t_e) / chi
-        bending_de_s = bending_scale * (2.0 * t_e.cross(bending_axis) / chi - bending_t_tilde) / rest_length_s
-        bending_de_e = -bending_scale * (2.0 * t_s.cross(bending_axis) / chi + bending_t_tilde) / rest_length_e
+        bending_de_s = bending_scale * (2.0 * t_e.cross(bending_axis) / chi - bending_t_tilde) / length_s
+        bending_de_e = -bending_scale * (2.0 * t_s.cross(bending_axis) / chi + bending_t_tilde) / length_e
 
         rod_state.hinges.verts_force[i_h, 0, i_b] = -bending_de_s + twisting_dx_s
         rod_state.hinges.verts_force[i_h, 1, i_b] = bending_de_s - bending_de_e - twisting_dx_s - twisting_dx_e
@@ -1853,15 +1863,15 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
                 topologies.append(np.where(idx_local >= 0, idx_local + start, -1))
 
             # The rest curvature of each side of a hinge follows from the frame of its edge on the rest shape, the
-            # frames carried along it by parallel transport. The initial frames carry no holonomy correction, so that
-            # the closing hinge of a loop starts with its twist. The rest geometry is computed in double precision
-            # whatever the precision of the simulation, the frames being carried edge to edge by a compiled loop typed
-            # for one precision
+            # frames carried along it by parallel transport. The state starts from these frames, so that a rod starts
+            # at the rest of its bending, a loop with its holonomy as twist (see compute_rod_frames). The rest geometry
+            # is computed in double precision whatever the precision of the simulation, the frames being carried edge
+            # to edge by a compiled loop typed for one precision
             pos = tensor_to_array(entity.init_positions, dtype=np.float64)
             edges = pos[edges_verts[:, 1]] - pos[edges_verts[:, 0]]
             edges_length = np.linalg.norm(edges, axis=-1)
             tangents = edges / edges_length[:, None]
-            d1_rest = compute_rod_frames(tangents, is_loop, gs.EPS)
+            d1_rest = compute_rod_frames(tangents, edges_length, is_loop, gs.EPS)
             hinges_tangent, hinges_d1 = tangents[hinges_edges], d1_rest[hinges_edges]
             t_s, t_e = hinges_tangent[:, 0], hinges_tangent[:, 1]
             kb = 2.0 * np.cross(t_s, t_e) / (1.0 + (t_s * t_e).sum(axis=-1, keepdims=True))
@@ -1876,7 +1886,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
                 kappa_rest[:] = 0.0
             verts_pos.append(pos)
             edges_rest_length.append(edges_length)
-            edges_d1.append(compute_rod_frames(tangents, False, gs.EPS) if is_loop else d1_rest)
+            edges_d1.append(d1_rest)
             hinges_kappa_rest.append(kappa_rest)
 
         n_kinds = 6
