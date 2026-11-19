@@ -238,6 +238,66 @@ def test_elastic_forces_conserve_energy(show_viewer):
 
 
 @pytest.mark.required
+def test_bending_plasticity_at_yield(show_viewer):
+    n_verts, interval, radius, rods_y = 20, 0.01, 0.1, (0.0, 0.3, 0.6)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -1.0, 0.8),
+            camera_lookat=(0.0, 0.3, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    # The rods are held on a circular arc, whose curvature at each vertex is the curvature binormal 2 tan(phi / 2) of
+    # the turning angle phi over the edge length: the first yields above it, the second below it, the third keeps the
+    # default yield
+    turn = 2.0 * math.asin(0.5 * interval / radius)
+    curvature = 2.0 * math.tan(0.5 * turn) / interval
+    materials = (
+        gs.materials.Rod.Base(
+            plastic_yield=1.25 * curvature,
+        ),
+        gs.materials.Rod.Base(
+            plastic_yield=0.8 * curvature,
+        ),
+        gs.materials.Rod.Base(),
+    )
+    rods = [
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=n_verts,
+                interval=interval,
+                pos=(0.0, y, 0.5),
+            ),
+            material=material,
+        )
+        for y, material in zip(rods_y, materials)
+    ]
+    scene.build()
+    angles = (np.arange(n_verts) - (n_verts - 1) / 2) * turn
+    for rod, y in zip(rods, rods_y):
+        rod.set_position(np.stack([radius * np.sin(angles), np.full(n_verts, y), 0.5 - radius * np.cos(angles)], -1))
+        rod.set_verts_fixed(True)
+    for _ in range(5):
+        scene.step()
+
+    # Each hinge of the arc holds the bending energy B / (2 l) |kb|^2 of its curvature over its rest length
+    material = rods[0].material
+    bending_modulus = material.E * math.pi * material.segment_radius**4 / 4.0
+    energy_elastic = (n_verts - 2) * bending_modulus / (2.0 * interval) * (curvature * interval) ** 2
+    energies = [rod.get_energy()[1] for rod in rods]
+    assert_allclose(energies[0], energy_elastic, tol=1e-10)
+    assert_allclose(energies[2], energy_elastic, tol=1e-10)
+    # Beyond the yield the rest curvature creeps toward the curvature, by all of its excess at the default creep rate of
+    # 1: the elastic curvature left, yield^2 / curvature, stays below the yield, and the creep stops
+    assert_allclose(energies[1], energy_elastic * 0.8**4, tol=1e-10)
+
+
+@pytest.mark.required
 def test_spinning_rod_keeps_angular_momentum(show_viewer):
     n_verts, interval, n_steps = 20, 0.02, 50
     scene = gs.Scene(

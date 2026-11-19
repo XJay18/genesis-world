@@ -1,3 +1,4 @@
+import math
 from typing import TYPE_CHECKING
 
 from pydantic import Field, StrictBool
@@ -24,8 +25,11 @@ class Base(Material["RodEntity"]):
     G : float, optional
         Twisting stiffness, in Pa. Zero disables twisting. Default is 1e6.
     plastic_yield : float, optional
-        Curvature beyond which bending deforms the rest shape permanently, in 1/m. Infinity keeps the rod elastic.
-        Default is 10.
+        Curvature beyond which bending deforms the rest shape permanently, in 1/m: the bend of the rod away from its
+        rest shape, measured at each vertex as the curvature binormal |kb| = 2 tan(phi / 2) of the turning angle phi
+        over the rest length around the vertex (the mean rest length of its two edges). A finite yield lets the rod keep
+        the shape it is bent into, as a wire does, at the cost of a rest shape that drifts with every sharp bend.
+        Infinity keeps the rod elastic. Default is infinity.
     plastic_creep : float, optional
         Rate at which the rest curvature moves toward the curvature beyond the yield, per substep. Default is 1.
     static_friction : float, optional
@@ -64,7 +68,7 @@ class Base(Material["RodEntity"]):
     K: NonNegativeFloat = 0.0
     E: NonNegativeFloat = 1.0e6
     G: NonNegativeFloat = 1.0e6
-    plastic_yield: float = Field(default=10.0, ge=0.0, allow_inf_nan=True)
+    plastic_yield: float = Field(default=math.inf, ge=0.0, allow_inf_nan=True)
     plastic_creep: NonNegativeFloat = 1.0
     static_friction: NonNegativeFloat = 0.3
     kinetic_friction: NonNegativeFloat = 0.25

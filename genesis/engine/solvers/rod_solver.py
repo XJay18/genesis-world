@@ -807,7 +807,9 @@ def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
             if bending_stiffness > 0.0:
                 kappa_elastic = kappa - kappa_rest
                 kappa_elastic_sq = kappa_elastic.dot(kappa_elastic)
-                plastic_yield = rod_info.rods.plastic_yield[i_r]
+                # The yield is a curvature per unit length and the curvature of a hinge its integral over the rest
+                # Voronoi length of the hinge
+                plastic_yield = rod_info.rods.plastic_yield[i_r] * rest_length
                 kappa_excess_sq = qd.max(0.0, kappa_elastic_sq - plastic_yield * plastic_yield)
                 creep = rod_info.rods.plastic_creep[i_r] * kappa_excess_sq / (kappa_elastic_sq + rod_info.EPS[None])
                 kappa_rest = kappa_rest + creep * kappa_elastic
