@@ -3603,6 +3603,18 @@ def func_project_rod_rigid_normal(
     vertex squeezed between two geoms pushes both back by the impulse that stops them, while a free rod and a free link
     meeting at the sphere of a vertex take the impulses of two free bodies.
 
+    A squeezed vertex is held across the axis of its most opposed pair of contacts by their friction (see
+    'kernel_project_rod_rigid_friction'), and moves there with the links of the pair. Each of its other contacts pushes
+    its own link and the links of the pair back by its share of the approach and of the penetration, up to what the
+    friction of the pair holds, and by no less than the impulse of the solve with the vertex free. That solve counts on
+    the vertex moving out along the normal of the contact, which the friction then cancels, so that a link which cannot
+    move away (heavy, or held by its own contacts) would sink into the vertex until the force driving it balances a
+    stiffness set by the inverse mass of the vertex. A link driven harder than the friction of the pair holds sinks
+    into the vertex by the rest. The contact sees a link through the bound of its inverse mass as a free body, so that a
+    light link held in place by its own contacts (pressed onto the ground by another link) sinks into a vertex until
+    the force pressing it balances 'rod_rigid_overlap_recovery' of the penetration over the square of the substep and
+    that bound.
+
     The geom each free vertex penetrates deepest is recorded where it penetrates one, through its sphere or an edge
     contact on its half of the edge, the record being cleared at the first substep of a step ('is_step_start', the
     argument of the kernel passed by reference, see 'func_project_rod_contacts' in rod_solver.py), so that it holds the
@@ -3866,6 +3878,49 @@ def func_project_rod_rigid_normal(
                 else:
                     system[i_c, i_c] = 1.0
             impulses = func_solve_nonnegative(system, target)
+            # The contacts outside the most opposed pair push a vertex that the friction of the pair holds (see the
+            # docstring)
+            if is_squeezed:
+                i_c_squeeze = -1
+                j_c_squeeze = -1
+                coupling_min = gs.qd_float(0.0)
+                for i_c in qd.static(range(N_CONTACTS_MAX)):
+                    for j_c in qd.static(range(i_c + 1, N_CONTACTS_MAX)):
+                        if j_c < n_contacts:
+                            if coupling[i_c, j_c] < coupling_min:
+                                coupling_min = coupling[i_c, j_c]
+                                i_c_squeeze = i_c
+                                j_c_squeeze = j_c
+                squeeze_axis = qd.Vector.zero(gs.qd_float, 3)
+                inv_mass_links_product = gs.qd_float(1.0)
+                inv_mass_links_sum = gs.qd_float(0.0)
+                impulse_held_max = gs.qd_float(0.0)
+                for i_c in qd.static(range(N_CONTACTS_MAX)):
+                    if i_c < n_contacts:
+                        if i_c == i_c_squeeze or i_c == j_c_squeeze:
+                            sign = qd.select(i_c == i_c_squeeze, 1.0, -1.0)
+                            squeeze_axis = squeeze_axis + sign * rod_state.rigid_contacts.normal[i_v, i_c, i_b]
+                            inv_mass_link = system[i_c, i_c] - coupling[i_c, i_c]
+                            inv_mass_links_product = inv_mass_links_product * inv_mass_link
+                            inv_mass_links_sum = inv_mass_links_sum + inv_mass_link
+                            i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
+                            impulse_held_max = impulse_held_max + geoms_info.coup_friction[i_g] * impulses[i_c, 0]
+                squeeze_axis = squeeze_axis.normalized()
+                # The two links of the pair move together with the vertex they hold
+                inv_mass_held = gs.qd_float(0.0)
+                if inv_mass_links_sum > 0.0:
+                    inv_mass_held = inv_mass_links_product / inv_mass_links_sum
+                for i_c in qd.static(range(N_CONTACTS_MAX)):
+                    if i_c < n_contacts and i_c != i_c_squeeze and i_c != j_c_squeeze:
+                        cos_sqr = rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(squeeze_axis) ** 2
+                        inv_mass_contact = (
+                            inv_mass * cos_sqr + inv_mass_held * (1.0 - cos_sqr) + system[i_c, i_c] - coupling[i_c, i_c]
+                        )
+                        target_held = qd.max(target[i_c, 0], 0.0)
+                        impulse_held = impulse_held_max
+                        if target_held < impulse_held_max * inv_mass_contact:
+                            impulse_held = target_held / inv_mass_contact
+                        impulses[i_c, 0] = qd.max(impulses[i_c, 0], impulse_held)
             for i_c in qd.static(range(N_CONTACTS_MAX)):
                 if i_c < n_contacts:
                     rod_state.rigid_contacts.impulse_normal[i_v, i_c, i_b] = impulses[i_c, 0]
