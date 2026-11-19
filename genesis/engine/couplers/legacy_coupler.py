@@ -3208,8 +3208,10 @@ def func_rod_rigid_contact_share(
     which push back by as much, so that its share of the point would only push the links apart. The point then acts on
     the rod through the other vertex alone, which turns the rod into the grip: the rims of two pads squeezing a rod
     across their faces turn it until the faces reach it, where a share of the squeezed vertex stops the pads on the
-    rims. Where the other vertex is squeezed or held too, no vertex of the edge moves the point, and both resolve their
-    shares by pushing the link back.
+    rims. The other vertex resolves its share of the point through its contact with the geom, the same point or, where
+    its sphere or its other edge holds the geom instead, that contact (see 'func_project_rod_rigid_normal'). Where the
+    other vertex is squeezed or held too, no vertex of the edge moves the point, and both resolve their shares by
+    pushing the link back.
 
     The contacts of the other vertex are those of the same substep, evaluated before the impulses.
     """
@@ -3603,6 +3605,14 @@ def func_project_rod_rigid_normal(
     vertex squeezed between two geoms pushes both back by the impulse that stops them, while a free rod and a free link
     meeting at the sphere of a vertex take the impulses of two free bodies.
 
+    A point inside an edge that a squeezed vertex leaves to the free vertex of the edge (see
+    'func_rod_rigid_contact_share') is resolved by that vertex's contact with the geom whichever point it holds: where
+    its sphere or its other edge holds the geom, the vertex has no contact at the point, which no impulse would then
+    resolve, so that contact resolves the larger of its own share of its penetration and its share of the point's,
+    the latter scaled by the cosine of the two normals, as the vertex moving along the normal of its contact takes the
+    point out by that cosine. Where the normals part, as for a sphere touching the side of a pad beside the rim the
+    edge crosses, the scaled share keeps the vertex from pushing the rod along itself by the depth of the rim.
+
     A squeezed vertex is held across the axis of its most opposed pair of contacts by their friction (see
     'kernel_project_rod_rigid_friction'), and moves there with the links of the pair. Each of its other contacts pushes
     its own link and the links of the pair back by its share of the approach and of the penetration, up to what the
@@ -3835,14 +3845,60 @@ def func_project_rod_rigid_normal(
             is_squeezed = func_rod_rigid_contacts_are_squeezing(i_v, i_b, n_contacts, rod_state, rod_config)
             coupling = qd.Matrix.zero(gs.qd_float, N_CONTACTS_MAX, N_CONTACTS_MAX)
             shares = qd.Vector.zero(gs.qd_float, N_CONTACTS_MAX)
+            penetrations = qd.Vector.zero(gs.qd_float, N_CONTACTS_MAX)
+            penetrations_start = qd.Vector.zero(gs.qd_float, N_CONTACTS_MAX)
             for i_c in qd.static(range(N_CONTACTS_MAX)):
                 if i_c < n_contacts:
                     shares[i_c] = func_rod_rigid_contact_share(i_v, i_c, i_b, is_squeezed, rod_state, rod_config)
+                    penetrations[i_c] = rod_state.rigid_contacts.penetration[i_v, i_c, i_b]
+                    penetrations_start[i_c] = rod_state.rigid_contacts.penetration_start[i_v, i_c, i_b]
                     for j_c in qd.static(range(N_CONTACTS_MAX)):
                         if j_c < n_contacts:
                             coupling[i_c, j_c] = inv_mass * rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(
                                 rod_state.rigid_contacts.normal[i_v, j_c, i_b]
                             )
+            # The point inside an edge that a squeezed neighbour leaves to the vertex is resolved by the contact of the
+            # vertex with its geom, whichever point of the vertex holds the geom (see the docstring)
+            if not is_squeezed:
+                for i_slot in qd.static(range(2)):
+                    i_e = rod_info.verts.edges_idx[i_v][i_slot]
+                    if i_e >= 0:
+                        edge_verts_idx = rod_info.edges.verts_idx[i_e]
+                        i_v_n = qd.select(edge_verts_idx[0] == i_v, edge_verts_idx[1], edge_verts_idx[0])
+                        n_contacts_n = rod_state.rigid_contacts.n_contacts[i_v_n, i_b]
+                        if func_rod_rigid_contacts_are_squeezing(i_v_n, i_b, n_contacts_n, rod_state, rod_config):
+                            for i_c_n in range(n_contacts_n):
+                                verts_idx_n = rod_state.rigid_contacts.verts_idx[i_v_n, i_c_n, i_b]
+                                # A point of the edge the two vertices share, which the neighbour leaves to the vertex
+                                if verts_idx_n[0] == i_v or verts_idx_n[1] == i_v:
+                                    for i_c in qd.static(range(N_CONTACTS_MAX)):
+                                        if i_c < n_contacts:
+                                            i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
+                                            if i_g == rod_state.rigid_contacts.geom_idx[i_v_n, i_c_n, i_b]:
+                                                t_n = rod_state.rigid_contacts.t[i_v_n, i_c_n, i_b]
+                                                # The contact moves the point along its own normal, which takes the
+                                                # point out by the cosine of their normals
+                                                share_n = (
+                                                    qd.select(i_v == verts_idx_n[0], 1.0 - t_n, t_n)
+                                                    / ((1.0 - t_n) ** 2 + t_n**2)
+                                                    * qd.max(
+                                                        rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(
+                                                            rod_state.rigid_contacts.normal[i_v_n, i_c_n, i_b]
+                                                        ),
+                                                        0.0,
+                                                    )
+                                                )
+                                                penetration_n = rod_state.rigid_contacts.penetration[i_v_n, i_c_n, i_b]
+                                                is_deeper = share_n * penetration_n > shares[i_c] * penetrations[i_c]
+                                                shares[i_c] = qd.select(is_deeper, share_n, shares[i_c])
+                                                penetrations[i_c] = qd.select(
+                                                    is_deeper, penetration_n, penetrations[i_c]
+                                                )
+                                                penetrations_start[i_c] = qd.select(
+                                                    is_deeper,
+                                                    rod_state.rigid_contacts.penetration_start[i_v_n, i_c_n, i_b],
+                                                    penetrations_start[i_c],
+                                                )
             # The share of the penetration at the start of the substep is removed from the rod alone, the links held,
             # each contact moving the vertex out of its geom along its normal, shared with the contacts pushing the
             # vertex the opposite way. A vertex squeezed between geoms is not moved: it cannot leave one without going
@@ -3858,7 +3914,7 @@ def func_project_rod_rigid_normal(
                         if qd.static(j_c != i_c):
                             if j_c < n_contacts and coupling[i_c, j_c] < 0.0:
                                 n_sharing += 1
-                    target[i_c, 0] = shares[i_c] * rod_state.rigid_contacts.penetration_start[i_v, i_c, i_b]
+                    target[i_c, 0] = shares[i_c] * penetrations_start[i_c]
                     if not is_squeezed:
                         impulses_held[i_c, 0] = target[i_c, 0] / (n_sharing * coupling[i_c, i_c])
                     rod_state.rigid_contacts.impulse_overlap[i_v, i_c, i_b] = impulses_held[i_c, 0]
@@ -3872,8 +3928,7 @@ def func_project_rod_rigid_normal(
                         i_v, i_c, i_b, rod_state, geoms_info, is_friction=False
                     )
                     target[i_c, 0] = shares[i_c] * (
-                        rod_state.rigid_contacts.penetration[i_v, i_c, i_b]
-                        - rod_state.rigid_contacts.penetration_start[i_v, i_c, i_b]
+                        penetrations[i_c] - penetrations_start[i_c]
                     ) + legacy_coupler_info.rod_rigid_overlap_recovery[None] * qd.max(penetration_left[i_c, 0], 0.0)
                 else:
                     system[i_c, i_c] = 1.0
