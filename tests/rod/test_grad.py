@@ -200,8 +200,11 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
     # larger step. The contacts with the plane, the box, the post and the pads make the rollout piecewise smooth in the
     # positions and stiffnesses, whose finite differences do not converge there, and take smaller steps for the
     # velocities and the bending stiffness. The post touches the rod inside an edge, which both of its vertices share.
+    # The contacts between the edges of the rod switch within the steps of the positions and the stretching stiffness
+    # that the other cases take, so they take ten times smaller ones.
+    is_rod_contact = case in ("contact", "contact_broadphase", "contact_stale")
     steps_and_tols = {
-        "pos": (1e-7, 5e-5),
+        "pos": (1e-8 if is_rod_contact else 1e-7, 5e-5),
         "vel": (
             {"free_box": 3e-7, "box": 1e-6, "plane": 1e-6, "post": 1e-6, "squeeze": 3e-6}.get(case, 1e-5),
             {"free_box": 5e-6, "post": 5e-7, "squeeze": 1e-7}.get(case, 2e-6),
@@ -211,7 +214,7 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
             {"free_box": 3e-6, "box": 1e-5, "plane": 1e-5}.get(case, 1e-4),
             {"squeeze": 5e-7}.get(case, 5e-6),
         ),
-        "K": (1e-3 if case == "inextensible" else 1e-4, 5e-5),
+        "K": (1e-3 if case == "inextensible" else 1e-5 if is_rod_contact else 1e-4, 5e-5),
         "G": (3e-4, 5e-6),
     }
     for name, value in inputs.items():
