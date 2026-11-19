@@ -350,6 +350,11 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     # The end of the edge of a point inside an edge, 0 or 1 along it, which the search found deeper and from whose depth
     # the penetration counts (see 'func_rod_rigid_contact' in legacy_coupler.py)
     t_end: qd.Tensor = field(float)
+    # The inverse inertia of each link that is the root of a free joint, about its root COM in the world frame (angular
+    # rows first), through the active rows of the last constraint solve of the rigid solver touching its dofs, every
+    # other dof held, which its contacts read in place of the bound of its inverse mass. It carries no gradient (see
+    # 'func_rod_rigid_links_response' in legacy_coupler.py)
+    links_inv_inertia: qd.Tensor = field((float, (6, 6)), shape=(ROD_RIGID_LINKS, ENVS))
 
 
 class RodRigidSlots(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_GEOMS, 3, ENVS)):
