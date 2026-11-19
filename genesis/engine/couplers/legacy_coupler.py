@@ -29,7 +29,17 @@ from genesis.engine.solvers.particle_solver import func_add_particles_momentum, 
 from genesis.engine.solvers.pbd_solver import PBDInfo, PBDState
 from genesis.engine.solvers.rigid.abd.forward_dynamics import func_vel_at_point
 from genesis.engine.solvers.rigid.abd.misc import func_add_external_wrench
-from genesis.engine.solvers.rigid.data import GeomsInfo, GeomsState, LinksInfo, LinksState, RigidData, RigidInfo
+from genesis.engine.solvers.rigid.collider.data import ColliderState
+from genesis.engine.solvers.rigid.constraint.data import ConstraintState
+from genesis.engine.solvers.rigid.data import (
+    DofsState,
+    GeomsInfo,
+    GeomsState,
+    LinksInfo,
+    LinksState,
+    RigidData,
+    RigidInfo,
+)
 from genesis.engine.solvers.rod_solver import (
     ROD_EDGES,
     RodData,
@@ -342,6 +352,12 @@ class LegacyCouplerInfo(Data, kind=DataKind.CONSTANT):
     # substep. A rigid link pressing a rod against another geom, whose inverse mass the contacts overestimate, then
     # stops a little inside it, rather than creeping through it (see 'kernel_project_rod_rigid_normal')
     rod_rigid_overlap_recovery: qd.Tensor = field(float, shape=())
+    # The share of the friction of the pair of contacts squeezing a vertex of the rods up to which its other contacts
+    # push their links back (see 'kernel_project_rod_rigid_normal'). Below one, the friction of the pair keeps a margin
+    # and holds the vertex static, so that an impact on a link that cannot move away goes into a transient penetration,
+    # which the recovery takes back, rather than sliding the vertex along the pair. The cost: a grip loaded past that
+    # share through a third contact sinks into that contact instead of sliding
+    rod_rigid_held_friction_share: qd.Tensor = field(float, shape=())
     # The fraction of the slip a contact of a rod with a rigid geom accumulated while sticking that the rod alone is
     # moved back by at each substep, without changing its velocity, within what Coulomb's bound leaves of its normal
     # corrections. A rod held by a link whose inverse mass the contacts overestimate (a link driven or held by its
@@ -630,6 +646,7 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
                 rod_edge_contact_n_evals=15,
                 rod_edge_contact_rel_depth=0.01,
                 rod_rigid_overlap_recovery=0.1,
+                rod_rigid_held_friction_share=0.8,
                 rod_rigid_anchor_recovery=0.1,
                 rod_rigid_overlap_relaxation=0.5,
                 rod_sdf_max_slope=math.sqrt(3.0),
@@ -1336,12 +1353,17 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
         """
         rigid_solver = self.rigid_solver
         is_step_start = self.sim.cur_substep_global % self.sim.substeps == 0
+        constraint_state = rigid_solver.constraint_solver.constraint_state
+        collider_state = rigid_solver.collider.collider_state
         # A scene tracking gradients launches the kernels one by one (see 'RodSolver.substep_post_coupling')
         if self.rod_solver.requires_grad:
             kernel_project_rod_rigid_normal(
                 self.rod_solver.rod_state,
                 rigid_solver.dyn_state.links,
+                rigid_solver.dyn_state.dofs,
                 rigid_solver.dyn_state.geoms,
+                collider_state,
+                constraint_state,
                 self.rod_solver.rod_info,
                 rigid_solver.dyn_info.links,
                 rigid_solver.dyn_info.geoms,
@@ -1367,7 +1389,10 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
             kernel_project_rod_rigid_contacts(
                 self.rod_solver.rod_state,
                 rigid_solver.dyn_state.links,
+                rigid_solver.dyn_state.dofs,
                 rigid_solver.dyn_state.geoms,
+                collider_state,
+                constraint_state,
                 self.rod_solver.rod_info,
                 rigid_solver.dyn_info.links,
                 rigid_solver.dyn_info.geoms,
@@ -3557,10 +3582,149 @@ def func_rod_rigid_contact(
 
 
 @qd.func
+def func_is_free_link(i_l: int, i_b: int, links_info: LinksInfo, rigid_config: qd.template()) -> bool:
+    """Whether a rigid link is the root of a free joint: no parent, six dofs, not fixed, of positive mass."""
+    I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
+    is_free = False
+    if links_info.parent_idx[I_l] < 0:
+        if links_info.n_dofs[I_l] == 6:
+            if not links_info.is_fixed[I_l]:
+                if links_info.inertial_mass[I_l] > 0.0:
+                    is_free = True
+    return is_free
+
+
+@qd.func
+def func_rod_rigid_links_response(
+    rod_state: RodState,
+    links_state: LinksState,
+    dofs_state: DofsState,
+    collider_state: ColliderState,
+    constraint_state: ConstraintState,
+    links_info: LinksInfo,
+    rigid_info: RigidInfo,
+    rigid_config: qd.template(),
+):
+    """Compute the inverse inertia of each free link the rods touch through the last constraint solve of the rigid
+    solver (see 'links_inv_inertia' in RodRigidContacts).
+
+    The constraint solve minimizes a cost whose Hessian over the accelerations of the dofs is H = M + J^T D J over its
+    active rows, with M the mass matrix and J, D the Jacobian and the stiffness of the rows. While the active set holds,
+    a generalized force f changes the accelerations of the next substep by H^-1 f, so that a link held in place by its
+    contacts moves under an impulse through H^-1. H is taken over the six dofs of a free link alone, every other dof
+    held: its block of the mass matrix plus the active rows touching its dofs. The motion subspace S of the dofs maps
+    their velocities to the twist of the link about its root COM in the world frame (angular part first), so that
+    S H^-1 S^T is the inverse inertia of the link there, which a contact reads at its point along its normal (see
+    'func_project_rod_rigid_normal'). Without active rows it is the inverse of the free-body inertia, the bound the other
+    links keep (see 'func_link_inverse_mass_bound').
+
+    Only the links the contacts of the rods touch at the substep are computed, the others being read by no contact. The
+    constraint solve lays its rows out as the equality rows, the friction loss rows, the rows of the contacts of the
+    collider contact by contact in their order after the hibernated ones, 'rows_per_contact' rows each (see
+    '_add_collision_constraints_per_contact' in the constraint solver), then the limit rows: those of the joints and
+    those of the dynamic constraints, a screw limit walking the chains of both of its links (see
+    'func_add_dynamic_constraint_rows_batch'). The scan reads every row in that order but the rows of the contacts that
+    no link of the kinematic tree of the free link takes part in, whose Jacobian is zero on its dofs, so that they add
+    exact zeros: the sum equals the one over every row, at a cost set by the contacts of the environment rather than by
+    all of its rows.
+
+    Under the elliptic friction cone, the rows of a contact form one cone whose active set and Hessian are blocks per
+    contact, which the response does not read: a free link then keeps the bound of its inverse mass.
+
+    The response is read from the solve as data and carries no gradient. Its derivative with respect to the state of
+    the link is mostly the slope of the stiffness of its contact rows in their penetration (the impedance of the rigid
+    contacts), which reaches the rods only through the gradients of the contacts of the collider, and the rigid backward
+    clears those before it reverses the rows (see '_constraint_force_grad' in rigid_solver.py). The gradient of a rod
+    pressing a free link that rests inside the impedance ramp of its own contacts is thus biased, by 1e-5 to 1e-4
+    relative over 20 to 40 steps in a rope pressing a 30 g box onto the ground, and exact where those contacts saturate.
+    """
+    # FIXME: the response carries no gradient. An exact one needs the rigid backward to accumulate the gradients of the
+    # contacts of the collider rather than clear them before its collision reverse (see '_constraint_force_grad').
+    ROWS_PER_CONTACT = qd.static(rigid_config.rows_per_contact)
+    for i_l, i_b in qd.ndrange(rod_state.rigid_contacts.links_inv_inertia.shape[0], links_state.pos.shape[1]):
+        is_touched = False
+        if rod_state.rigid_contacts.links_n_contacts[i_l, i_b] > 0:
+            is_touched = func_is_free_link(i_l, i_b, links_info, rigid_config)
+        if is_touched:
+            I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
+            i_d0 = links_info.dof_start[I_l]
+            H = qd.Matrix.zero(gs.qd_float, 6, 6)
+            for i in qd.static(range(6)):
+                for j in qd.static(range(6)):
+                    # The mass matrix holds its lower triangle
+                    if qd.static(i >= j):
+                        H[i, j] = rigid_info.mass_mat[i_d0 + i, i_d0 + j, i_b]
+                    else:
+                        H[i, j] = rigid_info.mass_mat[i_d0 + j, i_d0 + i, i_b]
+            # The equality and friction loss rows one by one, the rows of each contact of the tree of the link, then
+            # the limit rows
+            n_rows_before = (
+                constraint_state.n_constraints_equality[i_b] + constraint_state.n_constraints_frictionloss[i_b]
+            )
+            n_contacts_hibernated = collider_state.n_contacts_hibernated[i_b]
+            n_contacts_live = collider_state.n_contacts[i_b] - n_contacts_hibernated
+            i_row_limits = n_rows_before + n_contacts_live * ROWS_PER_CONTACT
+            for i_item in range(n_rows_before + n_contacts_live + 1):
+                i_row_start = i_item
+                n_rows = 1
+                if i_item == n_rows_before + n_contacts_live:
+                    i_row_start = i_row_limits
+                    n_rows = constraint_state.n_constraints[i_b] - i_row_limits
+                elif i_item >= n_rows_before:
+                    i_col_ = i_item - n_rows_before
+                    i_col = collider_state.contact_sort_idx[n_contacts_hibernated + i_col_, i_b]
+                    i_l_a = collider_state.contact_data.link_a[i_col, i_b]
+                    i_l_b = collider_state.contact_data.link_b[i_col, i_b]
+                    I_l_a = [i_l_a, i_b] if qd.static(rigid_config.batch_links_info) else i_l_a
+                    is_tree_contact = links_info.root_idx[I_l_a] == i_l
+                    if i_l_b >= 0:
+                        I_l_b = [i_l_b, i_b] if qd.static(rigid_config.batch_links_info) else i_l_b
+                        if links_info.root_idx[I_l_b] == i_l:
+                            is_tree_contact = True
+                    i_row_start = n_rows_before + i_col_ * ROWS_PER_CONTACT
+                    n_rows = ROWS_PER_CONTACT if is_tree_contact else 0
+                for i_row in range(i_row_start, i_row_start + n_rows):
+                    if constraint_state.active[i_row, i_b]:
+                        jac = qd.Vector.zero(gs.qd_float, 6)
+                        for i in qd.static(range(6)):
+                            jac[i] = constraint_state.jac[i_row, i_d0 + i, i_b]
+                        H = H + constraint_state.efc_D[i_row, i_b] * jac.outer_product(jac)
+            # The Cholesky factor H = L L^T, then X = L^-1 S^T, so that S H^-1 S^T = X^T X
+            L = qd.Matrix.zero(gs.qd_float, 6, 6)
+            for j in qd.static(range(6)):
+                diag = H[j, j]
+                for k in qd.static(range(j)):
+                    diag = diag - L[j, k] * L[j, k]
+                L[j, j] = qd.sqrt(qd.max(diag, rigid_info.EPS[None]))
+                for i in qd.static(range(j + 1, 6)):
+                    val = H[i, j]
+                    for k in qd.static(range(j)):
+                        val = val - L[i, k] * L[j, k]
+                    L[i, j] = val / L[j, j]
+            X = qd.Matrix.zero(gs.qd_float, 6, 6)
+            for k in qd.static(range(6)):
+                cdof_ang = dofs_state.cdof_ang[i_d0 + k, i_b]
+                cdof_vel = dofs_state.cdof_vel[i_d0 + k, i_b]
+                for c in qd.static(range(3)):
+                    X[k, c] = cdof_ang[c]
+                    X[k, 3 + c] = cdof_vel[c]
+            for c in qd.static(range(6)):
+                for i in qd.static(range(6)):
+                    val = X[i, c]
+                    for k in qd.static(range(i)):
+                        val = val - L[i, k] * X[k, c]
+                    X[i, c] = val / L[i, i]
+            rod_state.rigid_contacts.links_inv_inertia[i_l, i_b] = X.transpose() @ X
+
+
+@qd.func
 def func_project_rod_rigid_normal(
     rod_state: RodState,
     links_state: LinksState,
+    dofs_state: DofsState,
     geoms_state: GeomsState,
+    collider_state: ColliderState,
+    constraint_state: ConstraintState,
     rod_info: RodInfo,
     links_info: LinksInfo,
     geoms_info: GeomsInfo,
@@ -3599,8 +3763,10 @@ def func_project_rod_rigid_normal(
     leave one geom without going into the other, and its penetration is the one the links pressing it keep up, which
     only the impulses can take back. Then the share of the approach of the substep, plus 'rod_rigid_overlap_recovery' of
     the penetration the rod cannot leave alone, is resolved by impulses on the rod and on the links, each link
-    responding through the bound of its inverse mass shared by its contacts (see
-    'func_rod_rigid_contact_link_inverse_mass'). The rod takes each impulse along the normal at the vertex, and the link
+    responding through its inverse mass shared by its contacts (see 'func_rod_rigid_contact_link_inverse_mass'): the
+    bound of the link as a free body, or for a link that is the root of a free joint its response through the contacts
+    that hold it in place at the last constraint solve of the rigid solver (see 'func_rod_rigid_links_response'), which
+    carries no gradient. The rod takes each impulse along the normal at the vertex, and the link
     the opposite one at the surface of the rod next to the vertex (applied in 'kernel_project_rod_rigid_friction'): a
     vertex squeezed between two geoms pushes both back by the impulse that stops them, while a free rod and a free link
     meeting at the sphere of a vertex take the impulses of two free bodies.
@@ -3615,15 +3781,18 @@ def func_project_rod_rigid_normal(
 
     A squeezed vertex is held across the axis of its most opposed pair of contacts by their friction (see
     'kernel_project_rod_rigid_friction'), and moves there with the links of the pair. Each of its other contacts pushes
-    its own link and the links of the pair back by its share of the approach and of the penetration, up to what the
-    friction of the pair holds, and by no less than the impulse of the solve with the vertex free. That solve counts on
+    its own link and the links of the pair back by its share of the approach and of the penetration, up to
+    'rod_rigid_held_friction_share' of what the friction of the pair holds, and by no less than the impulse of the solve
+    with the vertex free. The margin keeps the friction of the pair static: an impact on a link that cannot move away
+    would otherwise saturate it, slide the vertex along the pair, and the recovery of the penetration would then throw
+    the link that pressed it back, the next impact sliding it further. That solve counts on
     the vertex moving out along the normal of the contact, which the friction then cancels, so that a link which cannot
     move away (heavy, or held by its own contacts) would sink into the vertex until the force driving it balances a
-    stiffness set by the inverse mass of the vertex. A link driven harder than the friction of the pair holds sinks
-    into the vertex by the rest. The contact sees a link through the bound of its inverse mass as a free body, so that a
-    light link held in place by its own contacts (pressed onto the ground by another link) sinks into a vertex until
-    the force pressing it balances 'rod_rigid_overlap_recovery' of the penetration over the square of the substep and
-    that bound.
+    stiffness set by the inverse mass of the vertex. A link driven harder than that share of the friction of the pair
+    sinks into the vertex by the rest. A light link held in place by its own contacts (pressed onto the ground by
+    another link) is seen through its response, which those contacts make small: seen through the bound of a free body
+    instead, it would sink into a vertex until the force pressing it balanced 'rod_rigid_overlap_recovery' of the
+    penetration over the square of the substep and that bound.
 
     The geom each free vertex penetrates deepest is recorded where it penetrates one, through its sphere or an edge
     contact on its half of the edge, the record being cleared at the first substep of a step ('is_step_start', the
@@ -3805,9 +3974,11 @@ def func_project_rod_rigid_normal(
             rod_state.rigid_contacts.normal[i_v, i_c, i_b] = normal
             rod_state.rigid_contacts.penetration[i_v, i_c, i_b] = penetration
             rod_state.rigid_contacts.penetration_start[i_v, i_c, i_b] = qd.max(penetration + slip.dot(normal), 0.0)
-            rod_state.rigid_contacts.inv_mass_link[i_v, i_c, i_b] = func_link_inverse_mass_bound(
-                i_l, i_b, pos, normal, links_state, links_info, rigid_config
-            )
+            # A free link reads its response once the contacts are counted, below
+            if not func_is_free_link(i_l, i_b, links_info, rigid_config):
+                rod_state.rigid_contacts.inv_mass_link[i_v, i_c, i_b] = func_link_inverse_mass_bound(
+                    i_l, i_b, pos, normal, links_state, links_info, rigid_config
+                )
             # The point of the geom the vertex sticks to, the one the vertex started the substep at for a new contact
             pos_prev = rod_state.verts.pos_prev[i_v, i_b]
             anchor = pos_prev + func_vel_at_point(i_l, i_b, pos_prev, links_state) * (rod_info.substep_dt[None])
@@ -3825,6 +3996,26 @@ def func_project_rod_rigid_normal(
             else:
                 qd.atomic_add(rod_state.rigid_contacts.links_contacts_weight[i_l, i_b], weight)
             qd.atomic_add(rod_state.rigid_contacts.links_n_contacts[i_l, i_b], 1)
+
+    # A free link moves through the contacts that hold it in place
+    func_rod_rigid_links_response(
+        rod_state, links_state, dofs_state, collider_state, constraint_state, links_info, rigid_info, rigid_config
+    )
+    for i_v, i_c, i_b in qd.ndrange(rod_state.verts.pos.shape[0], N_CONTACTS_MAX, rod_state.verts.pos.shape[1]):
+        if i_c < rod_state.rigid_contacts.n_contacts[i_v, i_b]:
+            i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
+            i_l = geoms_info.link_idx[i_g]
+            if func_is_free_link(i_l, i_b, links_info, rigid_config):
+                contact_verts_idx = rod_state.rigid_contacts.verts_idx[i_v, i_c, i_b]
+                i_v_s, i_v_e = contact_verts_idx[0], contact_verts_idx[1]
+                t = rod_state.rigid_contacts.t[i_v, i_c, i_b]
+                normal = rod_state.rigid_contacts.normal[i_v, i_c, i_b]
+                pos = (1.0 - t) * rod_state.verts.pos[i_v_s, i_b] + t * rod_state.verts.pos[i_v_e, i_b]
+                torque_arm = (pos - links_state.root_COM[i_l, i_b]).cross(normal)
+                twist = qd.Vector([torque_arm[0], torque_arm[1], torque_arm[2], normal[0], normal[1], normal[2]])
+                rod_state.rigid_contacts.inv_mass_link[i_v, i_c, i_b] = twist.dot(
+                    rod_state.rigid_contacts.links_inv_inertia[i_l, i_b] @ twist
+                )
 
     for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
         n_contacts = rod_state.rigid_contacts.n_contacts[i_v, i_b]
@@ -3960,6 +4151,7 @@ def func_project_rod_rigid_normal(
                             inv_mass_links_sum = inv_mass_links_sum + inv_mass_link
                             i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
                             impulse_held_max = impulse_held_max + geoms_info.coup_friction[i_g] * impulses[i_c, 0]
+                impulse_held_max = legacy_coupler_info.rod_rigid_held_friction_share[None] * impulse_held_max
                 squeeze_axis = squeeze_axis.normalized()
                 # The two links of the pair move together with the vertex they hold
                 inv_mass_held = gs.qd_float(0.0)
@@ -3998,7 +4190,10 @@ def func_project_rod_rigid_normal(
 def kernel_project_rod_rigid_normal(
     rod_state: RodState,
     links_state: LinksState,
+    dofs_state: DofsState,
     geoms_state: GeomsState,
+    collider_state: ColliderState,
+    constraint_state: ConstraintState,
     rod_info: RodInfo,
     links_info: LinksInfo,
     geoms_info: GeomsInfo,
@@ -4014,7 +4209,10 @@ def kernel_project_rod_rigid_normal(
     func_project_rod_rigid_normal(
         rod_state,
         links_state,
+        dofs_state,
         geoms_state,
+        collider_state,
+        constraint_state,
         rod_info,
         links_info,
         geoms_info,
@@ -4250,7 +4448,10 @@ def kernel_project_rod_rigid_friction(
 def kernel_project_rod_rigid_contacts(
     rod_state: RodState,
     links_state: LinksState,
+    dofs_state: DofsState,
     geoms_state: GeomsState,
+    collider_state: ColliderState,
+    constraint_state: ConstraintState,
     rod_info: RodInfo,
     links_info: LinksInfo,
     geoms_info: GeomsInfo,
@@ -4269,7 +4470,10 @@ def kernel_project_rod_rigid_contacts(
     func_project_rod_rigid_normal(
         rod_state,
         links_state,
+        dofs_state,
         geoms_state,
+        collider_state,
+        constraint_state,
         rod_info,
         links_info,
         geoms_info,

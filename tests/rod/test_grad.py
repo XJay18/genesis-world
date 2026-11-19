@@ -24,6 +24,7 @@ pytestmark = [pytest.mark.precision("64")]
         "plane",
         "box",
         "free_box",
+        "pressed_box",
         "post",
         "squeeze",
     ],
@@ -71,8 +72,8 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
             ),
             material=material,
         )
-    if case == "plane":
-        # A free rod sliding on a plane it collides with
+    if case in ("plane", "pressed_box"):
+        # A free rod sliding on a plane it collides with, or the ground under the pressed box
         scene.add_entity(
             morph=gs.morphs.Plane(),
             material=gs.materials.Rigid(
@@ -125,6 +126,19 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
                 gravity_compensation=1.0,
             ),
         )
+    if case == "pressed_box":
+        # A free rod sliding on a free box of 30 g that its weight presses onto the ground, which holds the box in place
+        box = scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(0.0, 0.0, 0.01),
+                size=(0.4, 0.1, 0.02),
+            ),
+            material=gs.materials.Rigid(
+                rho=0.03 / (0.4 * 0.1 * 0.02),
+                needs_coup=True,
+                coup_friction=0.3,
+            ),
+        )
     rod_pos = {
         "contact": (-0.5 * length, 0.0, 0.3105),
         "contact_broadphase": (-0.5 * length, 0.0, 0.3105),
@@ -132,6 +146,7 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
         "plane": (-0.5 * length, 0.0, 0.005),
         "box": (-0.5 * length, 0.0, 0.215),
         "free_box": (-0.5 * length, 0.0, 0.215),
+        "pressed_box": (-0.5 * length, 0.0, 0.025),
         "post": (-0.5 * length, 0.0, 0.2 + 0.0075 + 0.005 + 1e-4),
         "squeeze": (-0.5 * length, 0.0, 0.3),
     }.get(case, (0.0, 0.0, 0.5))
@@ -157,9 +172,9 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
     )
     if case in ("contact", "contact_broadphase", "contact_stale"):
         inputs["vel"][:, 2] -= 0.5
-    if case in ("box", "free_box"):
+    if case in ("box", "free_box", "pressed_box"):
         inputs["vel"][:, 0] += 0.3
-    if case == "free_box":
+    if case in ("free_box", "pressed_box"):
         box_weights = torch.tensor(rng.standard_normal(3), dtype=gs.tc_float, device=gs.device)
     if case == "squeeze":
         lift_dof = gripper.get_joint("lift").dofs_idx_local
@@ -187,7 +202,7 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
                 gripper.set_dofs_velocity(0.2, lift_dof)
             scene.step()
         loss = (rod.get_verts_pos() * weights).sum() + (rod.get_edges_theta() ** 2).sum()
-        if case == "free_box":
+        if case in ("free_box", "pressed_box"):
             loss = loss + (box.get_pos() * box_weights).sum()
         return loss
 
@@ -201,24 +216,29 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
     # positions and stiffnesses, whose finite differences do not converge there, and take smaller steps for the
     # velocities and the bending stiffness. The post touches the rod inside an edge, which both of its vertices share.
     # The contacts between the edges of the rod switch within the steps of the positions and the stretching stiffness
-    # that the other cases take, so they take ten times smaller ones.
+    # that the other cases take, so they take ten times smaller ones. The contacts of the rod see the pressed box through
+    # its response to the contacts holding it on the ground, which carries no gradient (see
+    # 'func_rod_rigid_links_response' in legacy_coupler.py): the velocity takes a bias that no step removes, which its
+    # tolerance bounds.
     is_rod_contact = case in ("contact", "contact_broadphase", "contact_stale")
     steps_and_tols = {
         "pos": (1e-8 if is_rod_contact else 1e-7, 5e-5),
         "vel": (
-            {"free_box": 3e-7, "box": 1e-6, "plane": 1e-6, "post": 2e-7, "squeeze": 5e-6}.get(case, 1e-5),
-            {"free_box": 5e-6, "post": 5e-7, "squeeze": 1e-7}.get(case, 2e-6),
+            {"free_box": 3e-7, "pressed_box": 3e-7, "box": 1e-6, "plane": 1e-6, "post": 2e-7, "squeeze": 5e-6}.get(
+                case, 1e-5
+            ),
+            {"free_box": 5e-6, "pressed_box": 5e-4, "post": 5e-7, "squeeze": 1e-7}.get(case, 2e-6),
         ),
         "theta": (3e-5, 2e-8),
         "E": (
-            {"free_box": 3e-6, "box": 1e-5, "plane": 1e-5, "post": 2e-5}.get(case, 1e-4),
-            {"squeeze": 5e-7}.get(case, 5e-6),
+            {"free_box": 3e-6, "pressed_box": 3e-6, "box": 1e-5, "plane": 1e-5, "post": 2e-5}.get(case, 1e-4),
+            {"pressed_box": 1e-5, "squeeze": 5e-7}.get(case, 5e-6),
         ),
         "K": (1e-3 if case == "inextensible" else 1e-5 if is_rod_contact else 1e-4, 5e-5),
         "G": (3e-4, 5e-6),
     }
     for name, value in inputs.items():
-        if case in ("plane", "box", "free_box", "post", "squeeze") and name not in ("vel", "E"):
+        if case in ("plane", "box", "free_box", "pressed_box", "post", "squeeze") and name not in ("vel", "E"):
             continue
         direction = torch.tensor(rng.standard_normal(value.shape), dtype=gs.tc_float, device=gs.device)
         step, tol = steps_and_tols[name]
