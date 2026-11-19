@@ -130,26 +130,33 @@ def test_elastic_energy_decays_with_damping(show_viewer):
             material=gs.materials.Rod.Base(
                 K=0.0,
                 E=1e5,
-                G=1e4,
+                G=G,
                 segment_radius=0.005,
             ),
         )
-        for y in (0.0, 0.5)
+        for y, G in ((0.0, 1e4), (0.5, 1e4), (1.0, 0.0))
     ]
     scene.build()
     # The first rod is released from a circular arc keeping its rest edge lengths, the second from a sine wave
-    # stretching them, which the inextensibility constraint first projects back
+    # stretching them, which the inextensibility constraint first projects back. The third, without twisting
+    # stiffness, is released from the same arc with the frames of every other edge turned by a quarter turn.
     angles = (np.arange(n_verts) - (n_verts - 1) / 2) * 2.0 * np.arcsin(0.5 * interval / radius)
     arc_z = 0.5 + radius * (1.0 - np.cos(angles))
     rods[0].set_position(np.stack([radius * np.sin(angles), np.zeros(n_verts), arc_z], -1))
     x = interval * np.arange(n_verts)
     rods[1].set_position(np.stack([x, 0.5 + np.zeros(n_verts), 0.5 + 0.01 * np.sin(2.0 * np.pi * x / x[-1])], -1))
+    rods[2].set_position(np.stack([radius * np.sin(angles), np.ones(n_verts), arc_z], -1))
+    rods[2].set_edges_theta(0.5 * np.pi * (np.arange(n_verts - 1) % 2))
+    # A round rod bends the same whatever the twist of its frames
+    assert_allclose(rods[2].get_energy(), rods[0].get_energy(), tol=gs.EPS)
 
     energies = []
     for _ in range(150):
         scene.step()
         energies.append(torch.stack([rod.get_energy().sum() for rod in rods]))
     energies = tensor_to_array(torch.stack(energies))
+    assert_allclose(energies[:, 2], energies[:, 0], tol=gs.EPS)
+    assert_allclose(rods[2].get_verts_pos() - rods[0].get_verts_pos(), (0.0, 1.0, 0.0), tol=gs.EPS)
     assert (energies[0] > 0.0).all()
     assert (np.diff(energies[:, 0]) < 0.0).all()
     assert energies[-1, 0] < 0.85 * energies[0, 0]
@@ -1822,6 +1829,82 @@ def test_rod_rigid_pad_rims_turn_rod_into_grip(two_pad_gripper, show_viewer):
     # vertical axis through the middle vertex, which the grip keeps at the centre of the pads
     assert (0.03 - gripper.get_dofs_position(pads_dof).sum(dim=-1) < 2.0 * radius).all()
     assert np.linalg.norm(np.array(held_offset), axis=-1).max() < 2e-10
+
+
+@pytest.mark.required
+def test_rod_rigid_squeezed_vertex_stays_out_of_blocked_link(two_pad_gripper, show_viewer):
+    radius, squeeze_force, press_force, n_steps = 0.01, 20.0, 5.0, 50
+    box_size = (0.03, 0.012, 0.02)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=0.0,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.15, -0.25, 0.12),
+            camera_lookat=(0.0, 0.0, 0.02),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+    )
+    gripper = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=two_pad_gripper,
+            pos=(0.0, 0.0, 0.031),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.6,
+        ),
+    )
+    # A free box of 30 g on the ground, under the middle vertex of the rod and narrower than the gap of the pads that
+    # squeeze it: pressed down by the pads, the vertex pushes the box into the ground, which holds it
+    box = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.0, 0.0, 0.5 * box_size[2]),
+            size=box_size,
+        ),
+        material=gs.materials.Rigid(
+            rho=0.03 / math.prod(box_size),
+            needs_coup=True,
+            coup_friction=0.6,
+        ),
+    )
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=7,
+            interval=0.02,
+            pos=(-0.06, 0.0, 0.031),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.001,
+            segment_radius=radius,
+        ),
+    )
+    scene.build(n_envs=2)
+    pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
+    lift_dof = gripper.get_joint("lift").dofs_idx_local
+    gripper.set_dofs_position(np.full((2, 2), 0.005 - 1e-5), pads_dof)
+    gripper.control_dofs_force([squeeze_force, squeeze_force, -press_force], [*pads_dof, *lift_dof])
+    carriage = gripper.get_link("carriage")
+    held_offset_start = tensor_to_array(rod.get_verts_pos())[:, 3] - tensor_to_array(carriage.get_pos())
+    depth, held_slip = [], []
+    for _ in range(n_steps):
+        scene.step()
+        verts_pos = tensor_to_array(rod.get_verts_pos())
+        box_top = tensor_to_array(box.get_pos())[:, 2] + 0.5 * box_size[2]
+        depth.append(box_top + radius - verts_pos[:, 3, 2])
+        held_slip.append(verts_pos[:, 3] - tensor_to_array(carriage.get_pos()) - held_offset_start)
+    # The pads press the vertex onto the box with the force of their carriage, and their friction holds it there. The
+    # box, held by the ground, stops the vertex at its surface
+    assert np.max(depth) < 5e-4
+    assert np.linalg.norm(held_slip, axis=-1).max() < 1e-6
 
 
 @pytest.mark.required
