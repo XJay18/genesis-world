@@ -28,14 +28,18 @@ def test_morphs_fall_freely_at_rest_shape(asset_tmp_path, show_viewer):
             damping=damping,
         ),
         viewer_options=gs.options.ViewerOptions(
-            camera_pos=(0.5, -1.5, 1.0),
-            camera_lookat=(0.5, 0.0, 0.5),
+            camera_pos=(0.6, -1.5, 1.0),
+            camera_lookat=(0.6, 0.0, 0.5),
         ),
         show_viewer=show_viewer,
     )
     s = np.linspace(0.0, 1.0, 16)
     file = str(asset_tmp_path / "rod_helix.npy")
     np.save(file, np.stack([0.15 * s, 0.02 * np.sin(2 * np.pi * s), 0.02 * np.cos(2 * np.pi * s)], axis=-1))
+    # A closed curve out of any plane, around which the parallel transport of a frame does not close on itself
+    s = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
+    loop_file = str(asset_tmp_path / "rod_twisted_loop.npy")
+    np.save(loop_file, 0.05 * np.stack([np.cos(s), np.sin(s), 0.6 * np.sin(2.0 * s) + 0.3 * np.cos(3.0 * s)], axis=-1))
     morphs = (
         gs.morphs.ParameterizedRod(
             type="rod",
@@ -59,22 +63,29 @@ def test_morphs_fall_freely_at_rest_shape(asset_tmp_path, show_viewer):
             file=file,
             pos=(0.9, 0.0, 0.5),
         ),
+        gs.morphs.Rod(
+            file=loop_file,
+            pos=(1.2, 0.0, 0.5),
+            is_loop=True,
+        ),
     )
+    # The loop out of any plane starts at the rest of its bending with the turn of its frames around it as twist, which
+    # a twisting stiffness would turn into forces on its vertices
     rods = [
         scene.add_entity(
             morph=morph,
             material=gs.materials.Rod.Base(
                 E=1e5,
-                G=1e4,
+                G=G,
                 segment_radius=0.005,
             ),
         )
-        for morph in morphs
+        for morph, G in zip(morphs, (1e4, 1e4, 1e4, 1e4, 0.0))
     ]
     scene.build(n_envs=2)
 
-    assert [rod.is_loop for rod in rods] == [False, True, False, False]
-    rods_topology = [(16, 15, 14), (16, 16, 16), (16, 15, 14), (16, 15, 14)]
+    assert [rod.is_loop for rod in rods] == [False, True, False, False, True]
+    rods_topology = [(16, 15, 14), (16, 16, 16), (16, 15, 14), (16, 15, 14), (24, 24, 24)]
     assert [(rod.n_verts, rod.n_edges, rod.n_hinges) for rod in rods] == rods_topology
     # The pairs of edges within two edges along a rod, or around a loop, do not collide
     edges_rod = np.repeat(np.arange(len(rods)), [rod.n_edges for rod in rods])

@@ -607,13 +607,14 @@ def func_last_projection_correction(
 
 
 @nb.jit(nopython=True, cache=True)
-def compute_rod_frames(tangents: np.ndarray, is_loop: bool, eps: float) -> np.ndarray:
+def compute_rod_frames(tangents: np.ndarray, lengths: np.ndarray, is_loop: bool, eps: float) -> np.ndarray:
     """
     Return the first director of a frame of each edge of a rod, carried from edge to edge by parallel transport.
 
     The frame of the first edge is perpendicular to its tangent, along the axis least aligned with it. For a loop, the
-    rotation the transport around the loop accumulates (its holonomy) is spread evenly over the edges, so that the frame
-    closes on itself.
+    rotation the transport around the loop accumulates (its holonomy) is spread over the edges in proportion to the
+    length along the loop, 'lengths' being the lengths of the edges: the frame closes on itself, turning by the same
+    angle per unit length at every hinge, which is the least twisting energy a loop of that holonomy can have.
     """
     n_edges = tangents.shape[0]
     d1 = np.zeros_like(tangents)
@@ -637,8 +638,12 @@ def compute_rod_frames(tangents: np.ndarray, is_loop: bool, eps: float) -> np.nd
             sin_holonomy = min(max(np.dot(np.cross(v, d1[0]), t0), -1.0), 1.0)
             cos_holonomy = min(max(np.dot(v, d1[0]), -1.0), 1.0)
             holonomy = math.atan2(sin_holonomy, cos_holonomy)
-            for i_c in range(n_edges):
-                angle = -holonomy * i_c / n_edges
+            # The length along the loop from the middle of the first edge to the middle of each edge, the sum of the
+            # Voronoi lengths of the hinges in between
+            length_along, length_loop = 0.0, lengths.sum()
+            for i_c in range(1, n_edges):
+                length_along += 0.5 * (lengths[i_c - 1] + lengths[i_c])
+                angle = holonomy * length_along / length_loop
                 d2 = np.cross(tangents[i_c], d1[i_c])
                 d1[i_c] = math.cos(angle) * d1[i_c] + math.sin(angle) * d2
     return d1
@@ -1856,15 +1861,15 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
                 topologies.append(np.where(idx_local >= 0, idx_local + start, -1))
 
             # The rest curvature of each side of a hinge follows from the frame of its edge on the rest shape, the
-            # frames carried along it by parallel transport. The initial frames carry no holonomy correction, so that
-            # the closing hinge of a loop starts with its twist. The rest geometry is computed in double precision
-            # whatever the precision of the simulation, the frames being carried edge to edge by a compiled loop typed
-            # for one precision
+            # frames carried along it by parallel transport. The state starts from these frames, so that a rod starts
+            # at the rest of its bending, a loop with its holonomy as twist (see compute_rod_frames). The rest geometry
+            # is computed in double precision whatever the precision of the simulation, the frames being carried edge
+            # to edge by a compiled loop typed for one precision
             pos = tensor_to_array(entity.init_positions, dtype=np.float64)
             edges = pos[edges_verts[:, 1]] - pos[edges_verts[:, 0]]
             edges_length = np.linalg.norm(edges, axis=-1)
             tangents = edges / edges_length[:, None]
-            d1_rest = compute_rod_frames(tangents, is_loop, gs.EPS)
+            d1_rest = compute_rod_frames(tangents, edges_length, is_loop, gs.EPS)
             hinges_tangent, hinges_d1 = tangents[hinges_edges], d1_rest[hinges_edges]
             t_s, t_e = hinges_tangent[:, 0], hinges_tangent[:, 1]
             kb = 2.0 * np.cross(t_s, t_e) / (1.0 + (t_s * t_e).sum(axis=-1, keepdims=True))
@@ -1879,7 +1884,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
                 kappa_rest[:] = 0.0
             verts_pos.append(pos)
             edges_rest_length.append(edges_length)
-            edges_d1.append(compute_rod_frames(tangents, False, gs.EPS) if is_loop else d1_rest)
+            edges_d1.append(d1_rest)
             hinges_kappa_rest.append(kappa_rest)
 
         n_kinds = 6
