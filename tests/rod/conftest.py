@@ -25,3 +25,14 @@ def two_pad_gripper(request):
         quat = f"{math.cos(0.5 * tilt)} {sign * math.sin(0.5 * tilt)} 0 0"
         ET.SubElement(pad, "geom", type="box", size="0.015 0.005 0.02", mass="0.1", quat=quat)
     return ET.tostring(mjcf, encoding="unicode")
+
+
+@pytest.fixture
+def ball_on_slide():
+    """A ball of 4 mm radius and 30 g on a vertical slide with viscous damping, to be pushed along it by a force."""
+    mjcf = ET.Element("mujoco", model="ball_on_slide")
+    worldbody = ET.SubElement(mjcf, "worldbody")
+    ball = ET.SubElement(worldbody, "body", name="ball")
+    ET.SubElement(ball, "joint", name="push", type="slide", axis="0 0 1", damping="20")
+    ET.SubElement(ball, "geom", type="sphere", size="0.004", mass="0.03")
+    return ET.tostring(mjcf, encoding="unicode")
