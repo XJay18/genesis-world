@@ -1003,6 +1003,8 @@ def kernel_project_rod_inextensibility(rod_state: RodState, rod_info: RodInfo, r
 
 # FIXME: quadrants#1001 - the backward pass saves what a kernel may write by its source, both branches of a static
 # condition counted, so that the projection without carry-free sums is a kernel of its own, free of their read-back.
+# The kernel saves copies under the rule of upstream's recorder alone: the rule carried for U1 (see LaunchRecorder)
+# restores 'dp_contact' once per projection either way, since the projection reads it.
 @reversed_with_atomic_sums
 @qd.kernel(fastcache=True)
 def kernel_project_rod_inextensibility_atomic(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
