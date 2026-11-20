@@ -28,12 +28,14 @@ def main():
         show_viewer=args.vis,
     )
 
-    # A soft rope, laid out horizontally, which is clamped at one end and swings down under gravity
+    # A soft rope, laid out horizontally, which is clamped at one end by its first two vertices and swings down under
+    # gravity
     rope = scene.add_entity(
         morph=gs.morphs.ParameterizedRod(
             n_vertices=11,
             interval=0.04,
             pos=(0.0, 0.0, 0.5),
+            fixed=(0, 1),
         ),
         material=gs.materials.Rod.Base(
             E=1e5,
@@ -50,9 +52,8 @@ def main():
     target = torch.tensor([0.22, 0.22, 0.33], dtype=gs.tc_float, device=gs.device)
     vel = torch.zeros(3, dtype=gs.tc_float, device=gs.device, requires_grad=True)
     for i_iter in range(n_iters):
-        # Every rollout restarts from the initial state, which also releases the clamped vertices
+        # Every rollout restarts from the initial state, the clamped vertices included
         scene.reset()
-        rope.set_verts_fixed(True, verts_idx_local=[0, 1])
         rope.set_velocity(vel)
 
         # forward pass
