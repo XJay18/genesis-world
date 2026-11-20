@@ -69,18 +69,16 @@ def test_morphs_fall_freely_at_rest_shape(asset_tmp_path, show_viewer):
             is_loop=True,
         ),
     )
-    # The loop out of any plane starts at the rest of its bending with the turn of its frames around it as twist, which
-    # a twisting stiffness would turn into forces on its vertices
     rods = [
         scene.add_entity(
             morph=morph,
             material=gs.materials.Rod.Base(
                 E=1e5,
-                G=G,
+                G=1e4,
                 segment_radius=0.005,
             ),
         )
-        for morph, G in zip(morphs, (1e4, 1e4, 1e4, 1e4, 0.0))
+        for morph in morphs
     ]
     scene.build(n_envs=2)
 

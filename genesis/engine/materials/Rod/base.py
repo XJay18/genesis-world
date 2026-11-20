@@ -23,7 +23,8 @@ class Base(Material["RodEntity"]):
     E : float, optional
         Bending stiffness, in Pa. Zero disables bending. Default is 1e6.
     G : float, optional
-        Twisting stiffness, in Pa. Zero disables twisting. Default is 1e6.
+        Twisting stiffness, in Pa, about the twist the rod is built with: an open rod is at rest untwisted, a loop at
+        the twist its shape imposes on it, so that every rod starts at rest. Zero disables twisting. Default is 1e6.
     plastic_yield : float, optional
         Curvature beyond which bending deforms the rest shape permanently, in 1/m: the bend of the rod away from its
         rest shape, measured at each vertex as the curvature binormal |kb| = 2 tan(phi / 2) of the turning angle phi
