@@ -1,8 +1,9 @@
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import Field, StrictBool
 
+import genesis as gs
 from genesis.typing import NonNegativeFloat, PositiveFloat
 
 from ..base import Material
@@ -21,9 +22,13 @@ class Base(Material["RodEntity"]):
         Stretching stiffness, in Pa. Zero leaves the length of the edges to the inextensibility constraint alone. A
         stiff value needs a small time step to stay stable. Default is 0.
     E : float, optional
-        Bending stiffness, in Pa. Zero disables bending. Default is 1e6.
+        Bending stiffness, in Pa. Zero disables bending. A stiff value needs a short substep: the bending stays stable
+        while E < m l^3 / (pi r^4 dt^2), with m the mass of a vertex, l the length of its edges, r the radius of the rod
+        and dt the substep. At a given linear density, halving the edges thus takes a substep four times shorter.
+        Default is 1e6.
     G : float, optional
-        Twisting stiffness, in Pa. Zero disables twisting. Default is 1e6.
+        Twisting stiffness, in Pa, about the twist the rod is built with: an open rod is at rest untwisted, a loop at
+        the twist its shape imposes on it, so that every rod starts at rest. Zero disables twisting. Default is 1e6.
     plastic_yield : float, optional
         Curvature beyond which bending deforms the rest shape permanently, in 1/m: the bend of the rod away from its
         rest shape, measured at each vertex as the curvature binormal |kb| = 2 tan(phi / 2) of the turning angle phi
@@ -49,7 +54,12 @@ class Base(Material["RodEntity"]):
         than a stiff stretching energy, at the cost of a small drift of the length the projection leaves. Default is
         True.
     segment_mass : float, optional
-        Mass of each vertex, in kg. Default is 0.02.
+        Mass of each vertex, in kg, whatever the length of its edges: the mass of the rod grows with its number of
+        vertices. Default is 0.02.
+    linear_density : float or None, optional
+        Mass per unit length of the rod, in kg/m, which gives each vertex the mass of half of each of its edges at
+        their rest length: the rod weighs its linear density times its length, whatever its number of vertices. None
+        gives every vertex the mass 'segment_mass', which cannot be set with it. Default is None.
     segment_radius : float, optional
         Radius of the rod, in m. Default is 0.01.
     twist_inertia : float or None, optional
@@ -76,5 +86,11 @@ class Base(Material["RodEntity"]):
     mpm_friction: NonNegativeFloat = 0.3
     inextensible: StrictBool = True
     segment_mass: PositiveFloat = 0.02
+    linear_density: PositiveFloat | None = None
     segment_radius: PositiveFloat = 0.01
     twist_inertia: PositiveFloat | None = None
+
+    def model_post_init(self, context: Any) -> None:
+        super().model_post_init(context)
+        if self.linear_density is not None and "segment_mass" in self.model_fields_set:
+            gs.raise_exception("A rod material takes 'segment_mass' or 'linear_density', not both.")

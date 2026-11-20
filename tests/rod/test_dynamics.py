@@ -69,18 +69,16 @@ def test_morphs_fall_freely_at_rest_shape(asset_tmp_path, show_viewer):
             is_loop=True,
         ),
     )
-    # The loop out of any plane starts at the rest of its bending with the turn of its frames around it as twist, which
-    # a twisting stiffness would turn into forces on its vertices
     rods = [
         scene.add_entity(
             morph=morph,
             material=gs.materials.Rod.Base(
                 E=1e5,
-                G=G,
+                G=1e4,
                 segment_radius=0.005,
             ),
         )
-        for morph, G in zip(morphs, (1e4, 1e4, 1e4, 1e4, 0.0))
+        for morph in morphs
     ]
     scene.build(n_envs=2)
 
@@ -110,6 +108,66 @@ def test_morphs_fall_freely_at_rest_shape(asset_tmp_path, show_viewer):
         fall += substep_dt * vel
     for rod, pos in zip(rods, pos_init):
         assert_allclose(rod.get_verts_pos() - pos, (0.0, 0.0, fall), tol=1e-10)
+
+
+@pytest.mark.required
+def test_rod_weight_follows_linear_density(show_viewer):
+    dt, substeps, gravity = 1e-3, 5, -9.81
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=dt,
+            substeps=substeps,
+            gravity=(0.0, 0.0, gravity),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -2.5, 0.6),
+            camera_lookat=(0.3, 0.0, 0.6),
+        ),
+        show_viewer=show_viewer,
+    )
+    # Ropes of the same length and linear density, of 11, 21 and 41 vertices, hanging from their top vertex
+    length, linear_density, radius, stretching_stiffness_area = 1.0, 0.1, 0.01, 100.0
+    rods = [
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=n_verts,
+                interval=length / (n_verts - 1),
+                axis="z",
+                pos=(0.3 * i_rod, 0.0, 0.1),
+                fixed=(-1,),
+            ),
+            material=gs.materials.Rod.Base(
+                K=stretching_stiffness_area / (math.pi * radius**2),
+                inextensible=False,
+                linear_density=linear_density,
+                segment_radius=radius,
+            ),
+        )
+        for i_rod, n_verts in enumerate((11, 21, 41))
+    ]
+    with pytest.raises(gs.GenesisException, match="linear_density"):
+        gs.materials.Rod.Base(segment_mass=0.01, linear_density=linear_density)
+    scene.build(n_envs=2)
+
+    # Each vertex weighs the linear density times half of each of its edges, so the edge j from the bottom holds the
+    # weight of j + 1/2 edges, and the rope hangs stretched by linear_density g length^2 / (2 K A) whatever its edges
+    pos_rest = []
+    for rod in rods:
+        edge_length = length / rod.n_edges
+        edges_weight = linear_density * edge_length * -gravity * (np.arange(rod.n_edges) + 0.5)
+        edges_length = edge_length * (1.0 + edges_weight / stretching_stiffness_area)
+        pos = rod.get_verts_pos()
+        verts_depth = np.append(np.cumsum(edges_length[::-1])[::-1], 0.0)
+        pos[..., 2] = pos[..., -1:, 2] - torch.tensor(verts_depth, dtype=gs.tc_float, device=gs.device)
+        rod.set_verts_pos(pos)
+        pos_rest.append(pos)
+    stretch = linear_density * -gravity * length**2 / (2.0 * stretching_stiffness_area)
+    for _ in range(10):
+        scene.step()
+    for rod, pos in zip(rods, pos_rest):
+        assert_allclose(rod.get_total_length(), length + stretch, tol=5e-16)
+        assert_allclose(rod.get_verts_pos(), pos, tol=1e-16)
+        assert_allclose(rod.get_verts_vel(), 0.0, tol=5e-13)
 
 
 @pytest.mark.required
@@ -504,20 +562,25 @@ def test_vertex_constraints_reset_with_state(show_viewer):
             ),
         )
         for n_verts, pos, is_fixed in (
-            (20, (0.0, 0.3, 0.3), False),
+            (20, (0.0, 0.3, 0.3), (0, 1)),
             (20, (0.36, 0.0, 0.2), False),
             (3, (0.0, -0.3, 0.3), True),
         )
     ]
+    with pytest.raises(gs.GenesisException, match="fixed vertex indices"):
+        scene.add_entity(morph=gs.morphs.ParameterizedRod(n_vertices=3, fixed=(3,)), material=gs.materials.Rod.Base())
     scene.build(n_envs=2)
-    rods[0].set_verts_fixed(True, [0, 1])
+    rods[0].set_verts_fixed(True, 2)
     rods[1].set_verts_fixed(True, 2, envs_idx=1)
     rods[1].set_vertex_constraints(19, link=box.base_link)
 
-    is_kinematic = [np.zeros((2, rod.n_verts), dtype=np.bool_) for rod in rods]
-    is_kinematic[0][:, :2] = True
+    # The vertices the morphs fix
+    is_kinematic_built = [np.zeros((2, rod.n_verts), dtype=np.bool_) for rod in rods]
+    is_kinematic_built[0][:, :2] = True
+    is_kinematic_built[2][:] = True
+    is_kinematic = [rod_is_kinematic.copy() for rod_is_kinematic in is_kinematic_built]
+    is_kinematic[0][:, 2] = True
     is_kinematic[1][1, 2] = is_kinematic[1][:, 19] = True
-    is_kinematic[2][:] = True
     for rod, rod_is_kinematic in zip(rods, is_kinematic):
         assert_equal(rod.get_verts_kinematic(), rod_is_kinematic)
 
@@ -532,18 +595,19 @@ def test_vertex_constraints_reset_with_state(show_viewer):
     # The constraints and the stiffness are part of the state, which a reset restores as built, the vertices the morphs
     # fix included
     scene.reset(envs_idx=[1])
-    for rod, pos, pos_0, rod_is_kinematic in zip(rods, pos_init, pos_env_0, is_kinematic):
+    for rod, pos, pos_0, rod_is_kinematic, rod_is_kinematic_built in zip(
+        rods, pos_init, pos_env_0, is_kinematic, is_kinematic_built
+    ):
         assert_allclose(rod.get_verts_pos()[1], pos[1], tol=gs.EPS)
         assert_allclose(rod.get_verts_pos()[0], pos_0, tol=gs.EPS)
         assert_equal(rod.get_verts_kinematic()[0], rod_is_kinematic[0])
-        assert_equal(rod.get_verts_kinematic()[1], rod is rods[2])
+        assert_equal(rod.get_verts_kinematic()[1], rod_is_kinematic_built[1])
     stiffness_scale = torch.tensor((2.0, 1.0), dtype=gs.tc_float, device=gs.device)
     assert_allclose(rods[0].get_bending_stiffness(), stiffness_scale * bending_stiffness_init, tol=gs.EPS)
 
     scene.reset()
-    for rod in rods:
-        assert_equal(rod.get_verts_kinematic(), rod is rods[2])
-    rods[0].set_verts_fixed(True, [0, 1])
+    for rod, rod_is_kinematic_built in zip(rods, is_kinematic_built):
+        assert_equal(rod.get_verts_kinematic(), rod_is_kinematic_built)
     rods[1].set_verts_fixed(True, 2, envs_idx=1)
     rods[1].set_vertex_constraints(19, link=box.base_link)
     shift = torch.tensor((0.0, 0.0, 0.05), dtype=gs.tc_float, device=gs.device)

@@ -119,11 +119,15 @@ class RodEdgesInfo(Data, kind=DataKind.CONSTANT, shape=(ROD_EDGES,)):
 
 
 class RodHingesInfo(Data, kind=DataKind.CONSTANT, shape=(ROD_HINGES,)):
-    """The topology and the rest Voronoi length (mean rest length of its two edges) of each hinge of the rods."""
+    """The topology, the rest Voronoi length (mean rest length of its two edges) and the rest twist of each hinge of the
+    rods."""
 
     verts_idx: qd.Tensor = field((int, 3))
     edges_idx: qd.Tensor = field((int, 2))
     rest_length: qd.Tensor = field(float)
+    # The twist of the frames the rod is built with, at which its twisting energy is zero: none for an open rod, the
+    # share of the holonomy of a loop its frames turn by at the hinge (see compute_rod_frames)
+    rest_twist: qd.Tensor = field(float)
 
 
 class RodInfo(Data):
@@ -612,16 +616,22 @@ def func_last_projection_correction(
 
 
 @nb.jit(nopython=True, cache=True)
-def compute_rod_frames(tangents: np.ndarray, lengths: np.ndarray, is_loop: bool, eps: float) -> np.ndarray:
+def compute_rod_frames(
+    tangents: np.ndarray, lengths: np.ndarray, is_loop: bool, eps: float
+) -> tuple[np.ndarray, float]:
     """
-    Return the first director of a frame of each edge of a rod, carried from edge to edge by parallel transport.
+    Return the first director of a frame of each edge of a rod, carried from edge to edge by parallel transport, and the
+    holonomy of a loop.
 
     The frame of the first edge is perpendicular to its tangent, along the axis least aligned with it. For a loop, the
     rotation the transport around the loop accumulates (its holonomy) is spread over the edges in proportion to the
-    length along the loop, 'lengths' being the lengths of the edges: the frame closes on itself, turning by the same
-    angle per unit length at every hinge, which is the least twisting energy a loop of that holonomy can have.
+    length along the loop, 'lengths' being the lengths of the edges: the frame closes on itself, turning at each hinge
+    by the holonomy times the Voronoi length of the hinge over the length of the loop, the same angle per unit length.
+    The holonomy is zero for an open rod, and exactly zero for a loop in a coordinate plane, whose frames keep an exact
+    zero component.
     """
     n_edges = tangents.shape[0]
+    holonomy = 0.0
     d1 = np.zeros_like(tangents)
     t0 = tangents[0]
     axis = np.zeros(3)
@@ -651,7 +661,7 @@ def compute_rod_frames(tangents: np.ndarray, lengths: np.ndarray, is_loop: bool,
                 angle = holonomy * length_along / length_loop
                 d2 = np.cross(tangents[i_c], d1[i_c])
                 d1[i_c] = math.cos(angle) * d1[i_c] + math.sin(angle) * d2
-    return d1
+    return d1, holonomy
 
 
 @qd.func
@@ -787,10 +797,12 @@ def func_compute_rod_forces(rod_state: RodState, rod_info: RodInfo):
         rod_state.hinges.kb[i_h, i_b] = kb
         rod_state.hinges.twist[i_h, i_b] = twist
 
-        # Twisting, through the twist of the hinge, at rest without twist
+        # Twisting, through the twist of the hinge away from its rest twist
+        twist_elastic = twist - rod_info.hinges.rest_twist[i_h]
         twisting_modulus = rod_state.rods.twisting_stiffness[i_r, i_b] * area * radius * radius / 2.0
-        twisting_scale = twisting_modulus * twist / rest_length
-        rod_state.hinges.twisting_energy[i_h, i_b] = 0.5 * twisting_modulus * twist * twist / rest_length
+        twisting_scale = twisting_modulus * twist_elastic / rest_length
+        twisting_energy = 0.5 * twisting_modulus * twist_elastic * twist_elastic / rest_length
+        rod_state.hinges.twisting_energy[i_h, i_b] = twisting_energy
         twisting_dx_s = -twisting_scale * kb / (2.0 * length_s)
         twisting_dx_e = twisting_scale * kb / (2.0 * length_e)
 
@@ -1835,7 +1847,8 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
 
     def _init_rod_data(self, edge_pairs_idx: np.ndarray):
         """Fill the topology, the rest geometry, the material and the initial state of the rods."""
-        topologies, verts_pos, edges_rest_length, edges_d1, hinges_kappa_rest = [], [], [], [], []
+        topologies, verts_pos, edges_rest_length, edges_d1 = [], [], [], []
+        verts_is_fixed, verts_mass, hinges_kappa_rest, hinges_rest_twist = [], [], [], []
         for entity in self._entities:
             n_verts, is_loop = entity.n_verts, entity.is_loop
             verts_local_idx = np.arange(n_verts)
@@ -1868,15 +1881,15 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
                 topologies.append(np.where(idx_local >= 0, idx_local + start, -1))
 
             # The rest curvature of each side of a hinge follows from the frame of its edge on the rest shape, the
-            # frames carried along it by parallel transport. The state starts from these frames, so that a rod starts
-            # at the rest of its bending, a loop with its holonomy as twist (see compute_rod_frames). The rest geometry
+            # frames carried along it by parallel transport. The state starts from these frames, and the twist of each
+            # hinge in them is its rest twist, so that a rod starts at rest (see compute_rod_frames). The rest geometry
             # is computed in double precision whatever the precision of the simulation, the frames being carried edge
             # to edge by a compiled loop typed for one precision
             pos = tensor_to_array(entity.init_positions, dtype=np.float64)
             edges = pos[edges_verts[:, 1]] - pos[edges_verts[:, 0]]
             edges_length = np.linalg.norm(edges, axis=-1)
             tangents = edges / edges_length[:, None]
-            d1_rest = compute_rod_frames(tangents, edges_length, is_loop, gs.EPS)
+            d1_rest, holonomy = compute_rod_frames(tangents, edges_length, is_loop, gs.EPS)
             hinges_tangent, hinges_d1 = tangents[hinges_edges], d1_rest[hinges_edges]
             t_s, t_e = hinges_tangent[:, 0], hinges_tangent[:, 1]
             kb = 2.0 * np.cross(t_s, t_e) / (1.0 + (t_s * t_e).sum(axis=-1, keepdims=True))
@@ -1889,10 +1902,24 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             )
             if entity.morph.rest_state == "straight":
                 kappa_rest[:] = 0.0
+            # The morph fixes every vertex for True, or the vertices of the given indices
+            rod_verts_is_fixed = np.full(n_verts, entity.morph.fixed is True)
+            if not isinstance(entity.morph.fixed, bool):
+                rod_verts_is_fixed[list(entity.morph.fixed)] = True
+            # The mass of each vertex, its share of the edges ending and starting at it for a linear density
+            if entity.material.linear_density is None:
+                rod_verts_mass = np.full(n_verts, entity.material.segment_mass)
+            else:
+                verts_edges = np.stack([edge_end, edge_start], axis=-1)
+                verts_edges_length = np.where(verts_edges >= 0, edges_length[verts_edges], 0.0)
+                rod_verts_mass = 0.5 * entity.material.linear_density * verts_edges_length.sum(axis=-1)
             verts_pos.append(pos)
+            verts_is_fixed.append(rod_verts_is_fixed)
+            verts_mass.append(rod_verts_mass)
             edges_rest_length.append(edges_length)
             edges_d1.append(d1_rest)
             hinges_kappa_rest.append(kappa_rest)
+            hinges_rest_twist.append(holonomy * edges_length[hinges_edges].mean(axis=-1) / edges_length.sum())
 
         n_kinds = 6
         (
@@ -1911,7 +1938,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         rods_n_edges = [entity.n_edges for entity in self._entities]
         materials = [entity.material for entity in self._entities]
         edges_rod_idx = np.repeat(np.arange(self.n_rods), rods_n_edges)
-        verts_mass = np.repeat([material.segment_mass for material in materials], rods_n_verts)
+        verts_mass = np.concatenate(verts_mass)
         verts_radius = np.repeat([material.segment_radius for material in materials], rods_n_verts)
         # The twist inertia of a solid cylinder of the mass and radius of the edge, where the material leaves it unset
         edges_twist_inertia = (
@@ -1949,8 +1976,9 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             (info.hinges.verts_idx, hinges_verts_idx, gs.tc_int),
             (info.hinges.edges_idx, hinges_edges_idx, gs.tc_int),
             (info.hinges.rest_length, hinges_rest_length, gs.tc_float),
+            (info.hinges.rest_twist, np.concatenate(hinges_rest_twist), gs.tc_float),
             (state.verts.pos, verts_pos, gs.tc_float),
-            (state.verts.is_fixed, np.repeat([e.morph.fixed for e in self._entities], rods_n_verts), gs.tc_bool),
+            (state.verts.is_fixed, np.concatenate(verts_is_fixed), gs.tc_bool),
             (state.verts.link_idx, np.full(self.n_verts, -1), gs.tc_int),
             (state.edges.d1_ref, edges_d1, gs.tc_float),
             (state.edges.d2_ref, np.cross(edges_tangent, edges_d1), gs.tc_float),
@@ -2133,8 +2161,10 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         """
         Set whether some vertices of the rods are fixed, keeping their position and velocity.
 
-        This is part of the state, which a differentiable rollout may change between two steps, and which a reset of the
-        scene restores as it was initially (the vertices the morphs fix).
+        This is part of the state, which a differentiable rollout may change between two steps, and which
+        `scene.reset()` restores as registered: the vertices the morphs fix (see 'RodMixin.fixed'), unless a state was
+        registered since with `scene.reset(state)`. A rod fixed at the same vertices in every rollout takes them from
+        its morph.
         """
         fixed, verts_idx, envs_idx = self._sanitize_io_variables(
             fixed, verts_idx, self.n_verts, "verts_idx", envs_idx, dtype=gs.tc_bool, batched_idx=True

@@ -43,7 +43,7 @@ def main():
             coup_friction=0.9,
         ),
     )
-    # A light and soft rope lying on the ground in front of the robot
+    # A light and soft rope of 50 g/m lying on the ground in front of the robot
     rope = scene.add_entity(
         morph=gs.morphs.ParameterizedRod(
             n_vertices=31,
@@ -53,7 +53,7 @@ def main():
         material=gs.materials.Rod.Base(
             E=5e3,
             G=1e3,
-            segment_mass=0.001,
+            linear_density=0.05,
         ),
     )
     scene.build()
