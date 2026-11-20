@@ -4124,8 +4124,8 @@ def func_project_rod_rigid_normal(
                             i_v_n = qd.select(edge_verts_idx[0] == i_v, edge_verts_idx[1], edge_verts_idx[0])
                             n_contacts_n = rod_state.rigid_contacts.n_contacts[i_v_n, i_b]
                             if func_rod_rigid_contacts_are_squeezing(i_v_n, i_b, n_contacts_n, rod_state, rod_config):
-                                # The loop runs to the static cap: the reverse pass cannot bound a trip count loaded at
-                                # a data-dependent index (U3 in the DLO-Solver upstream issues)
+                                # FIXME: U3 (DLO-Solver upstream issues) - the reverse pass cannot bound a trip count
+                                # loaded at a data-dependent index, so the loop runs to the static cap (see AGENTS.md)
                                 for i_c_n in range(N_CONTACTS_MAX):
                                     if i_c_n < n_contacts_n:
                                         verts_idx_n = rod_state.rigid_contacts.verts_idx[i_v_n, i_c_n, i_b]
