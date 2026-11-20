@@ -97,6 +97,11 @@ class RodEntity(Entity):
         self.init_positions_COM_offset = torch.tensor(
             init_positions - (verts_COM + offset_shift), dtype=gs.tc_float, device=gs.device
         )
+        if not isinstance(morph.fixed, bool) and not all(-self.n_verts <= i_v < self.n_verts for i_v in morph.fixed):
+            gs.raise_exception(
+                f"Expected fixed vertex indices in [-{self.n_verts}, {self.n_verts}) for a rod of {self.n_verts} "
+                f"vertices, got {morph.fixed}."
+            )
 
     @gs.assert_unbuilt
     def _build(self) -> None:

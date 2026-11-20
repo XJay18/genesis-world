@@ -1848,7 +1848,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
     def _init_rod_data(self, edge_pairs_idx: np.ndarray):
         """Fill the topology, the rest geometry, the material and the initial state of the rods."""
         topologies, verts_pos, edges_rest_length, edges_d1 = [], [], [], []
-        hinges_kappa_rest, hinges_rest_twist = [], []
+        verts_is_fixed, hinges_kappa_rest, hinges_rest_twist = [], [], []
         for entity in self._entities:
             n_verts, is_loop = entity.n_verts, entity.is_loop
             verts_local_idx = np.arange(n_verts)
@@ -1902,7 +1902,12 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             )
             if entity.morph.rest_state == "straight":
                 kappa_rest[:] = 0.0
+            # The morph fixes every vertex for True, or the vertices of the given indices
+            rod_verts_is_fixed = np.full(n_verts, entity.morph.fixed is True)
+            if not isinstance(entity.morph.fixed, bool):
+                rod_verts_is_fixed[list(entity.morph.fixed)] = True
             verts_pos.append(pos)
+            verts_is_fixed.append(rod_verts_is_fixed)
             edges_rest_length.append(edges_length)
             edges_d1.append(d1_rest)
             hinges_kappa_rest.append(kappa_rest)
@@ -1965,7 +1970,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             (info.hinges.rest_length, hinges_rest_length, gs.tc_float),
             (info.hinges.rest_twist, np.concatenate(hinges_rest_twist), gs.tc_float),
             (state.verts.pos, verts_pos, gs.tc_float),
-            (state.verts.is_fixed, np.repeat([e.morph.fixed for e in self._entities], rods_n_verts), gs.tc_bool),
+            (state.verts.is_fixed, np.concatenate(verts_is_fixed), gs.tc_bool),
             (state.verts.link_idx, np.full(self.n_verts, -1), gs.tc_int),
             (state.edges.d1_ref, edges_d1, gs.tc_float),
             (state.edges.d2_ref, np.cross(edges_tangent, edges_d1), gs.tc_float),
@@ -2148,8 +2153,10 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         """
         Set whether some vertices of the rods are fixed, keeping their position and velocity.
 
-        This is part of the state, which a differentiable rollout may change between two steps, and which a reset of the
-        scene restores as it was initially (the vertices the morphs fix).
+        This is part of the state, which a differentiable rollout may change between two steps, and which
+        `scene.reset()` restores as registered: the vertices the morphs fix (see 'RodMixin.fixed'), unless a state was
+        registered since with `scene.reset(state)`. A rod fixed at the same vertices in every rollout takes them from
+        its morph.
         """
         fixed, verts_idx, envs_idx = self._sanitize_io_variables(
             fixed, verts_idx, self.n_verts, "verts_idx", envs_idx, dtype=gs.tc_bool, batched_idx=True

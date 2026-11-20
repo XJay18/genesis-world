@@ -31,6 +31,7 @@ from genesis.constants import (
 from genesis.typing import (
     FGridArrayType,
     FrozenDictType,
+    IArrayType,
     NonNegativeInt,
     PositiveFloat,
     PositiveInt,
@@ -1746,12 +1747,14 @@ class RodMixin(Options):
     rest_state : str, optional
         The shape the rod relaxes to: "default" for the initial shape, "straight" for a straight rod with the same edge
         lengths. A loop has no straight rest shape. Defaults to "default".
-    fixed : bool, optional
-        Whether every vertex of the rod is fixed. Defaults to False.
+    fixed : bool or sequence of int, optional
+        The vertices of the rod that keep their position and velocity: True for every vertex, or the indices of some
+        vertices, a negative index counting from the last vertex (`(0, 1)` clamps the position and the direction of the
+        first end). They are part of the initial state, which `scene.reset()` restores. Defaults to False.
     """
 
     rest_state: Literal["default", "straight"] = "default"
-    fixed: StrictBool = False
+    fixed: StrictBool | IArrayType = False
 
 
 class Rod(FileMorph, RodMixin):
@@ -1777,7 +1780,7 @@ class Rod(FileMorph, RodMixin):
         Whether the last vertex connects back to the first one. Defaults to False.
     rest_state : str, optional
         See RodMixin. Defaults to "default".
-    fixed : bool, optional
+    fixed : bool or sequence of int, optional
         See RodMixin. Defaults to False.
     """
 
@@ -1819,7 +1822,7 @@ class ParameterizedRod(Morph, RodMixin):
         The quaternion (w-x-y-z convention) of the entity. If specified, `euler` will be ignored. Defaults to None.
     rest_state : str, optional
         See RodMixin. Defaults to "default".
-    fixed : bool, optional
+    fixed : bool or sequence of int, optional
         See RodMixin. Defaults to False.
     """
 

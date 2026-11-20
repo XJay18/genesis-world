@@ -502,20 +502,25 @@ def test_vertex_constraints_reset_with_state(show_viewer):
             ),
         )
         for n_verts, pos, is_fixed in (
-            (20, (0.0, 0.3, 0.3), False),
+            (20, (0.0, 0.3, 0.3), (0, 1)),
             (20, (0.36, 0.0, 0.2), False),
             (3, (0.0, -0.3, 0.3), True),
         )
     ]
+    with pytest.raises(gs.GenesisException, match="fixed vertex indices"):
+        scene.add_entity(morph=gs.morphs.ParameterizedRod(n_vertices=3, fixed=(3,)), material=gs.materials.Rod.Base())
     scene.build(n_envs=2)
-    rods[0].set_verts_fixed(True, [0, 1])
+    rods[0].set_verts_fixed(True, 2)
     rods[1].set_verts_fixed(True, 2, envs_idx=1)
     rods[1].set_vertex_constraints(19, link=box.base_link)
 
-    is_kinematic = [np.zeros((2, rod.n_verts), dtype=np.bool_) for rod in rods]
-    is_kinematic[0][:, :2] = True
+    # The vertices the morphs fix
+    is_kinematic_built = [np.zeros((2, rod.n_verts), dtype=np.bool_) for rod in rods]
+    is_kinematic_built[0][:, :2] = True
+    is_kinematic_built[2][:] = True
+    is_kinematic = [rod_is_kinematic.copy() for rod_is_kinematic in is_kinematic_built]
+    is_kinematic[0][:, 2] = True
     is_kinematic[1][1, 2] = is_kinematic[1][:, 19] = True
-    is_kinematic[2][:] = True
     for rod, rod_is_kinematic in zip(rods, is_kinematic):
         assert_equal(rod.get_verts_kinematic(), rod_is_kinematic)
 
@@ -530,18 +535,19 @@ def test_vertex_constraints_reset_with_state(show_viewer):
     # The constraints and the stiffness are part of the state, which a reset restores as built, the vertices the morphs
     # fix included
     scene.reset(envs_idx=[1])
-    for rod, pos, pos_0, rod_is_kinematic in zip(rods, pos_init, pos_env_0, is_kinematic):
+    for rod, pos, pos_0, rod_is_kinematic, rod_is_kinematic_built in zip(
+        rods, pos_init, pos_env_0, is_kinematic, is_kinematic_built
+    ):
         assert_allclose(rod.get_verts_pos()[1], pos[1], tol=gs.EPS)
         assert_allclose(rod.get_verts_pos()[0], pos_0, tol=gs.EPS)
         assert_equal(rod.get_verts_kinematic()[0], rod_is_kinematic[0])
-        assert_equal(rod.get_verts_kinematic()[1], rod is rods[2])
+        assert_equal(rod.get_verts_kinematic()[1], rod_is_kinematic_built[1])
     stiffness_scale = torch.tensor((2.0, 1.0), dtype=gs.tc_float, device=gs.device)
     assert_allclose(rods[0].get_bending_stiffness(), stiffness_scale * bending_stiffness_init, tol=gs.EPS)
 
     scene.reset()
-    for rod in rods:
-        assert_equal(rod.get_verts_kinematic(), rod is rods[2])
-    rods[0].set_verts_fixed(True, [0, 1])
+    for rod, rod_is_kinematic_built in zip(rods, is_kinematic_built):
+        assert_equal(rod.get_verts_kinematic(), rod_is_kinematic_built)
     rods[1].set_verts_fixed(True, 2, envs_idx=1)
     rods[1].set_vertex_constraints(19, link=box.base_link)
     shift = torch.tensor((0.0, 0.0, 0.05), dtype=gs.tc_float, device=gs.device)
