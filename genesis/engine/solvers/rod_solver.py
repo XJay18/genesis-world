@@ -1848,7 +1848,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
     def _init_rod_data(self, edge_pairs_idx: np.ndarray):
         """Fill the topology, the rest geometry, the material and the initial state of the rods."""
         topologies, verts_pos, edges_rest_length, edges_d1 = [], [], [], []
-        verts_is_fixed, hinges_kappa_rest, hinges_rest_twist = [], [], []
+        verts_is_fixed, verts_mass, hinges_kappa_rest, hinges_rest_twist = [], [], [], []
         for entity in self._entities:
             n_verts, is_loop = entity.n_verts, entity.is_loop
             verts_local_idx = np.arange(n_verts)
@@ -1906,8 +1906,16 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             rod_verts_is_fixed = np.full(n_verts, entity.morph.fixed is True)
             if not isinstance(entity.morph.fixed, bool):
                 rod_verts_is_fixed[list(entity.morph.fixed)] = True
+            # The mass of each vertex, its share of the edges ending and starting at it for a linear density
+            if entity.material.linear_density is None:
+                rod_verts_mass = np.full(n_verts, entity.material.segment_mass)
+            else:
+                verts_edges = np.stack([edge_end, edge_start], axis=-1)
+                verts_edges_length = np.where(verts_edges >= 0, edges_length[verts_edges], 0.0)
+                rod_verts_mass = 0.5 * entity.material.linear_density * verts_edges_length.sum(axis=-1)
             verts_pos.append(pos)
             verts_is_fixed.append(rod_verts_is_fixed)
+            verts_mass.append(rod_verts_mass)
             edges_rest_length.append(edges_length)
             edges_d1.append(d1_rest)
             hinges_kappa_rest.append(kappa_rest)
@@ -1930,7 +1938,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         rods_n_edges = [entity.n_edges for entity in self._entities]
         materials = [entity.material for entity in self._entities]
         edges_rod_idx = np.repeat(np.arange(self.n_rods), rods_n_edges)
-        verts_mass = np.repeat([material.segment_mass for material in materials], rods_n_verts)
+        verts_mass = np.concatenate(verts_mass)
         verts_radius = np.repeat([material.segment_radius for material in materials], rods_n_verts)
         # The twist inertia of a solid cylinder of the mass and radius of the edge, where the material leaves it unset
         edges_twist_inertia = (

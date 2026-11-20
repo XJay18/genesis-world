@@ -111,6 +111,66 @@ def test_morphs_fall_freely_at_rest_shape(asset_tmp_path, show_viewer):
 
 
 @pytest.mark.required
+def test_rod_weight_follows_linear_density(show_viewer):
+    dt, substeps, gravity = 1e-3, 5, -9.81
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=dt,
+            substeps=substeps,
+            gravity=(0.0, 0.0, gravity),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -2.5, 0.6),
+            camera_lookat=(0.3, 0.0, 0.6),
+        ),
+        show_viewer=show_viewer,
+    )
+    # Ropes of the same length and linear density, of 11, 21 and 41 vertices, hanging from their top vertex
+    length, linear_density, radius, stretching_stiffness_area = 1.0, 0.1, 0.01, 100.0
+    rods = [
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=n_verts,
+                interval=length / (n_verts - 1),
+                axis="z",
+                pos=(0.3 * i_rod, 0.0, 0.1),
+                fixed=(-1,),
+            ),
+            material=gs.materials.Rod.Base(
+                K=stretching_stiffness_area / (math.pi * radius**2),
+                inextensible=False,
+                linear_density=linear_density,
+                segment_radius=radius,
+            ),
+        )
+        for i_rod, n_verts in enumerate((11, 21, 41))
+    ]
+    with pytest.raises(gs.GenesisException, match="linear_density"):
+        gs.materials.Rod.Base(segment_mass=0.01, linear_density=linear_density)
+    scene.build(n_envs=2)
+
+    # Each vertex weighs the linear density times half of each of its edges, so the edge j from the bottom holds the
+    # weight of j + 1/2 edges, and the rope hangs stretched by linear_density g length^2 / (2 K A) whatever its edges
+    pos_rest = []
+    for rod in rods:
+        edge_length = length / rod.n_edges
+        edges_weight = linear_density * edge_length * -gravity * (np.arange(rod.n_edges) + 0.5)
+        edges_length = edge_length * (1.0 + edges_weight / stretching_stiffness_area)
+        pos = rod.get_verts_pos()
+        verts_depth = np.append(np.cumsum(edges_length[::-1])[::-1], 0.0)
+        pos[..., 2] = pos[..., -1:, 2] - torch.tensor(verts_depth, dtype=gs.tc_float, device=gs.device)
+        rod.set_verts_pos(pos)
+        pos_rest.append(pos)
+    stretch = linear_density * -gravity * length**2 / (2.0 * stretching_stiffness_area)
+    for _ in range(10):
+        scene.step()
+    for rod, pos in zip(rods, pos_rest):
+        assert_allclose(rod.get_total_length(), length + stretch, tol=1e-12)
+        assert_allclose(rod.get_verts_pos(), pos, tol=1e-12)
+        assert_allclose(rod.get_verts_vel(), 0.0, tol=1e-10)
+
+
+@pytest.mark.required
 def test_elastic_energy_decays_with_damping(show_viewer):
     n_verts, interval, radius = 30, 0.01, 0.15
     scene = gs.Scene(
