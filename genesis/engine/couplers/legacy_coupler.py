@@ -4124,42 +4124,48 @@ def func_project_rod_rigid_normal(
                             i_v_n = qd.select(edge_verts_idx[0] == i_v, edge_verts_idx[1], edge_verts_idx[0])
                             n_contacts_n = rod_state.rigid_contacts.n_contacts[i_v_n, i_b]
                             if func_rod_rigid_contacts_are_squeezing(i_v_n, i_b, n_contacts_n, rod_state, rod_config):
-                                for i_c_n in range(n_contacts_n):
-                                    verts_idx_n = rod_state.rigid_contacts.verts_idx[i_v_n, i_c_n, i_b]
-                                    # A point of the edge the two vertices share, which the neighbour leaves to the vertex
-                                    if verts_idx_n[0] == i_v or verts_idx_n[1] == i_v:
-                                        for i_c in qd.static(range(N_CONTACTS_MAX)):
-                                            if i_c < n_contacts:
-                                                i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
-                                                if i_g == rod_state.rigid_contacts.geom_idx[i_v_n, i_c_n, i_b]:
-                                                    t_n = rod_state.rigid_contacts.t[i_v_n, i_c_n, i_b]
-                                                    # The contact moves the point along its own normal, which takes the
-                                                    # point out by the cosine of their normals
-                                                    share_n = (
-                                                        qd.select(i_v == verts_idx_n[0], 1.0 - t_n, t_n)
-                                                        / ((1.0 - t_n) ** 2 + t_n**2)
-                                                        * qd.max(
-                                                            rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(
-                                                                rod_state.rigid_contacts.normal[i_v_n, i_c_n, i_b]
-                                                            ),
-                                                            0.0,
+                                # The loop runs to the static cap: the reverse pass cannot bound a trip count loaded at
+                                # a data-dependent index (U3 in the DLO-Solver upstream issues)
+                                for i_c_n in range(N_CONTACTS_MAX):
+                                    if i_c_n < n_contacts_n:
+                                        verts_idx_n = rod_state.rigid_contacts.verts_idx[i_v_n, i_c_n, i_b]
+                                        # A point of the edge the two vertices share, which the neighbour leaves to the
+                                        # vertex
+                                        if verts_idx_n[0] == i_v or verts_idx_n[1] == i_v:
+                                            for i_c in qd.static(range(N_CONTACTS_MAX)):
+                                                if i_c < n_contacts:
+                                                    i_g = rod_state.rigid_contacts.geom_idx[i_v, i_c, i_b]
+                                                    if i_g == rod_state.rigid_contacts.geom_idx[i_v_n, i_c_n, i_b]:
+                                                        t_n = rod_state.rigid_contacts.t[i_v_n, i_c_n, i_b]
+                                                        # The contact moves the point along its own normal, which takes
+                                                        # the point out by the cosine of their normals
+                                                        share_n = (
+                                                            qd.select(i_v == verts_idx_n[0], 1.0 - t_n, t_n)
+                                                            / ((1.0 - t_n) ** 2 + t_n**2)
+                                                            * qd.max(
+                                                                rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(
+                                                                    rod_state.rigid_contacts.normal[i_v_n, i_c_n, i_b]
+                                                                ),
+                                                                0.0,
+                                                            )
                                                         )
-                                                    )
-                                                    penetration_n = rod_state.rigid_contacts.penetration[
-                                                        i_v_n, i_c_n, i_b
-                                                    ]
-                                                    is_deeper = (
-                                                        share_n * penetration_n > shares[i_c] * penetrations[i_c]
-                                                    )
-                                                    shares[i_c] = qd.select(is_deeper, share_n, shares[i_c])
-                                                    penetrations[i_c] = qd.select(
-                                                        is_deeper, penetration_n, penetrations[i_c]
-                                                    )
-                                                    penetrations_start[i_c] = qd.select(
-                                                        is_deeper,
-                                                        rod_state.rigid_contacts.penetration_start[i_v_n, i_c_n, i_b],
-                                                        penetrations_start[i_c],
-                                                    )
+                                                        penetration_n = rod_state.rigid_contacts.penetration[
+                                                            i_v_n, i_c_n, i_b
+                                                        ]
+                                                        is_deeper = (
+                                                            share_n * penetration_n > shares[i_c] * penetrations[i_c]
+                                                        )
+                                                        shares[i_c] = qd.select(is_deeper, share_n, shares[i_c])
+                                                        penetrations[i_c] = qd.select(
+                                                            is_deeper, penetration_n, penetrations[i_c]
+                                                        )
+                                                        penetrations_start[i_c] = qd.select(
+                                                            is_deeper,
+                                                            rod_state.rigid_contacts.penetration_start[
+                                                                i_v_n, i_c_n, i_b
+                                                            ],
+                                                            penetrations_start[i_c],
+                                                        )
                 # The share of the penetration at the start of the substep is removed from the rod alone, the links held,
                 # each contact moving the vertex out of its geom along its normal, shared with the contacts pushing the
                 # vertex the opposite way. A vertex squeezed between geoms is not moved: it cannot leave one without going
