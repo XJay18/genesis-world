@@ -524,7 +524,7 @@ def reversed_with_atomic_sums(kernel: Callable) -> Callable:
     def backward(*args):
         kernel.grad(*args[:i_config], _rod_config_with_atomic_sums(args[i_config]), *args[i_config + 1 :])
 
-    return register_custom_backward(backward)(kernel)
+    return register_custom_backward(backward, kernel_autodiff=True)(kernel)
 
 
 @qd.func
