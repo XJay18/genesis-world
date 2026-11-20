@@ -1190,6 +1190,21 @@ Kernel.reset = _kernel_reset_with_template_args
 PerformanceDispatcher.__init__ = _perf_dispatcher_init_released_on_reset
 
 
+def qd_zerocopy_view(value: qd.Tensor | qd.Field | qd.Ndarray) -> torch.Tensor | None:
+    """Return the zero-copy view of a Quadrants field / ndarray in its native layout, None where it has none.
+
+    The view is the one 'qd_to_torch' returns without a copy, cached on the array. An array has none without zero-copy
+    support, or where Quadrants offers none for its dtype on the backend (an integer field on CPU).
+    """
+    if not gs.use_zerocopy.is_supported:
+        return None
+    # FIXME: quadrants - an array tells nothing of its own zero-copy support but by refusing the view
+    try:
+        return qd_to_torch(value, copy=False)
+    except (ValueError, RuntimeError, TypeError):
+        return None
+
+
 def qd_from_torch(value: qd.Tensor | qd.Field | qd.Ndarray, tensor: torch.Tensor) -> None:
     """Write a torch tensor into a Quadrants field / ndarray, in the native layout of the latter (see qd_to_torch).
 
@@ -1199,8 +1214,8 @@ def qd_from_torch(value: qd.Tensor | qd.Field | qd.Ndarray, tensor: torch.Tensor
     """
     if isinstance(value, qd.Tensor):
         value = value._unwrap()
-    if gs.use_zerocopy.is_supported:
-        view = qd_to_torch(value, copy=False)
+    view = qd_zerocopy_view(value)
+    if view is not None:
         # A host tensor goes to the device by chunks, as a single copy holds a staging buffer as large as the tensor,
         # which a unified-memory GPU counts as device memory
         if tensor.device.type == "cpu" and tensor.shape == view.shape and view.ndim > 0:

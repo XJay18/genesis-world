@@ -1,10 +1,11 @@
 """
-Arrays a Quadrants kernel may write, from its source.
+Arrays a Quadrants kernel may write and may read, from its source.
 
 The backward pass of a recorded substep saves the values a launch overwrites that an earlier launch reads (see
-LaunchRecorder). Quadrants records the struct members a compiled kernel uses, but not which of them it writes, so the
-writes are read from the Python source of the kernel and of the funcs it calls. The analysis over-approximates: both
-branches of a static condition count, so a write it reports may never happen, which costs a copy, never a gradient.
+LaunchRecorder). Quadrants records the struct members a compiled kernel uses, but not which of them it writes or reads,
+so the writes and the reads are found in the Python source of the kernel and of the funcs it calls. The analysis
+over-approximates: both branches of a static condition count, so a write or a read it reports may never happen, which
+costs a copy, never a gradient.
 """
 
 import ast
@@ -26,24 +27,36 @@ class Callee(NamedTuple):
     owner_path: tuple[str, ...]
 
 
-# The paths each kernel or func may write, by function and bound object, each entry living as long as the bound object
-# (the function itself for a free function)
-_WRITTEN_PATHS_CACHE = OwnedCache()
+class AccessedPaths(NamedTuple):
+    """The paths of the parameters of a kernel or a func that it may write, and those it may read."""
+
+    written: frozenset[tuple[str, ...]]
+    read: frozenset[tuple[str, ...]]
 
 
-# FIXME: quadrants#1001 - Quadrants exposes no write set of a kernel, so it is derived from the source here, which
-# duplicates the analysis of its frontend and counts both branches of a static condition.
-def get_written_paths(fn: Callable, owner: object | None = None) -> frozenset[tuple[str, ...]]:
+# The paths each kernel or func may write and read, by function and bound object, each entry living as long as the bound
+# object (the function itself for a free function)
+_ACCESSED_PATHS_CACHE = OwnedCache()
+
+# The atomic operations whose adjoint takes no value of the array they add to, which they write without reading it
+_ATOMIC_LINEAR = ("atomic_add", "atomic_sub")
+
+
+# FIXME: quadrants#1001 - Quadrants exposes no write or read set of a kernel, so they are derived from the source here,
+# which duplicates the analysis of its frontend and counts both branches of a static condition.
+def get_accessed_paths(fn: Callable, owner: object | None = None) -> AccessedPaths:
     """
-    Return the paths of the parameters of a kernel or a func that it may write.
+    Return the paths of the parameters of a kernel or a func that it may write, and those it may read.
 
     A path is the name of a parameter followed by the struct fields reaching the array, such as
     `("dyn_state", "dofs", "vel")`. A write is an assignment to an element, an augmented assignment, the first argument
-    of an atomic operation or a `fill`, in the function itself or in a func it calls with the array as argument. `owner`
-    is the object the first parameter of a method is bound to, through which it reaches the funcs of other objects.
+    of an atomic operation or a `fill`, in the function itself or in a func it calls with the array as argument. A read
+    is the load of an element, the target of an augmented assignment or the first argument of an atomic operation other
+    than an addition or a subtraction, whose adjoint takes no value of the array. `owner` is the object the first
+    parameter of a method is bound to, through which it reaches the funcs of other objects.
     """
     cache_key = (fn, id(owner))
-    paths_cached = _WRITTEN_PATHS_CACHE.find(cache_key)
+    paths_cached = _ACCESSED_PATHS_CACHE.find(cache_key)
     if paths_cached is not None:
         return paths_cached
     func_def = ast.parse(textwrap.dedent(inspect.getsource(fn))).body[0]
@@ -78,13 +91,25 @@ def get_written_paths(fn: Callable, owner: object | None = None) -> frozenset[tu
             if isinstance(target, ast.Name) and callee is not None:
                 funcs[target.id] = callee
 
-    paths_written = set()
+    paths_written, paths_read = set(), set()
+    # The element loads that are the first argument of a linear atomic operation, which writes them alone
+    loads_atomic = set()
     for node in ast.walk(func_def):
+        if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Subscript):
+            if (isinstance(node.func, ast.Attribute) and node.func.attr in _ATOMIC_LINEAR) or (
+                isinstance(node.func, ast.Name) and node.func.id in _ATOMIC_LINEAR
+            ):
+                loads_atomic.add(id(node.args[0]))
+    for node in ast.walk(func_def):
+        if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load) and id(node) not in loads_atomic:
+            paths_read |= _resolve(node.value, aliases)
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 paths_written |= _resolve_store(target, aliases)
         elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
             paths_written |= _resolve_store(node.target, aliases)
+            if isinstance(node, ast.AugAssign):
+                paths_read |= _resolve_store(node.target, aliases)
         elif isinstance(node, ast.Call):
             if isinstance(node.func, ast.Attribute):
                 name = node.func.attr
@@ -112,13 +137,20 @@ def get_written_paths(fn: Callable, owner: object | None = None) -> frozenset[tu
                     for keyword in node.keywords
                     if keyword.arg is not None
                 ]
-                callee_paths_written = get_written_paths(callee.fn, callee.owner)
+                callee_paths = get_accessed_paths(callee.fn, callee.owner)
                 for callee_param, arg_paths in bindings:
-                    for callee_path in callee_paths_written:
-                        if callee_path[0] == callee_param:
-                            paths_written |= {(*path, *callee_path[1:]) for path in arg_paths}
-    params_paths_written = frozenset([path for path in paths_written if path[0] in params])
-    return _WRITTEN_PATHS_CACHE.own(fn if owner is None else owner, cache_key, params_paths_written)
+                    for callee_paths_accessed, paths_accessed in (
+                        (callee_paths.written, paths_written),
+                        (callee_paths.read, paths_read),
+                    ):
+                        for callee_path in callee_paths_accessed:
+                            if callee_path[0] == callee_param:
+                                paths_accessed |= {(*path, *callee_path[1:]) for path in arg_paths}
+    params_paths = AccessedPaths(
+        written=frozenset([path for path in paths_written if path[0] in params]),
+        read=frozenset([path for path in paths_read if path[0] in params]),
+    )
+    return _ACCESSED_PATHS_CACHE.own(fn if owner is None else owner, cache_key, params_paths)
 
 
 def _resolve(node: ast.expr, aliases: dict[str, set[tuple[str, ...]]]) -> set[tuple[str, ...]]:

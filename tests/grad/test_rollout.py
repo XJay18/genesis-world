@@ -5,7 +5,12 @@ import numpy as np
 import pytest
 import torch
 
+import quadrants as qd
+
 import genesis as gs
+from genesis.grad.bridge import LaunchRecorder, no_grad, register_custom_backward
+from genesis.utils.data import Data, DataKind, Size, field
+from genesis.utils.misc import qd_from_torch, qd_to_torch
 
 from ..utils.assertions import assert_allclose, assert_equal
 from .utils import make_diff_scene_pair
@@ -375,3 +380,70 @@ def test_reject_non_differentiable_solvers():
             scene.add_entity(morph=box, material=material)
         with pytest.raises(gs.GenesisException, match=component_name):
             scene.build()
+
+
+@pytest.mark.required
+def test_backward_restores_the_overwrites_a_reversal_reads(tol):
+    n_values = Size("n_values")
+
+    class ChainState(Data, kind=DataKind.STATE, shape=(n_values,)):
+        x: qd.Tensor = field(float, grad=True)
+        a: qd.Tensor = field(float, grad=True)
+        y: qd.Tensor = field(float, grad=True)
+        b: qd.Tensor = field(float, grad=True)
+        z: qd.Tensor = field(float, grad=True)
+        s: qd.Tensor = field(float)
+
+    # The first launch writes 'a' and reads it back, a custom backward reads the scale 's', a launch without gradient
+    # overwrites 's', then a launch overwrites 'a' and the last one reads both. Each reversal runs at the values its
+    # launch left only if the backward pass restores both overwrites first.
+    @qd.kernel
+    def kernel_square_sine(state: ChainState):
+        for i in range(state.x.shape[0]):
+            state.a[i] = state.x[i] * state.x[i]
+        for i in range(state.y.shape[0]):
+            state.y[i] = qd.sin(state.a[i])
+
+    @qd.kernel
+    def kernel_scale_grad(state: ChainState):
+        for i in range(state.b.shape[0]):
+            state.y.grad[i] = state.y.grad[i] + state.s[i] * state.b.grad[i]
+            state.b.grad[i] = 0.0
+
+    @register_custom_backward(kernel_scale_grad)
+    @qd.kernel
+    def kernel_scale(state: ChainState):
+        for i in range(state.b.shape[0]):
+            state.b[i] = state.s[i] * state.y[i]
+
+    @no_grad
+    @qd.kernel
+    def kernel_double_scale(state: ChainState):
+        for i in range(state.s.shape[0]):
+            state.s[i] = 2.0 * state.s[i]
+
+    @qd.kernel
+    def kernel_triple(state: ChainState):
+        for i in range(state.x.shape[0]):
+            state.a[i] = 3.0 * state.x[i]
+
+    @qd.kernel
+    def kernel_add_scaled_square(state: ChainState):
+        for i in range(state.z.shape[0]):
+            state.z[i] = state.b[i] + state.s[i] * state.a[i] * state.a[i]
+
+    state = ChainState(sizes={"n_values": 5}, requires_grad=True)
+    x = torch.linspace(0.2, 1.0, 5, dtype=gs.tc_float, device=gs.device)
+    scale = torch.linspace(0.5, 1.5, 5, dtype=gs.tc_float, device=gs.device)
+    z_grad = torch.linspace(-1.0, 2.0, 5, dtype=gs.tc_float, device=gs.device)
+    qd_from_torch(state.x, x)
+    qd_from_torch(state.s, scale)
+    recorder = LaunchRecorder()
+    with recorder:
+        for kernel in (kernel_square_sine, kernel_scale, kernel_double_scale, kernel_triple, kernel_add_scaled_square):
+            kernel(state)
+    # z = s sin(x^2) + 2 s (3 x)^2
+    assert_allclose(qd_to_torch(state.z), scale * torch.sin(x * x) + 18.0 * scale * x * x, tol=tol)
+    qd_from_torch(state.z.grad, z_grad)
+    recorder.reverse()
+    assert_allclose(qd_to_torch(state.x.grad), z_grad * scale * (2.0 * x * torch.cos(x * x) + 36.0 * x), tol=tol)
