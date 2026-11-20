@@ -165,9 +165,9 @@ def test_rod_weight_follows_linear_density(show_viewer):
     for _ in range(10):
         scene.step()
     for rod, pos in zip(rods, pos_rest):
-        assert_allclose(rod.get_total_length(), length + stretch, tol=1e-12)
-        assert_allclose(rod.get_verts_pos(), pos, tol=1e-12)
-        assert_allclose(rod.get_verts_vel(), 0.0, tol=1e-10)
+        assert_allclose(rod.get_total_length(), length + stretch, tol=5e-16)
+        assert_allclose(rod.get_verts_pos(), pos, tol=1e-16)
+        assert_allclose(rod.get_verts_vel(), 0.0, tol=5e-13)
 
 
 @pytest.mark.required
