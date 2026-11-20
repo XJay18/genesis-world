@@ -22,7 +22,10 @@ class Base(Material["RodEntity"]):
         Stretching stiffness, in Pa. Zero leaves the length of the edges to the inextensibility constraint alone. A
         stiff value needs a small time step to stay stable. Default is 0.
     E : float, optional
-        Bending stiffness, in Pa. Zero disables bending. Default is 1e6.
+        Bending stiffness, in Pa. Zero disables bending. A stiff value needs a short substep: the bending stays stable
+        while E < m l^3 / (pi r^4 dt^2), with m the mass of a vertex, l the length of its edges, r the radius of the rod
+        and dt the substep. At a given linear density, halving the edges thus takes a substep four times shorter.
+        Default is 1e6.
     G : float, optional
         Twisting stiffness, in Pa, about the twist the rod is built with: an open rod is at rest untwisted, a loop at
         the twist its shape imposes on it, so that every rod starts at rest. Zero disables twisting. Default is 1e6.
