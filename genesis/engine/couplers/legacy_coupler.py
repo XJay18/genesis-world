@@ -4987,7 +4987,7 @@ def func_gather_rod_mpm_patches_exact(
         rod_state.verts.mpm_inv_mass[i_v, i_b] = 0.0
 
 
-@register_custom_backward(lambda *args: kernel_rod_mpm_gather.grad(*args))
+@register_custom_backward(lambda *args: kernel_rod_mpm_gather.grad(*args), kernel_autodiff=True)
 @qd.kernel(fastcache=True)
 def kernel_rod_mpm_gather_exact(
     mpm_state: MPMState,
@@ -5072,7 +5072,7 @@ def func_share_rod_mpm_nodes_exact(
             func_carry_free_sum_clear(3 * i_k, i_b, rod_mpm_contact.nodes_sums)
 
 
-@register_custom_backward(lambda *args: kernel_rod_mpm_share.grad(*args))
+@register_custom_backward(lambda *args: kernel_rod_mpm_share.grad(*args), kernel_autodiff=True)
 @qd.kernel(fastcache=True)
 def kernel_rod_mpm_share_exact(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
@@ -5147,7 +5147,7 @@ def func_compute_rod_mpm_inv_mass_exact(
             rod_state.verts.mpm_inv_mass[i_v, i_b] = inv_mass / rod_state.verts.mpm_mass[i_v, i_b]
 
 
-@register_custom_backward(lambda *args: kernel_rod_mpm_grid_inv_mass.grad(*args))
+@register_custom_backward(lambda *args: kernel_rod_mpm_grid_inv_mass.grad(*args), kernel_autodiff=True)
 @qd.kernel(fastcache=True)
 def kernel_rod_mpm_grid_inv_mass_exact(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo
@@ -5270,7 +5270,7 @@ def func_scatter_rod_mpm_impulse_exact(
         rod_state.verts.vel[i_v, i_b] = func_rod_mpm_vert_vel(i_v, i_b, rod_state, rod_info)
 
 
-@register_custom_backward(lambda *args: kernel_rod_mpm_scatter.grad(*args))
+@register_custom_backward(lambda *args: kernel_rod_mpm_scatter.grad(*args), kernel_autodiff=True)
 @qd.kernel(fastcache=True)
 def kernel_rod_mpm_scatter_exact(
     mpm_state: MPMState, rod_state: RodState, rod_mpm_contact: RodMPMContact, mpm_info: MPMInfo, rod_info: RodInfo

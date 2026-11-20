@@ -61,10 +61,11 @@ def step_overwrites(backend, monkeypatch):
         launches = launches_open.pop(recorder, [])
         if not launches:
             return
-        arrays_saved = {id(array) for array, _ in recorder.entries[-1].arrays_saved}
+        arrays_saved = {id(array) for array, *_ in recorder.entries[-1].arrays_saved}
         is_copying = True
         for key, (path, array, value) in values.items():
-            if key not in arrays_saved:
+            # The recorder saves an array an entry read since its last write alone, as the entry opened
+            if key not in arrays_saved and key in recorder._arrays_read:
                 value_after = qd_to_torch(array, copy=True)
                 # Entries the solver leaves at NaN compare equal to themselves
                 if value.is_floating_point():

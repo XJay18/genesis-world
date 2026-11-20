@@ -528,7 +528,7 @@ def reversed_with_atomic_sums(kernel: Callable) -> Callable:
     def backward(*args):
         kernel.grad(*args[:i_config], _rod_config_with_atomic_sums(args[i_config]), *args[i_config + 1 :])
 
-    return register_custom_backward(backward)(kernel)
+    return register_custom_backward(backward, kernel_autodiff=True)(kernel)
 
 
 @qd.func
@@ -603,12 +603,22 @@ def func_last_projection_correction(
     corrections in carry-free sums, which the vertex reads into 'dp_contact' here, the kernel applying them being the
     only one to read them.
     """
-    dp = qd.Vector.zero(gs.qd_float, 3)
     if qd.static(rod_config.has_edge_pairs):
         if qd.static(rod_config.is_deterministic):
             # A vertex moved by no contact holds empty sums and keeps its zero correction (see func_add_edge_pair_sums)
             if rod_state.verts.n_contacts[i_v, i_b] > 0:
                 rod_state.verts.dp_contact[i_v, i_b] = func_read_verts_sums(i_v, i_b, rod_state.verts.dp_contact_sums)
+    return func_taken_projection_correction(i_v, i_b, rod_state, rod_config)
+
+
+@qd.func
+def func_taken_projection_correction(
+    i_v: int, i_b: int, rod_state: RodState, rod_config: qd.template()
+) -> qd.types.vector(3):
+    """Return the correction of the position of a vertex the last projection left, its carry-free sums already read
+    (see func_last_projection_correction)."""
+    dp = qd.Vector.zero(gs.qd_float, 3)
+    if qd.static(rod_config.has_edge_pairs):
         dp = rod_state.verts.dp_contact[i_v, i_b] / qd.max(rod_state.verts.n_contacts[i_v, i_b], 1)
     else:
         dp = rod_state.verts.dp_inextensibility[i_v, i_b]
@@ -984,7 +994,13 @@ def func_project_rod_inextensibility(
             rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + func_last_projection_correction(
                 i_v, i_b, rod_state, rod_config
             )
+    func_gather_rod_inextensibility(rod_state, rod_info, project_inextensibility)
 
+
+@qd.func
+def func_gather_rod_inextensibility(rod_state: RodState, rod_info: RodInfo, project_inextensibility: qd.template()):
+    """Compute the corrections of the inextensibility constraints where `project_inextensibility` (see
+    func_project_rod_inextensibility)."""
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
         if project_inextensibility:
             rod_state.verts.dp_inextensibility[i_v, i_b] = func_gather_inextensibility(i_v, i_b, rod_state, rod_info)
@@ -995,6 +1011,22 @@ def func_project_rod_inextensibility(
 def kernel_project_rod_inextensibility(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
     """Run a projection of the inextensibility constraints (see func_project_rod_inextensibility)."""
     func_project_rod_inextensibility(rod_state, rod_info, rod_config, project_inextensibility=True)
+
+
+# FIXME: quadrants#1001 - the backward pass saves what a kernel may write by its source, both branches of a static
+# condition counted, so that the projection without carry-free sums is a kernel of its own, free of their read-back.
+# The kernel saves copies under the rule of upstream's recorder alone: the rule carried for U1 (see LaunchRecorder)
+# restores 'dp_contact' once per projection either way, since the projection reads it.
+@reversed_with_atomic_sums
+@qd.kernel(fastcache=True)
+def kernel_project_rod_inextensibility_atomic(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
+    """Run a projection of the inextensibility constraints whose contacts sum through atomics, without
+    `is_deterministic` (see func_project_rod_inextensibility)."""
+    for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
+        rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + func_taken_projection_correction(
+            i_v, i_b, rod_state, rod_config
+        )
+    func_gather_rod_inextensibility(rod_state, rod_info, project_inextensibility=True)
 
 
 @qd.func
@@ -2024,11 +2056,16 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
             kernel_integrate_rod_positions(self.rod_state, self.rod_info)
             if self.rod_config.has_broadphase:
                 kernel_update_rod_contact_candidates(self.rod_state, self.rod_info, self.data_manager.errno)
+            # See kernel_project_rod_inextensibility_atomic
+            if self.rod_config.is_deterministic:
+                kernel_inextensibility = kernel_project_rod_inextensibility
+            else:
+                kernel_inextensibility = kernel_project_rod_inextensibility_atomic
             for i_iter in range(self._n_pbd_iters):
                 if self.rod_config.has_edge_pairs:
                     kernel_project_rod_contacts(i_iter, self.rod_state, self.rod_info, self.rod_config)
                 if i_iter < self._n_pbd_iters - 1:
-                    kernel_project_rod_inextensibility(self.rod_state, self.rod_info, self.rod_config)
+                    kernel_inextensibility(self.rod_state, self.rod_info, self.rod_config)
         else:
             kernel_integrate_rod_substep(self.rod_state, self.rod_info, self.rod_config, self.data_manager.errno)
             for i_iter in range(self._n_pbd_iters):

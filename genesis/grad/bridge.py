@@ -31,13 +31,14 @@ import torch
 from torch.autograd.function import once_differentiable
 from torch.autograd.graph import increment_version
 
+import quadrants as qd
 from quadrants.lang import impl
 
 import genesis as gs
-from genesis.grad.kernel_writes import get_written_paths
+from genesis.grad.kernel_writes import get_accessed_paths
 from genesis.utils.cache import OwnedCache
 from genesis.utils.data import iter_state_arrays
-from genesis.utils.misc import qd_from_torch, qd_to_torch
+from genesis.utils.misc import qd_from_torch, qd_to_torch, qd_zerocopy_view
 
 if TYPE_CHECKING:
     from genesis.engine.solvers.base_solver import Solver
@@ -231,6 +232,10 @@ class RolloutGraph:
 # function of the kernel (see 'no_grad' and 'register_custom_backward')
 _KERNELS_BACKWARD: dict[Callable, Callable[..., None] | None] = {}
 
+# The backwards running the autodiff of their kernel, or of a variant of it, which read the arrays the kernel reads (see
+# 'register_custom_backward' and 'reversed_with')
+_KERNELS_AUTODIFF_BACKWARD: set[Callable[..., None]] = set()
+
 
 def no_grad(kernel: Callable) -> Callable:
     """
@@ -243,16 +248,22 @@ def no_grad(kernel: Callable) -> Callable:
     return kernel
 
 
-def register_custom_backward(backward: Callable[..., None]) -> Callable[[Callable], Callable]:
+def register_custom_backward(
+    backward: Callable[..., None], *, kernel_autodiff: bool = False
+) -> Callable[[Callable], Callable]:
     """
     Declare the backward reversing the launches of a kernel, which autodiff cannot derive.
 
-    The backward is called with the arguments of the launch, from the values it left (see LaunchRecorder). The tag goes
-    above the kernel decorator.
+    The backward is called with the arguments of the launch, from the values it left (see LaunchRecorder). With
+    `kernel_autodiff`, the backward runs the autodiff of the kernel, or of a variant of it computing the same values
+    from the same arrays, so that it reads the arrays the kernel reads alone, and the recorder saves no other. The tag
+    goes above the kernel decorator.
     """
 
     def decorator(kernel: Callable) -> Callable:
         _KERNELS_BACKWARD[kernel.fn] = backward
+        if kernel_autodiff:
+            _KERNELS_AUTODIFF_BACKWARD.add(backward)
         return kernel
 
     return decorator
@@ -277,13 +288,14 @@ def reversed_with(**overwrites: bool | int | float) -> Callable[[Callable], Call
             kernel.grad(*[overwrites_by_position.get(i, arg) for i, arg in enumerate(args)])
 
         _KERNELS_BACKWARD[kernel.fn] = backward
+        _KERNELS_AUTODIFF_BACKWARD.add(backward)
         return kernel
 
     return decorator
 
 
-# The arrays of the state each launch uses and those it may write, by compiled kernel and struct arguments, each entry
-# living as long as the structs
+# The arrays of the state each launch uses, those it may read and those it may write, by compiled kernel and struct
+# arguments, each entry living as long as the structs
 _LAUNCH_ARRAYS_CACHE = OwnedCache()
 
 
@@ -295,10 +307,17 @@ class LaunchRecorder:
     Every launch is one entry, reversed by the autodiff of its kernel, unless it runs in a block opened by 'entry',
     whose launches form one entry. An entry is reversed at the values it left, as the autodiff of Quadrants expects,
     then the arrays it overwrote are restored, so that every entry before it is reversed at the values it left too.
-    Before each launch, the recorder saves the arrays of the state the launch writes that an earlier entry uses: the
-    writes come from the source of the kernel (see 'get_written_paths'), narrowed to the struct members its compiled
-    form uses, and the uses of the earlier entries from their compiled form. A backward pass follows the convention of
-    autodiff, consuming the adjoint of the values a launch wrote and clearing it.
+    Before each launch, the recorder saves the arrays of the state the launch writes that an earlier entry read since
+    their last write. The writes and the reads come from the source of the kernel (see 'get_accessed_paths'), narrowed
+    to the struct members its compiled form uses. An entry reads the arrays its kernels read where autodiff reverses it
+    or a backward running the autodiff of its kernel does (see 'register_custom_backward'), every array it uses where
+    another backward does, and none without gradient. An array no entry reads after a write keeps the value of its last
+    write once the entries are reversed. A backward pass follows the convention of autodiff, consuming the adjoint of
+    the values a launch wrote and clearing it.
+
+    The arrays with a zero-copy view (see 'qd_zerocopy_view') are saved and restored through it, the launches of a
+    kernel and structs sharing the views of their arrays: a save is one copy of the view, and the restore of an entry
+    one copy of all the arrays it saved.
     """
 
     def __init__(self):
@@ -310,9 +329,12 @@ class LaunchRecorder:
         self._is_grouping = False
         # Whether the recorder is saving arrays, whose copy is a kernel launch of its own without zero-copy views
         self._is_saving = False
-        # The arrays the closed entries use, and those the open one does, by identity
-        self._arrays_used: set[int] = set()
+        # The arrays the closed entries read since their last write, and those the open entry uses, reads and writes, by
+        # identity
+        self._arrays_read: set[int] = set()
         self._arrays_used_by_entry: set[int] = set()
+        self._arrays_read_by_entry: set[int] = set()
+        self._arrays_written_by_entry: set[int] = set()
 
     def __enter__(self) -> "LaunchRecorder":
         # The recorder of the calls between two steps is entered once per call, which a warnings context allows once
@@ -341,8 +363,7 @@ class LaunchRecorder:
             if isinstance(arg, torch.Tensor) and arg.requires_grad and arg.grad is None:
                 self._tensors_without_grad.append(arg)
         if not self._is_grouping:
-            self._arrays_used |= self._arrays_used_by_entry
-            self._arrays_used_by_entry.clear()
+            self._close_entry()
             if kernel.func in _KERNELS_BACKWARD:
                 entry = RecordedEntry(
                     launches=[],
@@ -365,26 +386,55 @@ class LaunchRecorder:
         launch_arrays = _LAUNCH_ARRAYS_CACHE.find(launch_key)
         if launch_arrays is None:
             flat_names_used = kernel.used_py_dataclass_parameters_by_key_enforcing.get(key)
-            paths_written = get_written_paths(kernel.func, args[0] if kernel.is_classkernel else None)
-            arrays_used, arrays_written = set(), []
+            paths_accessed = get_accessed_paths(kernel.func, args[0] if kernel.is_classkernel else None)
+            arrays_used, arrays_read, arrays_written = set(), set(), []
             for arg_meta, arg in zip(kernel.arg_metas, args):
                 if dataclasses.is_dataclass(arg):
                     for path, array in iter_state_arrays(arg):
                         path = (arg_meta.name, *path)
                         if flat_names_used is None or "__qd_" + "__qd_".join(path) in flat_names_used:
                             arrays_used.add(id(array))
-                            if path in paths_written:
-                                arrays_written.append(array)
-            launch_arrays = (arrays_used, arrays_written)
+                            if path in paths_accessed.read:
+                                arrays_read.add(id(array))
+                            if path in paths_accessed.written:
+                                view = qd_zerocopy_view(array)
+                                arrays_written.append((array, view))
+            arrays_written_ids = {id(array) for array, _ in arrays_written}
+            launch_arrays = (arrays_used, arrays_read, arrays_written, arrays_written_ids)
             for struct in structs:
                 _LAUNCH_ARRAYS_CACHE.own(struct, launch_key, launch_arrays)
-        arrays_used, arrays_written = launch_arrays
+        arrays_used, arrays_read, arrays_written, arrays_written_ids = launch_arrays
+        # FIXME: U1 (DLO-Solver upstream issues) - the saves of the arrays read since their last write, through cached
+        # views, are carried locally until upstream changes the recorder.
         self._is_saving = True
-        for array in arrays_written:
-            if id(array) in self._arrays_used and all([array is not saved for saved, _ in entry.arrays_saved]):
-                entry.arrays_saved.append((array, qd_to_torch(array, copy=True)))
+        # FIXME: DLPack may return old values on Apple Metal if sync is not systematically called manually
+        is_sync_pending = gs.backend == gs.metal
+        for array, view in arrays_written:
+            if id(array) in self._arrays_read and all([array is not saved for saved, _, _ in entry.arrays_saved]):
+                if view is None:
+                    entry.arrays_saved.append((array, None, qd_to_torch(array, copy=True)))
+                    continue
+                if is_sync_pending:
+                    qd.sync()
+                    is_sync_pending = False
+                entry.arrays_saved.append((array, view, view.clone()))
         self._is_saving = False
         self._arrays_used_by_entry |= arrays_used
+        self._arrays_read_by_entry |= arrays_read
+        self._arrays_written_by_entry |= arrays_written_ids
+
+    def _close_entry(self) -> None:
+        """Add the arrays the open entry reads to those read since their last write, which ends for those it writes."""
+        if self.entries:
+            entry = self.entries[-1]
+            self._arrays_read -= self._arrays_written_by_entry
+            if entry.is_autodiff or entry.backward in _KERNELS_AUTODIFF_BACKWARD:
+                self._arrays_read |= self._arrays_read_by_entry
+            elif entry.backward is not None:
+                self._arrays_read |= self._arrays_used_by_entry
+        self._arrays_used_by_entry.clear()
+        self._arrays_read_by_entry.clear()
+        self._arrays_written_by_entry.clear()
 
     @contextlib.contextmanager
     def entry(self, backward: Callable[..., None] | None, *args) -> Iterator[None]:
@@ -394,8 +444,7 @@ class LaunchRecorder:
         `backward` is None for launches without gradient.
         """
         assert not self._is_grouping, "A block recording one entry cannot open inside another."
-        self._arrays_used |= self._arrays_used_by_entry
-        self._arrays_used_by_entry.clear()
+        self._close_entry()
         self.entries.append(
             RecordedEntry(launches=[], is_autodiff=False, backward=backward, backward_args=args, arrays_saved=[])
         )
@@ -407,7 +456,7 @@ class LaunchRecorder:
 
     def reverse(self, start: int = 0, stop: int | None = None) -> dict[int, torch.Tensor]:
         """
-        Run the backward pass of the entries in reverse order, which leaves the arrays as they were before them.
+        Run the backward pass of the entries in reverse order, which leaves the arrays they read as before them.
 
         `start` and `stop` bound the entries reversed, all of them by default. Returns the gradients the reversal gives
         the torch tensors tracking gradients the launches take, by identity of the tensor.
@@ -436,8 +485,12 @@ class LaunchRecorder:
                             tensors_grad[tensor_id] = leaf.grad
             elif backward is not None:
                 backward(*backward_args)
-            for array, value in arrays_saved:
-                qd_from_torch(array, value)
+            views_saved = [view for _, view, _ in arrays_saved if view is not None]
+            if views_saved:
+                torch._foreach_copy_(views_saved, [value for _, view, value in arrays_saved if view is not None])
+            for array, view, value in arrays_saved:
+                if view is None:
+                    qd_from_torch(array, value)
             is_sync_pending |= bool(arrays_saved) and gs.use_zerocopy.is_supported and gs.backend == gs.metal
         if is_sync_pending:
             torch.mps.synchronize()
@@ -447,7 +500,8 @@ class LaunchRecorder:
 class RecordedEntry(NamedTuple):
     """
     An entry of a recorded step: its launches, whether autodiff reverses them, the backward reversing them otherwise
-    (None without gradient) with its arguments, and the arrays it overwrites with their values before it.
+    (None without gradient) with its arguments, and the arrays it overwrites with their zero-copy views (None without
+    zero-copy support) and their values before it.
     """
 
     launches: list[tuple[Callable, tuple]]
