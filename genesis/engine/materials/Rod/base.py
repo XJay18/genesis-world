@@ -1,9 +1,10 @@
 import math
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import Field, StrictBool
 
 import genesis as gs
+from genesis.constants import STRUCTURE
 from genesis.typing import NonNegativeFloat, PositiveFloat
 
 from ..base import Material
@@ -74,6 +75,8 @@ class Base(Material["RodEntity"]):
         with kb the curvature binormal (2 tan(phi / 2) for a turning angle phi), kappa_rest the rest curvature, l the
         edge length and dt the substep. Default is None.
     """
+
+    structure: ClassVar[STRUCTURE] = STRUCTURE.DEFORMABLE
 
     K: NonNegativeFloat = 0.0
     E: NonNegativeFloat = 1.0e6

@@ -1099,6 +1099,20 @@ class FEMOptions(GravityMixin, TimeBasedMixin):
     vis: FEMVisOptions = Field(default_factory=FEMVisOptions)
 
 
+class RodVisOptions(Options):
+    """
+    Options configuring the markers of the rod solver, which the interactive viewer and the debug cameras draw.
+
+    Parameters
+    ----------
+    constraints : bool, optional
+        Whether to draw the vertices fixed in place or constrained to a target or a rigid link, as a point at each. Their
+        state is read back at each frame drawn. Defaults to False.
+    """
+
+    constraints: StrictBool = False
+
+
 class RodOptions(GravityMixin, TimeBasedMixin):
     """
     Options configuring the RodSolver.
@@ -1128,6 +1142,8 @@ class RodOptions(GravityMixin, TimeBasedMixin):
         it raises an error. Rods short enough for all their pairs of edges to fit it test them all at every substep,
         skipping the search for the nearby ones. A larger value allows denser piles of rods at the cost of memory.
         Defaults to 32.
+    vis : gs.options.RodVisOptions, optional
+        The markers the solver draws (see ``gs.options.RodVisOptions``).
     """
 
     damping: NonNegativeFloat = 0.0
@@ -1136,3 +1152,4 @@ class RodOptions(GravityMixin, TimeBasedMixin):
     n_pbd_iters: PositiveInt = 10
     contact_margin: PositiveFloat | None = None
     multiplier_contact_candidates: PositiveInt = 32
+    vis: RodVisOptions = Field(default_factory=RodVisOptions)
