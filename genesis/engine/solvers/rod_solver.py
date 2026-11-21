@@ -15,6 +15,16 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.entities.rod_entity import RodEntity
+from genesis.engine.render_context import (
+    CONSTRAINT_COLOR,
+    CONSTRAINT_POINT_RADIUS,
+    ArrayRef,
+    DynamicMesh,
+    Points,
+    ScopedRenderContext,
+    SegmentationKeys,
+    Shape,
+)
 from genesis.engine.solvers.rigid.data import LinksState
 from genesis.engine.state_change import StateChange, mutates
 from genesis.grad.bridge import no_grad, register_custom_backward
@@ -2394,3 +2404,179 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
     def contact_margin(self):
         """How far a vertex may move over the projections of a substep before a contact may be missed, in meters."""
         return self._contact_margin
+
+
+# ------------------------------------------------------------------------------------
+# ------------------------------------ drawing ---------------------------------------
+# ------------------------------------------------------------------------------------
+
+# The number of vertices of each ring of the tube drawn around a rod, and the number of rings of each cap closing an
+# open rod, its pole included
+ROD_TUBE_N_RADIAL = 16
+ROD_TUBE_N_CAP = 8
+# The scale of the size of the markers of the constrained vertices relative to the largest radius of the rods, larger
+# than the tube to stand out of it
+CONSTRAINED_VERTEX_SIZE_SCALE = 1.5
+
+
+class RodScopedRenderContext(ScopedRenderContext[RodSolver]):
+    """The tube drawn around each rod, and the marker of its constrained vertices, as the visual options ask.
+
+    The tube surrounds each vertex of the centerline with a ring at its radius, perpendicular to the mean tangent of its
+    edges and turned by the first director of their reference frames, so that a texture follows the twist of the rod.
+    Hemispherical caps close the ends of an open rod. The texture coordinates run around the tube and along its
+    vertices. The tube is the surface the rod collides with, which the debug views draw too.
+    """
+
+    def build(self) -> None:
+        solver = self.owner
+        n_radial, n_cap = ROD_TUBE_N_RADIAL, ROD_TUBE_N_CAP
+        # The vertices of the tubes of every rod form one array, which the rods draw through 'verts_idx' so that a
+        # renderer reads it once: a ring per vertex of the centerlines, then the rings and the pole of each cap.
+        n_cap_verts = (n_cap - 1) * n_radial + 1
+        n_ring_verts = solver.n_verts * n_radial
+        n_ends = 2 * sum(not entity.is_loop for entity in solver.entities)
+        self._verts = torch.zeros(
+            (solver.n_envs_, n_ring_verts + n_ends * n_cap_verts, 3), dtype=gs.tc_float, device=gs.device
+        )
+        # The edges before and after each vertex, the end vertices of an open rod taking their single edge for both
+        verts_edge_prev, verts_edge_next = [], []
+        edges_vert_start, edges_vert_end = [], []
+        # The vertex at each end of the open rods, and the direction of its cap along the tangent
+        ends_vert, ends_sign = [], []
+        i_radial = np.arange(n_radial)
+        shapes = []
+        for entity in solver.entities:
+            n_verts, n_edges, is_loop = entity.n_verts, entity.n_edges, entity.is_loop
+            verts_local_idx, edges_local_idx = np.arange(n_verts), np.arange(n_edges)
+            edges_vert_start.append(entity.v_start + edges_local_idx)
+            edges_vert_end.append(entity.v_start + (edges_local_idx + 1) % n_verts)
+            if is_loop:
+                verts_edge_prev.append(entity.e_start + (verts_local_idx - 1) % n_edges)
+                verts_edge_next.append(entity.e_start + verts_local_idx)
+            else:
+                verts_edge_prev.append(entity.e_start + np.maximum(verts_local_idx - 1, 0))
+                verts_edge_next.append(entity.e_start + np.minimum(verts_local_idx, n_edges - 1))
+
+            # Two triangles per quad between consecutive rings
+            rings_idx = np.arange(n_verts if is_loop else n_verts - 1)[:, None]
+            a = rings_idx * n_radial + i_radial
+            b = rings_idx * n_radial + (i_radial + 1) % n_radial
+            c = ((rings_idx + 1) % n_verts) * n_radial + i_radial
+            d = ((rings_idx + 1) % n_verts) * n_radial + (i_radial + 1) % n_radial
+            faces = [np.stack((a, b, c), -1).reshape((-1, 3)), np.stack((d, c, b), -1).reshape((-1, 3))]
+            uvs = [np.stack(np.broadcast_arrays(i_radial / n_radial, verts_local_idx[:, None]), -1).reshape((-1, 2))]
+            mesh_verts_idx = [entity.v_start * n_radial + np.arange(n_verts * n_radial)]
+            if not is_loop:
+                n_mesh_verts = n_verts * n_radial
+                for i_end, sign in ((0, -1.0), (n_verts - 1, 1.0)):
+                    mesh_verts_idx.append(n_ring_verts + len(ends_vert) * n_cap_verts + np.arange(n_cap_verts))
+                    uvs.append(np.zeros((n_cap_verts, 2)))
+                    ends_vert.append(entity.v_start + i_end)
+                    ends_sign.append(sign)
+                    # The rings of the cap, starting from the end ring of the tube, then the fan to the pole
+                    rings_start = np.concatenate(([i_end * n_radial], n_mesh_verts + np.arange(n_cap - 1) * n_radial))
+                    a = rings_start[:-1, None] + i_radial
+                    b = rings_start[:-1, None] + (i_radial + 1) % n_radial
+                    c = rings_start[1:, None] + i_radial
+                    d = rings_start[1:, None] + (i_radial + 1) % n_radial
+                    i_pole = n_mesh_verts + (n_cap - 1) * n_radial
+                    fan = np.stack((rings_start[-1] + i_radial, rings_start[-1] + (i_radial + 1) % n_radial), -1)
+                    # The winding is reversed at the start, so that the faces point outward at both ends
+                    if sign > 0.0:
+                        caps_faces = (np.stack((a, b, c), -1), np.stack((d, c, b), -1))
+                    else:
+                        caps_faces = (np.stack((a, c, b), -1), np.stack((d, b, c), -1))
+                        fan = fan[:, ::-1]
+                    faces += [cap_faces.reshape((-1, 3)) for cap_faces in caps_faces]
+                    faces.append(np.concatenate((fan, np.full((n_radial, 1), i_pole)), -1))
+                    n_mesh_verts = i_pole + 1
+            shapes.append(
+                DynamicMesh(
+                    np.concatenate(faces),
+                    entity.surface,
+                    self._verts,
+                    np.concatenate(uvs),
+                    SegmentationKeys(entity.idx, entity.idx, entity.idx),
+                    verts_idx=np.concatenate(mesh_verts_idx),
+                )
+            )
+        self._shapes = tuple(shapes)
+        self._verts_edge_prev, self._verts_edge_next, self._edges_vert_start, self._edges_vert_end = (
+            torch.as_tensor(np.concatenate(verts_idx), dtype=gs.tc_int, device=gs.device)
+            for verts_idx in (verts_edge_prev, verts_edge_next, edges_vert_start, edges_vert_end)
+        )
+        self._ends_vert = torch.tensor(ends_vert, dtype=gs.tc_int, device=gs.device)
+        self._ends_sign = torch.tensor(ends_sign, dtype=gs.tc_float, device=gs.device)
+        rings_angle = 2.0 * np.pi * i_radial / n_radial
+        caps_angle = 0.5 * np.pi * np.arange(1, n_cap) / n_cap
+        self._rings_cos, self._rings_sin, self._caps_cos, self._caps_sin = (
+            torch.as_tensor(values, dtype=gs.tc_float, device=gs.device)
+            for values in (np.cos(rings_angle), np.sin(rings_angle), np.cos(caps_angle), np.sin(caps_angle))
+        )
+
+        # The marker of the constrained vertices, drawn at every vertex and shown at those fixed or constrained
+        self._constrained_verts: Points | None = None
+        if solver.options.vis.constraints:
+            radius = qd_to_torch(solver.rod_info.verts.radius).max().item()
+            self._constrained_verts = Points(
+                ArrayRef(solver.rod_state.verts.pos),
+                radius=max(CONSTRAINT_POINT_RADIUS, CONSTRAINED_VERTEX_SIZE_SCALE * radius),
+                color=CONSTRAINT_COLOR,
+                is_active=torch.zeros((solver.n_envs_, solver.n_verts), dtype=gs.tc_bool, device=gs.device),
+            )
+
+    def update_shapes(self, envs_idx: torch.Tensor | None, view: str) -> tuple[Shape, ...]:
+        """Compute the vertices of the tubes of every rod at once in the environments asked, and return the tubes."""
+        if envs_idx is not None:
+            solver = self.owner
+            pos = qd_to_torch(solver.rod_state.verts.pos, envs_idx, transpose=True)
+            d1 = qd_to_torch(solver.rod_state.edges.d1_ref, envs_idx, transpose=True)
+            radius = qd_to_torch(solver.rod_info.verts.radius)
+            edges = pos[:, self._edges_vert_end] - pos[:, self._edges_vert_start]
+            tangents = edges / torch.linalg.norm(edges, dim=-1, keepdim=True)
+            tangents_next = tangents[:, self._verts_edge_next]
+            d1_next = d1[:, self._verts_edge_next]
+            # The mean of two nearly opposite directions is undefined, so the direction of the next edge replaces it
+            verts_tangent = tangents[:, self._verts_edge_prev] + tangents_next
+            verts_tangent = torch.where(
+                (verts_tangent**2).sum(dim=-1, keepdim=True) < 1.0, tangents_next, verts_tangent
+            )
+            verts_tangent = verts_tangent / torch.linalg.norm(verts_tangent, dim=-1, keepdim=True)
+            verts_normal = d1[:, self._verts_edge_prev] + d1_next
+            verts_normal = torch.where((verts_normal**2).sum(dim=-1, keepdim=True) < 1.0, d1_next, verts_normal)
+            verts_normal = verts_normal - (verts_normal * verts_tangent).sum(dim=-1, keepdim=True) * verts_tangent
+            verts_normal = verts_normal / torch.linalg.norm(verts_normal, dim=-1, keepdim=True)
+            verts_binormal = torch.linalg.cross(verts_tangent, verts_normal, dim=-1)
+            rings_dir = (
+                self._rings_cos[:, None] * verts_normal[..., None, :]
+                + self._rings_sin[:, None] * verts_binormal[..., None, :]
+            )
+            rings = pos[..., None, :] + radius[:, None, None] * rings_dir
+            # The caps of the open rods, each a stack of rings shrinking toward the pole along the end tangent
+            ends_pos = pos[:, self._ends_vert]
+            ends_tangent = verts_tangent[:, self._ends_vert]
+            ends_radius = radius[self._ends_vert]
+            ends_offset = self._ends_sign * ends_radius
+            caps_center = (
+                ends_pos[:, :, None] + ends_offset[:, None, None] * self._caps_sin[:, None] * ends_tangent[:, :, None]
+            )
+            caps_rings = (
+                caps_center[..., None, :]
+                + ends_radius[:, None, None, None] * self._caps_cos[:, None, None] * rings_dir[:, self._ends_vert, None]
+            )
+            poles = ends_pos + ends_offset[:, None] * ends_tangent
+            caps = torch.cat((caps_rings.flatten(2, 3), poles[:, :, None]), dim=2)
+            self._verts[envs_idx] = torch.cat((rings.flatten(1, 2), caps.flatten(1, 2)), dim=1)
+        return self._shapes
+
+    def update_markers(self, envs_idx: torch.Tensor) -> tuple[Shape, ...]:
+        if self._constrained_verts is None:
+            return ()
+        # The setters of the fixed and constrained vertices notify no change (an input of the next step, which the
+        # rollout graph records as state, see 'mutates'), so the markers follow them once a step makes them stale
+        solver = self.owner
+        is_fixed = qd_to_torch(solver.rod_state.verts.is_fixed, envs_idx, transpose=True)
+        is_constrained = qd_to_torch(solver.rod_state.verts.is_constrained, envs_idx, transpose=True)
+        self._constrained_verts.is_active[envs_idx] = torch.logical_or(is_fixed, is_constrained)
+        return (self._constrained_verts,)
