@@ -686,3 +686,113 @@ def test_parallel_envs_grad_matches_single_env(backend, show_viewer):
             else:
                 assert_allclose(pos_single, pos[i_b], tol=1e-15)
             assert_allclose(vel_single.grad, vel_ad.grad[i_b], tol=1e-15)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "default",
+        # Performance mode, as DLO-Bench runs, keeps the arrays in fields, whose adstack sizes the reverse pass bounds
+        # from the trip counts of the loops
+        pytest.param(
+            "performance",
+            marks=[pytest.mark.performance_mode(True), pytest.mark.use_deterministic_algorithms(False)],
+        ),
+    ],
+)
+def test_squeezed_neighbour_cover_grad_matches_fd(mode, backend, two_pad_gripper, ball_on_slide, show_viewer):
+    n_steps = 30
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+            gravity=(0.0, 0.0, 0.0),
+            requires_grad=True,
+        ),
+        rod_options=gs.options.RodOptions(
+            damping=0.0,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.15, -0.3, 0.2),
+            camera_lookat=(0.0, 0.0, 0.1),
+        ),
+        show_viewer=show_viewer,
+    )
+    # A rod with fixed ends squeezed at its middle vertex by held pads, and a ball pushed up into the edge after that
+    # vertex, under its point near the free vertex of the edge, which the squeezed vertex leaves to it (see
+    # 'func_project_rod_rigid_normal' in legacy_coupler.py)
+    gripper = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=two_pad_gripper,
+            pos=(0.0, 0.0, 0.1),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.6,
+        ),
+    )
+    ball = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=ball_on_slide,
+            pos=(0.017, 0.0, 0.085),
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=0.6,
+        ),
+    )
+    rod = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=7,
+            interval=0.02,
+            pos=(-0.06, 0.0, 0.1),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.001,
+            segment_radius=0.01,
+        ),
+    )
+    scene.build()
+    pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
+    lift_dof = gripper.get_joint("lift").dofs_idx_local
+    push_dof = ball.get_joint("push").dofs_idx_local
+    gripper.set_dofs_kp([1e4], lift_dof)
+    gripper.set_dofs_kv([150.0], lift_dof)
+
+    rng = np.random.default_rng(0)
+    weights = torch.tensor(rng.standard_normal((7, 3)), dtype=gs.tc_float, device=gs.device)
+    inputs = dict(
+        vel=torch.tensor(0.01 * rng.standard_normal((7, 3)), dtype=gs.tc_float, device=gs.device),
+        push=torch.tensor([10.0], dtype=gs.tc_float, device=gs.device),
+    )
+
+    def rollout(vel, push):
+        scene.reset()
+        rod.set_verts_fixed(True, verts_idx_local=[0, 6])
+        gripper.set_dofs_position(np.full(2, 0.005 - 1e-5), pads_dof)
+        gripper.control_dofs_force([20.0, 20.0], pads_dof)
+        gripper.control_dofs_position([0.0], lift_dof)
+        ball.control_dofs_force(push, push_dof)
+        rod.set_velocity(vel)
+        for _ in range(n_steps):
+            scene.step()
+        return (rod.get_verts_pos() * weights).sum() + 10.0 * ball.get_pos()[2]
+
+    inputs_ad = {name: value.clone().requires_grad_() for name, value in inputs.items()}
+    rollout(**inputs_ad).backward()
+
+    # Directional derivatives along a random direction, each with the step and the tolerance (relative to the finite
+    # difference) its measured floor sets
+    rng = np.random.default_rng(1)
+    steps_and_tols = {"vel": (3e-5, 1e-8), "push": (1e-3, 1e-9)}
+    for name, value in inputs.items():
+        direction = torch.tensor(rng.standard_normal(value.shape), dtype=gs.tc_float, device=gs.device)
+        eps, tol = steps_and_tols[name]
+        with torch.no_grad():
+            loss_plus = rollout(**{**inputs, name: value + eps * direction})
+            loss_minus = rollout(**{**inputs, name: value - eps * direction})
+        grad_fd = (loss_plus - loss_minus) / (2.0 * eps)
+        grad_ad = (inputs_ad[name].grad * direction).sum()
+        assert abs(grad_ad - grad_fd) <= tol * abs(grad_fd), name
