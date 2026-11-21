@@ -137,11 +137,11 @@ def test_rod_tube_renders_at_rod(show_viewer):
             )
             dist = np.linalg.norm(points[:, None] - (edges_start + t[..., None] * edges_vec), axis=-1).min(axis=-1)
             assert len(points) > 0
-            assert ((dist > 0.85 * RADIUS) & (dist < 1.15 * RADIUS)).all()
+            assert ((dist > 0.95 * RADIUS) & (dist < 1.05 * RADIUS)).all()
         # The tube is as wide as the rod: the straight rod spans its diameter across the image, seen from its distance
         if not rod.is_loop:
             focal = 0.5 * CAM_RES[1] / np.tan(0.5 * np.deg2rad(FOV))
             width = 2.0 * RADIUS * focal / np.sqrt(CAMERA_DIST**2 - RADIUS**2)
             for i_b in range(scene.n_envs):
                 mask = seg[i_b] == seg_idx[rod.idx]
-                assert abs(mask[:, CAM_RES[0] // 2].sum() - width) < 2.0
+                assert abs(mask[:, CAM_RES[0] // 2].sum() - width) < 1.0
