@@ -680,12 +680,15 @@ def test_parallel_envs_grad_matches_single_env(backend, show_viewer):
         loss.backward()
         for pos, pos_single, vel_ad, vel_single in zip(rods_pos, rods_pos_single, vels_ad, vels_single):
             # The atomic sums of the contacts, of the rod-MPM transfers and of the rigid corrections may take another
-            # order on GPU, which leaves rounding in the positions and the gradients. The CPU runs them in a fixed order
+            # order on GPU, and with fields the two scenes run kernels compiled for their own shapes, which the GPU
+            # compiler may round differently. Both leave rounding in the positions and the gradients. The CPU runs the
+            # sums in a fixed order
             if gs.backend == gs.cpu:
                 assert_equal(pos_single, pos[i_b])
+                assert_allclose(vel_single.grad, vel_ad.grad[i_b], tol=1e-15)
             else:
-                assert_allclose(pos_single, pos[i_b], tol=1e-15)
-            assert_allclose(vel_single.grad, vel_ad.grad[i_b], tol=1e-15)
+                assert_allclose(pos_single, pos[i_b], tol=1e-14)
+                assert_allclose(vel_single.grad, vel_ad.grad[i_b], tol=5e-14)
 
 
 @pytest.mark.required
