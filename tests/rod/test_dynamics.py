@@ -525,6 +525,9 @@ def test_vertex_constraints_reset_with_state(show_viewer):
         rod_options=gs.options.RodOptions(
             damping=10.0,
             angular_damping=5.0,
+            vis=gs.options.RodVisOptions(
+                constraints=True,
+            ),
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(0.5, -1.2, 0.6),
@@ -621,6 +624,12 @@ def test_vertex_constraints_reset_with_state(show_viewer):
     assert (box.get_pos()[:, 2] < box_pos_init[:, 2] - 1e-3).all()
     verts_pos = gu.transform_by_trans_quat(verts_offset, box.get_pos(), box.get_quat())
     assert_allclose(rods[1].get_verts_pos()[:, 19], verts_pos, tol=gs.EPS)
+
+    # The marker of the constrained vertices stands at every vertex of the rods, shown at those fixed or constrained in
+    # each environment
+    (constrained_points,) = scene.sim.render_context.get_markers()
+    assert_allclose(constrained_points.pos, torch.cat([rod.get_verts_pos() for rod in rods], dim=-2), tol=gs.EPS)
+    assert_equal(constrained_points.is_active, torch.cat([rod.get_verts_kinematic() for rod in rods], dim=-1))
 
 
 @pytest.mark.required
