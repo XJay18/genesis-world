@@ -9,6 +9,8 @@ from genesis.utils.misc import qd_from_torch, tensor_to_array
 
 from ..utils.assertions import assert_allclose
 
+pytestmark = [pytest.mark.precision("64")]
+
 
 @pytest.mark.required
 @pytest.mark.parametrize("is_loop", [False, True])
