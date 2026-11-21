@@ -2573,6 +2573,8 @@ class RodScopedRenderContext(ScopedRenderContext[RodSolver]):
     def update_markers(self, envs_idx: torch.Tensor) -> tuple[Shape, ...]:
         if self._constrained_verts is None:
             return ()
+        # The setters of the fixed and constrained vertices notify no change (an input of the next step, which the
+        # rollout graph records as state, see 'mutates'), so the markers follow them once a step makes them stale
         solver = self.owner
         is_fixed = qd_to_torch(solver.rod_state.verts.is_fixed, envs_idx, transpose=True)
         is_constrained = qd_to_torch(solver.rod_state.verts.is_constrained, envs_idx, transpose=True)

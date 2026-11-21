@@ -1107,7 +1107,8 @@ class RodVisOptions(Options):
     ----------
     constraints : bool, optional
         Whether to draw the vertices fixed in place or constrained to a target or a rigid link, as a point at each. Their
-        state is read back at each frame drawn. Defaults to False.
+        state is read back at each frame drawn, and a vertex fixed, constrained or released shows as such from the next
+        step. Defaults to False.
     """
 
     constraints: StrictBool = False
