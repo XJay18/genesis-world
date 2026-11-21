@@ -5,7 +5,7 @@ import trimesh
 
 import genesis as gs
 from genesis.engine.solvers.rod_solver import ROD_TUBE_N_RADIAL
-from genesis.utils.misc import qd_from_torch, tensor_to_array
+from genesis.utils.misc import tensor_to_array
 
 from ..utils.assertions import assert_allclose
 
@@ -13,29 +13,29 @@ pytestmark = [pytest.mark.precision("64")]
 
 
 @pytest.mark.required
-@pytest.mark.parametrize("is_loop", [False, True])
-def test_tube_mesh_around_centerline(is_loop, show_viewer):
+@pytest.mark.parametrize("shape", ["straight", "loop", "hairpin"])
+def test_tube_mesh_around_centerline(shape, show_viewer):
     n_verts, radius = 12, 0.01
     angles = 2.0 * np.pi * np.arange(n_verts) / n_verts
-    if is_loop:
+    if shape == "loop":
         verts = 0.1 * np.stack([np.cos(angles), np.sin(angles), np.zeros(n_verts)], axis=-1)
-    else:
+    elif shape == "straight":
         verts = np.stack([0.01 * np.arange(n_verts), np.zeros(n_verts), 0.002 * np.sin(angles)], axis=-1)
-    edges = np.roll(verts, -1, axis=0) - verts
-    if not is_loop:
-        edges = edges[:-1]
-    # Directors perpendicular to the edges and turning by pi from one edge to the next, so that the directors of the
-    # two edges of every vertex are opposite
-    d1 = np.cross(edges, (0.0, 0.0, 1.0))
-    d1 /= np.linalg.norm(d1, axis=-1, keepdims=True)
-    d1[1::2] *= -1.0
+    else:
+        # The rod folds back by 150 degrees at its sixth vertex, in the plane of the first director of its edges (along
+        # z for a rod built along x), so that both the tangents and the directors of the two edges of that vertex are
+        # nearly opposite
+        fold_dir = np.array((np.cos(np.deg2rad(150.0)), 0.0, np.sin(np.deg2rad(150.0))))
+        verts = np.zeros((n_verts, 3))
+        verts[:6, 0] = 0.01 * np.arange(6)
+        verts[6:] = verts[5] + 0.01 * np.arange(1, n_verts - 5)[:, None] * fold_dir
 
     scene = gs.Scene(
         show_viewer=show_viewer,
     )
     rod = scene.add_entity(
         morph=gs.morphs.ParameterizedRod(
-            type="circle" if is_loop else "rod",
+            type="circle" if shape == "loop" else "rod",
             n_vertices=n_verts,
             radius=0.1,
             interval=0.01,
@@ -46,11 +46,7 @@ def test_tube_mesh_around_centerline(is_loop, show_viewer):
     )
     scene.build()
     rod.set_verts_pos(verts)
-    solver = scene.sim.rod_solver
-    # The directors are written in place, which no setter of the rod accepts, so the tube is refreshed by hand
-    qd_from_torch(solver.rod_state.edges.d1_ref, torch.as_tensor(d1[:, None], dtype=gs.tc_float, device=gs.device))
-    scene.sim.render_context.invalidate()
-    (tube,) = solver.render_context.get_shapes()
+    (tube,) = scene.sim.rod_solver.render_context.get_shapes()
     mesh_verts = tensor_to_array(tube.verts[0, tube.verts_idx])
     mesh = trimesh.Trimesh(mesh_verts, tensor_to_array(tube.faces), process=False)
 
