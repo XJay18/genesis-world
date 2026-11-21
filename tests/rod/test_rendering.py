@@ -22,13 +22,11 @@ def test_tube_mesh_around_centerline(shape, show_viewer):
     elif shape == "straight":
         verts = np.stack([0.01 * np.arange(n_verts), np.zeros(n_verts), 0.002 * np.sin(angles)], axis=-1)
     else:
-        # The rod folds back by 150 degrees at its sixth vertex, in the plane of the first director of its edges (along
-        # z for a rod built along x), so that both the tangents and the directors of the two edges of that vertex are
-        # nearly opposite
-        fold_dir = np.array((np.cos(np.deg2rad(150.0)), 0.0, np.sin(np.deg2rad(150.0))))
+        # The rod folds back onto itself at its sixth vertex, whose two edges have exactly opposite tangents (the
+        # positions are multiples of a power of two)
         verts = np.zeros((n_verts, 3))
-        verts[:6, 0] = 0.01 * np.arange(6)
-        verts[6:] = verts[5] + 0.01 * np.arange(1, n_verts - 5)[:, None] * fold_dir
+        verts[:6, 0] = np.arange(6) / 64.0
+        verts[6:, 0] = verts[5, 0] - np.arange(1, n_verts - 5) / 64.0
 
     scene = gs.Scene(
         show_viewer=show_viewer,
