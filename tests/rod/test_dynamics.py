@@ -1066,7 +1066,7 @@ def test_rod_mpm_contact_does_not_overshoot_at_any_mass(show_viewer):
     for rod in rods:
         vel_z = rod.get_verts_vel()[:, 2]
         assert (vel_z < 0.0).all()
-        assert vel_z.max() > -0.99
+        assert vel_z.mean() > -0.9
 
 
 @pytest.mark.required
@@ -1688,18 +1688,20 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
                 for gripper, rod, held_weight in zip(grippers, rods_grasped, held_weights)
             ]
         )
-        # The capsules rest on the edge of the plate and on the post, the axis of the rods a radius away from them, and
-        # the rod dropped at 1 m/s onto the other post is stopped at its surface
-        for rod, center, clearance, penetration_max in (
-            (rod_on_plate, (0.0, 0.2), radius, 1e-4),
-            (rod_on_post, (0.3, 0.1), radius + post_radius, 1e-4),
-            (rod_dropped, (0.45, 0.1), radius + post_radius, 5e-5),
+        # The capsules rest on the edge of the plate and on the post, the axis of the rods a radius away from them once
+        # they landed, and the rod dropped at 1 m/s onto the other post is stopped at its surface
+        for rod, center, clearance, penetration_max, is_resting in (
+            (rod_on_plate, (0.0, 0.2), radius, 1e-4, True),
+            (rod_on_post, (0.3, 0.1), radius + post_radius, 1e-4, True),
+            (rod_dropped, (0.45, 0.1), radius + post_radius, 5e-5, False),
         ):
             verts_pos = tensor_to_array(rod.get_verts_pos())
             t = np.linspace(0.0, 1.0, 101)[:, None]
             axis_pos = verts_pos[:, :-1, None] + t * (verts_pos[:, 1:, None] - verts_pos[:, :-1, None])
-            axis_pos = axis_pos[..., ::2]
-            assert np.linalg.norm(axis_pos - center, axis=-1).min() > clearance - penetration_max
+            axis_dist = np.linalg.norm(axis_pos[..., ::2] - center, axis=-1).min(axis=(1, 2))
+            assert (axis_dist > clearance - penetration_max).all()
+            if is_resting and i_step >= n_close_steps:
+                assert (axis_dist < clearance + 5e-6).all()
         # The penetration of the edges of the held vertex of the drooping rope into the lower pad
         verts_pos = tensor_to_array(rod_drooping.get_verts_pos())[:, 4:7]
         axis_pos = verts_pos[:, :-1, None] + t * (verts_pos[:, 1:, None] - verts_pos[:, :-1, None])
@@ -2274,11 +2276,15 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
     # The pads press the vertex onto the box with the force of their carriage, and their friction holds it there. The
     # box, held by the ground, stops the vertex at its surface, however light it is: the contact sees it through the
     # ground holding it
-    assert np.max(depth) < 5e-4
+    depth = np.array(depth).reshape((n_steps, len(pressed), -1))
+    assert depth.max() < 5e-4
+    # Once the pads pressed it down, the vertex stays on the box
+    assert depth[n_settle_steps:].min() > -1e-4
     assert np.linalg.norm(held_slip, axis=-1).max() < 1e-6
     # The squeezed vertex leaves the point of the edge to the free vertex, whose contact with the ball, its sphere, pushes
-    # the point out too: the ball stops near the surface of the rod
+    # the point out too: the ball stops at the surface of the rod, touching it
     assert np.max(edge_depth) < 5e-4
+    assert np.min(edge_depth) > 0.0
     # The response the contacts read equals the one over every row to the rounding of the sums
     assert response_err
     assert np.max(response_err) < 5e-15
