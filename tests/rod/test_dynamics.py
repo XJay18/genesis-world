@@ -2449,6 +2449,53 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
 
 
 @pytest.mark.required
+def test_rod_rigid_friction_sticks_where_rod_is_placed(show_viewer):
+    radius, shift, n_steps = 0.005, 0.05, 2
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.1, -0.3, 0.2),
+            camera_lookat=(0.05, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=1.0,
+        ),
+    )
+    rope = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=11,
+            interval=0.02,
+            pos=(-0.1, 0.0, radius),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=radius,
+        ),
+    )
+    scene.build(n_envs=2)
+    # The rope of the second environment is moved along the ground before it lands, the one of the first once it sticks
+    # to the ground, which leaves the two at the same place
+    verts_pos = rope.get_verts_pos()
+    verts_pos[:, :, 0] += shift
+    rope.set_verts_pos(verts_pos[1:], envs_idx=[1])
+    for _ in range(n_steps):
+        scene.step()
+    verts_pos = rope.get_verts_pos()
+    verts_pos[:, :, 0] += shift
+    rope.set_position(verts_pos[:1], envs_idx=[0])
+    scene.step()
+    # The moved rope sticks where it was placed, as the other one does
+    assert_allclose(rope.get_verts_pos()[0], rope.get_verts_pos()[1], tol=gs.EPS)
+
+
+@pytest.mark.required
 def test_rod_rests_on_supported_rigid_link(show_viewer):
     radius, n_steps = 0.005, 300
     scene = gs.Scene(

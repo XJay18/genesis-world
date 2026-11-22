@@ -1611,6 +1611,7 @@ def kernel_set_rod_verts_vector(
     envs_idx: qd.types.ndarray(),
     values: qd.types.ndarray(),
     rod_state: RodState,
+    rod_config: qd.template(),
     is_pos: qd.template(),
 ):
     for i_v_, i_b_ in qd.ndrange(verts_idx.shape[1], envs_idx.shape[0]):
@@ -1618,6 +1619,9 @@ def kernel_set_rod_verts_vector(
         i_b = envs_idx[i_b_]
         # The earlier occurrences of a repeated vertex are -1 (see 'drop_repeated_index')
         if i_v >= 0:
+            # A vertex moved elsewhere sticks where it lands, rather than to the points of the geoms it stuck to
+            if qd.static(is_pos and rod_config.has_rigid_contacts):
+                rod_state.rigid_anchors.n_anchors[i_v, i_b] = 0
             for j in qd.static(range(3)):
                 if qd.static(is_pos):
                     rod_state.verts.pos[i_v, i_b][j] = values[i_b_, i_v_, j]
@@ -2152,7 +2156,8 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         Set the position of some vertices of the rods.
 
         The reference frames of the edges follow their new tangents by parallel transport, so that the twist of the
-        rods is preserved.
+        rods is preserved. A vertex moved on a rigid geom sticks to it where it lands, its friction forgetting where it
+        stuck before.
 
         Parameters
         ----------
@@ -2167,7 +2172,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         pos, verts_idx, envs_idx = self._sanitize_io_variables(
             pos, verts_idx, self.n_verts, "verts_idx", envs_idx, (3,), batched_idx=True
         )
-        kernel_set_rod_verts_vector(verts_idx, envs_idx, pos, self.rod_state, is_pos=True)
+        kernel_set_rod_verts_vector(verts_idx, envs_idx, pos, self.rod_state, self.rod_config, is_pos=True)
         kernel_transport_rod_frames(envs_idx, self.rod_state, self.rod_info)
         kernel_commit_rod_frames(envs_idx, self.rod_state)
         self.clear_errno(envs_idx)
@@ -2184,7 +2189,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         vel, verts_idx, envs_idx = self._sanitize_io_variables(
             vel, verts_idx, self.n_verts, "verts_idx", envs_idx, (3,), batched_idx=True
         )
-        kernel_set_rod_verts_vector(verts_idx, envs_idx, vel, self.rod_state, is_pos=False)
+        kernel_set_rod_verts_vector(verts_idx, envs_idx, vel, self.rod_state, self.rod_config, is_pos=False)
         self.clear_errno(envs_idx)
 
     @gs.assert_built
