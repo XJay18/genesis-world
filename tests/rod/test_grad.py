@@ -697,8 +697,8 @@ def test_parallel_envs_grad_matches_single_env(backend, show_viewer):
     "mode",
     [
         "default",
-        # Performance mode, as DLO-Bench runs, keeps the arrays in fields, whose adstack sizes the reverse pass bounds
-        # from the trip counts of the loops
+        # Performance mode keeps the arrays in fields, whose adstack sizes the reverse pass bounds from the trip counts
+        # of the loops
         pytest.param(
             "performance",
             marks=[pytest.mark.performance_mode(True), pytest.mark.use_deterministic_algorithms(False)],

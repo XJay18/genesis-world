@@ -21,6 +21,10 @@ def main():
         # Without damping, the rods would swing for a long time before settling
         rod_options=gs.options.RodOptions(
             damping=2.0,
+            # Draw a point at each fixed vertex, the two clamping the end of each rod
+            vis=gs.options.RodVisOptions(
+                constraints=True,
+            ),
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(0.4, -1.1, 0.6),
