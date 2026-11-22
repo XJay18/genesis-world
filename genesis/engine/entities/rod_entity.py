@@ -113,16 +113,17 @@ class RodEntity(Entity):
 
     def set_position(self, pos, envs_idx=None):
         """
-        Set the position of every vertex of the rod, or of the center of its vertices, each keeping its initial offset.
+        Set the position of every vertex of the rod, or place the rod in its initial shape around a given center.
 
         A value whose next-to-last dimension has one entry per vertex, shape ([M,] n_verts, 3), sets every vertex, also
         when the number of environments equals the number of vertices. Any other value, shape (3,), (M, 3) or (M, 1, 3),
-        places the center, (M, 1, 3) being unambiguous whatever the number of vertices.
+        is the mean position of the vertices, around which they take their initial positions, (M, 1, 3) being
+        unambiguous whatever the number of vertices. The twist of the edges is kept (see 'set_verts_pos').
 
         Parameters
         ----------
         pos : array_like, shape ([M,] [n_verts | 1,] 3)
-            The positions of the vertices, or of their center.
+            The positions of the vertices, or their mean position, in meters.
         envs_idx : None | int | array_like, shape (M,), optional
             The indices of the environments to set. If None, all environments will be considered. Defaults to None.
         """
@@ -142,7 +143,7 @@ class RodEntity(Entity):
         Parameters
         ----------
         vel : array_like, shape ([M,] [n_verts | 1,] 3)
-            The velocities of the vertices, or the one they share.
+            The velocities of the vertices, or the one they share, in m/s.
         envs_idx : None | int | array_like, shape (M,), optional
             The indices of the environments to set. If None, all environments will be considered. Defaults to None.
         """
@@ -160,10 +161,12 @@ class RodEntity(Entity):
         """
         Set the position of some vertices.
 
+        The reference frames of the edges follow their new directions, so that the twist of the rod is kept.
+
         Parameters
         ----------
         poss : array_like, shape ([M,] [N,] 3)
-            Target position of each vertex.
+            The position of each vertex, in meters.
         verts_idx_local : None | int | array_like, shape ([M,] N)
             Index of the vertices relative to this entity, once for every environment or one row per environment. If
             None, all vertices will be considered. Defaults to None.
@@ -175,7 +178,7 @@ class RodEntity(Entity):
 
     @gs.assert_built
     def set_verts_vel(self, vels, verts_idx_local=None, envs_idx=None):
-        """Set the velocity of some vertices (see 'set_verts_pos')."""
+        """Set the velocity of some vertices, in m/s (see 'set_verts_pos' for the arguments)."""
         verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True, batched_idx=True)
         self._solver.set_verts_vel(vels, verts_idx, envs_idx)
 
@@ -195,7 +198,7 @@ class RodEntity(Entity):
         Returns
         -------
         poss : torch.Tensor, shape ([M,] N, 3)
-            The position of each vertex.
+            The position of each vertex, in meters.
         """
         verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True)
         return self._solver.get_verts_pos(verts_idx, envs_idx)
@@ -208,14 +211,26 @@ class RodEntity(Entity):
         Returns
         -------
         vels : torch.Tensor, shape ([M,] N, 3)
-            The velocity of each vertex.
+            The velocity of each vertex, in m/s.
         """
         verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True)
         return self._solver.get_verts_vel(verts_idx, envs_idx)
 
     @gs.assert_built
     def set_edges_theta(self, theta, edges_idx_local=None, envs_idx=None):
-        """Set the twist angle of the material frame of some edges about their tangent, in radians."""
+        """
+        Set the twist angle of the material frame of some edges about their tangent, in radians.
+
+        Parameters
+        ----------
+        theta : float | array_like, shape ([M,] [N,])
+            The twist angle of each edge.
+        edges_idx_local : None | int | array_like, shape ([M,] N), optional
+            Index of the edges relative to this entity, once for every environment or one row per environment. If None,
+            all edges will be considered. Defaults to None.
+        envs_idx : None | int | array_like, shape (M,), optional
+            The indices of the environments to set. If None, all environments will be considered. Defaults to None.
+        """
         edges_idx = self._get_global_idx(edges_idx_local, self.n_edges, self._e_start, unsafe=True, batched_idx=True)
         self._solver.set_edges_theta(theta, edges_idx, envs_idx)
 
@@ -257,17 +272,24 @@ class RodEntity(Entity):
 
     @gs.assert_built
     def get_stretching_stiffness(self, envs_idx=None):
-        """Get the stretching stiffness of the rod in some environments, in Pa."""
+        """
+        Get the stretching stiffness of the rod in some environments, in Pa.
+
+        Returns
+        -------
+        stiffness : torch.Tensor, shape ([M,])
+            The stiffness in each environment.
+        """
         return self._solver.get_rods_stiffness(self._rod_idx, envs_idx, kind=0)[..., 0]
 
     @gs.assert_built
     def get_bending_stiffness(self, envs_idx=None):
-        """Get the bending stiffness of the rod in some environments, in Pa."""
+        """Get the bending stiffness of the rod in some environments, in Pa (see 'get_stretching_stiffness')."""
         return self._solver.get_rods_stiffness(self._rod_idx, envs_idx, kind=1)[..., 0]
 
     @gs.assert_built
     def get_twisting_stiffness(self, envs_idx=None):
-        """Get the twisting stiffness of the rod in some environments, in Pa."""
+        """Get the twisting stiffness of the rod in some environments, in Pa (see 'get_stretching_stiffness')."""
         return self._solver.get_rods_stiffness(self._rod_idx, envs_idx, kind=2)[..., 0]
 
     @gs.assert_built
@@ -292,7 +314,7 @@ class RodEntity(Entity):
     @gs.assert_built
     def get_verts_kinematic(self, verts_idx_local=None, envs_idx=None):
         """
-        Get whether some vertices move kinematically, fixed or constrained (see 'RodSolver.get_verts_kinematic').
+        Get whether some vertices move kinematically, fixed or constrained to a target.
 
         Parameters
         ----------
@@ -300,6 +322,11 @@ class RodEntity(Entity):
             Index of the vertices relative to this entity (see 'set_verts_pos').
         envs_idx : None | int | array_like, shape (M,), optional
             The indices of the environments to read. If None, all environments will be considered. Defaults to None.
+
+        Returns
+        -------
+        is_kinematic : torch.Tensor, shape ([M,] N)
+            Whether each vertex is fixed or constrained, in each environment.
         """
         verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True, batched_idx=True)
         return self._solver.get_verts_kinematic(verts_idx, envs_idx)
@@ -317,9 +344,11 @@ class RodEntity(Entity):
         verts_idx_local : None | int | array_like, shape ([M,] N)
             Index of the vertices relative to this entity (see 'set_verts_pos').
         target_poss : None | array_like, shape ([M,] [N,] 3), optional
-            Target position of each vertex. If None, the current positions are used. Defaults to None.
+            Target position of each vertex in the world frame, in meters. If None, the current positions are used.
+            Defaults to None.
         link : RigidLink, optional
-            The rigid link the vertices follow, keeping their offset to it. Defaults to None.
+            The rigid link the vertices follow, keeping the offset of their targets to the link at the time of the call.
+            If None, the targets stay in place. Defaults to None.
         envs_idx : None | int | array_like, shape (M,), optional
             The indices of the environments to set. If None, all environments will be considered. Defaults to None.
         """
@@ -338,15 +367,22 @@ class RodEntity(Entity):
     @gs.assert_built
     def get_verts_contact_geom_idx(self, verts_idx_local=None, envs_idx=None):
         """
-        Get a rigid geom each vertex penetrated during the last step, -1 for none (see
-        'RodSolver.get_verts_contact_geom_idx').
+        Get a rigid geom each vertex penetrated during the last step, -1 for none.
+
+        See 'RodSolver.get_verts_contact_geom_idx' for the geom reported. It raises an exception in a scene where the
+        rods collide with no rigid geom.
 
         Parameters
         ----------
         verts_idx_local : None | int | array_like, shape (N,)
-            Index of the vertices relative to this entity. If None, all vertices will be considered.
+            Index of the vertices relative to this entity. If None, all vertices will be considered. Defaults to None.
         envs_idx : None | int | array_like, shape (M,), optional
             The indices of the environments to read. If None, all environments will be considered. Defaults to None.
+
+        Returns
+        -------
+        geom_idx : torch.Tensor, shape ([M,] N)
+            The global index of the geom, in each environment.
         """
         verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True)
         return self._solver.get_verts_contact_geom_idx(verts_idx, envs_idx)

@@ -20,16 +20,17 @@ class Base(Material["RodEntity"]):
     Parameters
     ----------
     K : float, optional
-        Stretching stiffness, in Pa. Zero leaves the length of the edges to the inextensibility constraint alone. A
-        stiff value needs a small time step to stay stable. Default is 0.
+        Stretching stiffness, the Young's modulus of the rod in tension, in Pa. Zero leaves the length of the edges to
+        the inextensibility constraint alone. A stiff value needs a short substep to stay stable. Default is 0.
     E : float, optional
-        Bending stiffness, in Pa. Zero disables bending. A stiff value needs a short substep: the bending stays stable
-        while E < m l^3 / (pi r^4 dt^2), with m the mass of a vertex, l the length of its edges, r the radius of the rod
-        and dt the substep. At a given linear density, halving the edges thus takes a substep four times shorter.
-        Default is 1e6.
+        Bending stiffness, the Young's modulus of the rod in bending, in Pa. Zero disables bending. A stiff value needs
+        a short substep: the bending stays stable while E < m l^3 / (pi r^4 dt^2), with m the mass of a vertex, l the
+        length of its edges, r the radius of the rod and dt the substep. At a given linear density, halving the edges
+        thus takes a substep four times shorter. Default is 1e6.
     G : float, optional
-        Twisting stiffness, in Pa, about the twist the rod is built with: an open rod is at rest untwisted, a loop at
-        the twist its shape imposes on it, so that every rod starts at rest. Zero disables twisting. Default is 1e6.
+        Twisting stiffness, the shear modulus of the rod, in Pa, about the twist the rod is built with: an open rod is
+        at rest untwisted, a loop at the twist its shape imposes on it, so that every rod starts at rest. Zero disables
+        twisting. Default is 1e6.
     plastic_yield : float, optional
         Curvature beyond which bending deforms the rest shape permanently, in 1/m: the bend of the rod away from its
         rest shape, measured at each vertex as the curvature binormal |kb| = 2 tan(phi / 2) of the turning angle phi
@@ -37,11 +38,17 @@ class Base(Material["RodEntity"]):
         the shape it is bent into, as a wire does, at the cost of a rest shape that drifts with every sharp bend.
         Infinity keeps the rod elastic. Default is infinity.
     plastic_creep : float, optional
-        Rate at which the rest curvature moves toward the curvature beyond the yield, per substep. Default is 1.
+        How fast the rest shape follows a bend beyond the yield. At each substep, the rest curvature at a vertex bent
+        beyond the yield moves toward its curvature by this value times the fraction 1 - (yield / bend)^2 of their
+        difference. A value of 1 at most keeps the rest curvature between its previous value and the curvature. A
+        smaller value spreads the plastic flow over more substeps, so that the rod holds a quick bend more elastically.
+        Default is 1.
     static_friction : float, optional
-        Static friction coefficient of the contacts between rods. Default is 0.3.
+        Static friction coefficient of the contacts between rods, a pair of edges in contact taking the mean of the
+        coefficients of its four vertices. The contacts with rigid geoms take the friction of the geom instead
+        ('coup_friction' of its material). Default is 0.3.
     kinetic_friction : float, optional
-        Kinetic friction coefficient of the contacts between rods. Default is 0.25.
+        Kinetic friction coefficient of the contacts between rods, averaged as 'static_friction'. Default is 0.25.
     restitution : float, optional
         Coefficient of restitution of the collisions of the rod with MPM materials, from 0 (the normal velocities
         equalize) to 1 (they bounce back elastically). Default is 0.
@@ -62,14 +69,17 @@ class Base(Material["RodEntity"]):
         their rest length: the rod weighs its linear density times its length, whatever its number of vertices. None
         gives every vertex the mass 'segment_mass', which cannot be set with it. Default is None.
     segment_radius : float, optional
-        Radius of the rod, in m. Default is 0.01.
+        Radius of the rod, in m: the radius of the capsules its edges collide with and of the tube it is drawn as. The
+        stiffnesses act through the cross-section of the rod, its area pi r^2 in stretching, its second moment of area
+        pi r^4 / 4 in bending and its polar moment pi r^4 / 2 in twisting, so that a thicker rod is stiffer at the same
+        moduli. Default is 0.01.
     twist_inertia : float or None, optional
         Rotational inertia of each edge about its tangent, in kg m^2, which sets how fast the twist follows its energy
         and how much angular momentum the spin of the edges holds. None takes the inertia of a solid cylinder of the
         mass of the edge (the mean of its two vertex masses) and the radius of the rod, m r^2 / 2. A larger value slows
         the twist, which then lags the bending and takes angular momentum from the vertices, so that a spinning rod
         slows down. Where the substep is too long to integrate the twist stably at this inertia, as for the stiff twist
-        of short edges at the default 10 ms step, the inertia is raised to the least stable value: a shorter substep
+        of short edges at the default 10 ms step, the inertia is raised to the smallest stable value: a shorter substep
         keeps it physical. The raise counts the twisting stiffness alone: the bending adds a twist stiffness only
         through a rest curvature, which stays stable while |kb| |kappa_rest| < 8 m l / (pi E r^2 dt^2) at every hinge,
         with kb the curvature binormal (2 tan(phi / 2) for a turning angle phi), kappa_rest the rest curvature, l the

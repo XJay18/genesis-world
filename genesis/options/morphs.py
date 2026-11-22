@@ -1759,21 +1759,23 @@ class Rod(FileMorph, RodMixin):
     """
     Morph of a rod whose vertices are loaded from a `.npy` file, an array of shape (n_vertices, 3) in meters.
 
-    The vertices are scaled, then rotated about their center and translated by the pose of the morph.
+    The vertices are scaled, translated by `pos`, then rotated about their mean position. There must be at least 3 of
+    them.
 
     Parameters
     ----------
     file : str
-        The path to the file.
+        The path to the file, absolute or relative to the working directory or to the assets directory of Genesis.
     scale : float or tuple, optional
         The scaling factor of the vertices, uniform if a float, per axis if a 3-tuple. Defaults to 1.0.
     pos : tuple, shape (3,), optional
-        The position of the entity in meters. Defaults to (0.0, 0.0, 0.0).
+        The translation of the vertices, in meters. Defaults to (0.0, 0.0, 0.0).
     euler : tuple, shape (3,), optional
-        The euler angle of the entity in degrees. This follows scipy's extrinsic x-y-z rotation convention.
-        Defaults to (0.0, 0.0, 0.0).
+        The rotation of the vertices about their mean position, as euler angles in degrees. This follows scipy's
+        extrinsic x-y-z rotation convention. Defaults to (0.0, 0.0, 0.0).
     quat : tuple, shape (4,), optional
-        The quaternion (w-x-y-z convention) of the entity. If specified, `euler` will be ignored. Defaults to None.
+        The rotation of the vertices about their mean position, as a quaternion (w-x-y-z convention). If specified,
+        `euler` will be ignored. Defaults to None.
     is_loop : bool, optional
         Whether the last vertex connects back to the first one. Defaults to False.
     rest_state : str, optional
@@ -1796,11 +1798,15 @@ class ParameterizedRod(Morph, RodMixin):
     """
     Morph of a rod sampled from a parametric shape: a straight rod, a circle or a half circle.
 
+    The shape is translated by `pos`, then its vertices are rotated about their mean position.
+
     Parameters
     ----------
     type : str, optional
-        The shape: "rod" for a straight rod along `axis`, "circle" for a circle in the plane of `axis` and the next
-        axis, "half_circle" for half of it. A full circle (`gap` 0) is a loop. Defaults to "rod".
+        The shape: "rod" for a straight rod starting at `pos` along `axis`, "circle" for a circle centered at `pos` in
+        the plane of `axis` and the axis after it (y after x, z after y, x after z), starting on `axis`, and
+        "half_circle" for the half of that circle on the positive side of the axis after `axis`. A full circle (`gap`
+        0) is a loop. Defaults to "rod".
     n_vertices : int, optional
         The number of vertices, at least 3. Defaults to 10.
     interval : float, optional
@@ -1810,14 +1816,16 @@ class ParameterizedRod(Morph, RodMixin):
     axis : str, optional
         The axis "x", "y" or "z" the shape is laid along. Defaults to "x".
     gap : int, optional
-        The number of vertex slots left empty at the ends of a circle or half circle, opening it. Defaults to 0.
+        The number of vertex slots left empty, opening the shape: between the last and the first vertex of a circle,
+        and at each end of a half circle, the vertices keeping the spacing of the slots. Defaults to 0.
     pos : tuple, shape (3,), optional
-        The position of the entity in meters. Defaults to (0.0, 0.0, 0.0).
+        The translation of the shape, in meters. Defaults to (0.0, 0.0, 0.0).
     euler : tuple, shape (3,), optional
-        The euler angle of the entity in degrees. This follows scipy's extrinsic x-y-z rotation convention.
-        Defaults to (0.0, 0.0, 0.0).
+        The rotation of the vertices about their mean position, as euler angles in degrees. This follows scipy's
+        extrinsic x-y-z rotation convention. Defaults to (0.0, 0.0, 0.0).
     quat : tuple, shape (4,), optional
-        The quaternion (w-x-y-z convention) of the entity. If specified, `euler` will be ignored. Defaults to None.
+        The rotation of the vertices about their mean position, as a quaternion (w-x-y-z convention). If specified,
+        `euler` will be ignored. Defaults to None.
     rest_state : str, optional
         See RodMixin. Defaults to "default".
     fixed : bool or sequence of int, optional

@@ -1106,9 +1106,9 @@ class RodVisOptions(Options):
     Parameters
     ----------
     constraints : bool, optional
-        Whether to draw the vertices fixed in place or constrained to a target or a rigid link, as a point at each. Their
-        state is read back at each frame drawn, and a vertex fixed, constrained or released shows as such from the next
-        step. Defaults to False.
+        Whether to draw the vertices fixed in place or constrained to a target or a rigid link, as a point at each.
+        Their state is read back at each frame drawn, and a vertex fixed, constrained or released shows as such from the
+        next step. Defaults to False.
     """
 
     constraints: StrictBool = False
@@ -1121,23 +1121,30 @@ class RodOptions(GravityMixin, TimeBasedMixin):
     Parameters
     ----------
     damping : float, optional
-        Damping rate of the velocities of the rod vertices, in 1/s, which gravity escapes. A larger value settles a rod
-        faster and steadies stiff rods, at the cost of slowing every motion. Defaults to 0.0.
+        Damping rate of the velocities of the rod vertices, in 1/s: they decay by exp(-damping * dt) over each substep
+        of duration dt, before gravity adds its own. A rod at rest thus starts falling at the full acceleration of
+        gravity, and a falling rod tends to a speed of about the gravity over the damping. A larger value settles a rod
+        faster and steadies stiff rods, at the cost of slowing every motion, a free fall included. Defaults to 0.0.
     angular_damping : float, optional
-        Damping rate of the twist rates of the rod edges, in 1/s. Defaults to 0.0.
+        Damping rate of the twist rates of the rod edges, in 1/s: they decay by exp(-angular_damping * dt) over each
+        substep of duration dt. A larger value settles the twist of a rod faster, at the cost of slowing every spin of
+        the rods about their axis. Defaults to 0.0.
     adjacent_gap : int, optional
-        Number of edges on each side of an edge of a rod that it does not collide with, which would otherwise always
-        touch it at their shared vertex. A larger value lets a rod fold more tightly onto itself before it collides.
+        Number of edges on each side of an edge of a rod that it does not collide with. Its two neighbours touch it at
+        their shared vertices, and the edges a few steps away along the rod overlap it wherever the rod bends sharply
+        for its radius. A larger value lets a rod fold onto itself over more edges before it collides with itself.
         Defaults to 2.
     n_pbd_iters : int, optional
-        Number of projections of the inextensibility and contact constraints per substep. More projections hold the
-        length and resolve the contacts more accurately, at a runtime cost growing linearly with their number.
+        Number of projections of the inextensibility and rod-rod contact constraints per substep. More projections hold
+        the length and resolve the contacts more accurately, at a runtime cost growing linearly with their number.
         Defaults to 10.
     contact_margin : float, optional
-        The margin of the search for rod-rod contacts, in meters. Pairs of edges further apart than this are skipped
-        unless a vertex moves over half of it during the projections of a substep, in which case all pairs of edges are
-        tested. A larger margin tests more pairs of edges at every step, a smaller one tests all pairs more often. None
-        takes the largest vertex radius of the rods. Defaults to None.
+        The margin of the search for rod-rod contacts, in meters, where the rods have more pairs of edges than
+        'multiplier_contact_candidates' lets them test at every substep. The pairs of edges further apart than the
+        margin when a substep starts are skipped, unless a vertex moves by more than half of it during the projections
+        of the substep, in which case its environment tests all its pairs of edges. A larger margin tests more pairs at
+        every substep, a smaller one tests all pairs more often. If None, the largest radius of the rods is used.
+        Defaults to None.
     multiplier_contact_candidates : int, optional
         The capacity of the pairs of edges tested for rod-rod contact, as a multiple of the number of edges. Exceeding
         it raises an error. Rods short enough for all their pairs of edges to fit it test them all at every substep,
