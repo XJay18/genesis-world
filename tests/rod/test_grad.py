@@ -3,7 +3,8 @@ import pytest
 import torch
 
 import genesis as gs
-from genesis.utils.misc import qd_to_numpy
+import genesis.utils.geom as gu
+from genesis.utils.misc import qd_to_numpy, tensor_to_array
 
 from ..grad.conftest import step_overwrites  # noqa: F401
 from ..utils.assertions import assert_allclose, assert_equal
@@ -502,6 +503,11 @@ def test_mid_rollout_attachment_grad_matches_fd(backend, show_viewer):
         E=torch.tensor(1e4, dtype=gs.tc_float, device=gs.device),
     )
 
+    # The attached vertices with their links, their positions in the frame of the link as they are attached, and their
+    # positions at the end of the rollout with the poses of the links then
+    attached = ((rods[0], [0, 1], link_box), (rods[1], [0], free_box))
+    attached_local_pos, attached_end_poses = [], []
+
     def rollout(rod_vel, link_vel, box_vel, E):
         scene.reset()
         rods[0].set_velocity(rod_vel)
@@ -514,12 +520,34 @@ def test_mid_rollout_attachment_grad_matches_fd(backend, show_viewer):
             if i_step == i_step_attach:
                 rods[0].set_vertex_constraints([0, 1], link=link_box.base_link)
                 rods[1].set_vertex_constraints(0, link=free_box.base_link)
+                with torch.no_grad():
+                    attached_local_pos[:] = [
+                        gu.inv_transform_by_trans_quat(
+                            tensor_to_array(rod.get_verts_pos()[verts_idx]),
+                            tensor_to_array(link.get_pos()),
+                            tensor_to_array(link.get_quat()),
+                        )
+                        for rod, verts_idx, link in attached
+                    ]
             scene.step()
+        with torch.no_grad():
+            attached_end_poses[:] = [
+                (
+                    tensor_to_array(rod.get_verts_pos()[verts_idx]),
+                    tensor_to_array(link.get_pos()),
+                    tensor_to_array(link.get_quat()),
+                )
+                for rod, verts_idx, link in attached
+            ]
         loss = (torch.stack([rod.get_verts_pos() for rod in rods]) * rods_weights).sum()
         return loss + (free_box.get_pos() * box_weights).sum() + rods[0].get_geodesic_distance(2, 7)
 
     inputs_ad = {name: value.clone().requires_grad_() for name, value in inputs.items()}
     rollout(**inputs_ad).backward()
+    # The attached vertices follow their links, placed at their targets at the end of every substep
+    for local_pos, (verts_pos, link_pos, link_quat) in zip(attached_local_pos, attached_end_poses):
+        verts_target = gu.transform_by_trans_quat(local_pos, link_pos, link_quat)
+        assert_allclose(verts_pos, verts_target, atol=1e-15)
 
     # Directional derivatives along a random direction, with the step and the tolerance their measured floors set
     steps_and_tols = {
@@ -538,6 +566,9 @@ def test_mid_rollout_attachment_grad_matches_fd(backend, show_viewer):
         grad_fd = (loss_plus - loss_minus) / (2.0 * eps)
         grad_ad = (inputs_ad[name].grad * direction).sum()
         assert abs(grad_ad - grad_fd) <= tol * abs(grad_fd), name
+        # The velocity of the driven box reaches the loss through the attachment alone
+        if name == "link_vel":
+            assert abs(grad_fd) > 2e-3
 
 
 @pytest.mark.required
