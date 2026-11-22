@@ -905,6 +905,74 @@ def test_rod_contact_at_immovable_vertices_does_not_lever_free_vertex(show_viewe
 
 
 @pytest.mark.required
+def test_rod_contact_friction_follows_coulomb_law(show_viewer):
+    radius, dt, gravity, static_friction, kinetic_friction = 0.005, 1e-3, 9.81, 0.3, 0.25
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=dt,
+            substeps=1,
+            gravity=(0.0, 0.0, -gravity),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.05, -0.25, 0.15),
+            camera_lookat=(0.05, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    material = gs.materials.Rod.Base(
+        segment_radius=radius,
+        static_friction=static_friction,
+        kinetic_friction=kinetic_friction,
+    )
+    # Two fixed bars along x, and two short ropes lying across them, without bending stiffness. The first crosses the
+    # bars at their vertices, where each of its edges touches two edges of a bar, the second between them, where its
+    # middle vertex takes the contacts of both bars
+    for y in (-0.01, 0.01):
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=21,
+                interval=0.02,
+                axis="x",
+                pos=(-0.2, y, 0.0),
+                fixed=True,
+            ),
+            material=material,
+        )
+    ropes = [
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=3,
+                interval=0.02,
+                axis="y",
+                pos=(x, -0.02, 2.0 * radius),
+            ),
+            material=gs.materials.Rod.Base(
+                E=0.0,
+                G=0.0,
+                segment_radius=radius,
+                static_friction=static_friction,
+                kinetic_friction=kinetic_friction,
+            ),
+        )
+        for x in (0.0, 0.11)
+    ]
+    scene.build(n_envs=2)
+    # A rope resting on a support sinks into it by the fall of a substep, g dt^2, from which the friction bounds the
+    # change of the tangential velocity over the substep: mu_s g dt for a static contact, which a slower slip is within,
+    # and mu_k g dt once it slides, the kinetic deceleration mu_k g
+    vel_static = 0.5 * static_friction * gravity * dt
+    vel_sliding = 3.0 * static_friction * gravity * dt
+    for rope in ropes:
+        rope.set_velocity([[vel_static, 0.0, 0.0], [vel_sliding, 0.0, 0.0]])
+    scene.step()
+    for rope in ropes:
+        verts_vel = tensor_to_array(rope.get_verts_vel())
+        # The slow rope stops within the substep, and the fast one slides on
+        assert_allclose(verts_vel[0, :, :2], 0.0, atol=5e-11)
+        assert_allclose(verts_vel[1, :, 0], vel_sliding - kinetic_friction * gravity * dt, atol=1e-5)
+
+
+@pytest.mark.required
 @pytest.mark.parametrize("rod_mpm", [True, False])
 def test_rod_mpm_coupling(rod_mpm, show_viewer):
     scene = gs.Scene(

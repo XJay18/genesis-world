@@ -230,6 +230,8 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
     # 'dv_friction' by the next one (see 'RodConfig.is_deterministic')
     dp_contact_sums: CarryFreeSums = field(kind=DataKind.SCRATCH)
     dv_friction_sums: CarryFreeSums = field(kind=DataKind.SCRATCH)
+    # The number of rod-rod contacts whose friction moves the vertex at the substep, over which its friction is averaged
+    n_friction_contacts: qd.Tensor = field(int, kind=DataKind.SCRATCH, labels=ROD_CONTACTS)
 
 
 class RodEdgesState(Data, kind=DataKind.STATE, shape=(ROD_EDGES, ENVS)):
@@ -1384,7 +1386,7 @@ def func_finalize_rod_positions(
     The last projection is the one of the contacts with the rigid geoms where the rods couple with them (see
     'LegacyCoupler.project_rod_rigid_contacts'), the last one of the rods otherwise. The friction of the pairs sharing a
     vertex adds up as their corrections do (see kernel_project_rod_contacts), into carry-free sums with
-    `is_deterministic`, which kernel_finalize_rod_velocities reads.
+    `is_deterministic`, and kernel_finalize_rod_velocities averages it over the pairs, which it counts here.
     """
     IS_EXACT = qd.static(rod_config.is_deterministic)
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
@@ -1422,11 +1424,14 @@ def func_finalize_rod_positions(
     if qd.static(rod_config.has_edge_pairs):
         for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
             rod_state.verts.dv_friction[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
+            rod_state.verts.n_friction_contacts[i_v, i_b] = 0
             if qd.static(IS_EXACT):
                 func_clear_verts_sums(i_v, i_b, rod_state.verts.dv_friction_sums)
 
         # Coulomb friction cancels the tangential relative velocity of the closest points of two edges in contact, up
-        # to the bound the penetration recovered over the substep sets
+        # to the bound the penetration recovered over the substep sets. Each pair sees the whole approach of the
+        # substep as its penetration, as if it alone carried the vertices: a vertex averages the friction of its pairs
+        # as it averages their corrections, which cancels a static slip once rather than once per pair
         for i_c, i_b in qd.ndrange(
             *rod_state.edge_pairs.penetration.shape, axes=qd.static(eoa(rod_state.edge_pairs.penetration))
         ):
@@ -1483,8 +1488,8 @@ def func_finalize_rod_positions(
                     if vel_tangent_norm >= mu_s * vel_normal:
                         dv_tangent = -mu_k * vel_normal / qd.max(vel_tangent_norm, rod_info.EPS[None]) * vel_tangent
                     impulse = dv_tangent / inv_mass_eff
+                    verts_idx = qd.Vector([i_v_a1, i_v_a2, i_v_b1, i_v_b2], dt=gs.qd_int)
                     if qd.static(IS_EXACT):
-                        verts_idx = qd.Vector([i_v_a1, i_v_a2, i_v_b1, i_v_b2], dt=gs.qd_int)
                         func_add_edge_pair_sums(
                             i_b, verts_idx, impulse, weights, inv_masses, rod_state.verts.dv_friction_sums
                         )
@@ -1493,6 +1498,10 @@ def func_finalize_rod_positions(
                         qd.atomic_add(rod_state.verts.dv_friction[i_v_a2, i_b], inv_masses[1] * weights[1] * impulse)
                         qd.atomic_sub(rod_state.verts.dv_friction[i_v_b1, i_b], inv_masses[2] * weights[2] * impulse)
                         qd.atomic_sub(rod_state.verts.dv_friction[i_v_b2, i_b], inv_masses[3] * weights[3] * impulse)
+                    for i_c_v in qd.static(range(4)):
+                        if inv_masses[i_c_v] * weights[i_c_v] > 0.0:
+                            i_v_c = verts_idx[i_c_v]
+                            qd.atomic_add(rod_state.verts.n_friction_contacts[i_v_c, i_b], 1)
 
 
 @reversed_with_atomic_sums
@@ -1506,14 +1515,17 @@ def kernel_finalize_rod_positions(
 
 @qd.func
 def func_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
-    """Apply the friction of the rod-rod contacts and the constraints of the vertices to the velocities, then commit the
-    reference frames and the rest curvatures the substep computed."""
+    """Apply the friction of the rod-rod contacts, averaged over the contacts of each vertex, and the constraints of the
+    vertices to the velocities, then commit the reference frames and the rest curvatures the substep computed."""
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
         if qd.static(rod_config.has_edge_pairs):
             # The friction left in carry-free sums (see kernel_finalize_rod_positions)
             if qd.static(rod_config.is_deterministic):
                 rod_state.verts.dv_friction[i_v, i_b] = func_read_verts_sums(i_v, i_b, rod_state.verts.dv_friction_sums)
-            rod_state.verts.vel[i_v, i_b] = rod_state.verts.vel[i_v, i_b] + rod_state.verts.dv_friction[i_v, i_b]
+            n_friction_contacts = qd.max(rod_state.verts.n_friction_contacts[i_v, i_b], 1)
+            rod_state.verts.vel[i_v, i_b] = (
+                rod_state.verts.vel[i_v, i_b] + rod_state.verts.dv_friction[i_v, i_b] / n_friction_contacts
+            )
         if rod_state.verts.is_constrained[i_v, i_b]:
             rod_state.verts.vel[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
