@@ -1,5 +1,4 @@
 import math
-import os
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -638,10 +637,8 @@ def test_vertex_constraints_reset_with_state(show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("contact_margin", [None, 1e-6])
-def test_rod_contacts_match_reference(contact_margin, asset_tmp_path, show_viewer):
-    # FIXME: the reference trajectory is a recorded GPU run of this scene. Replace with physics-informed assertions on
-    # the contacts between the rods.
-    ref = np.load(os.path.join(os.path.dirname(__file__), "data", "s1_hanging_gpu_200steps.npz"))
+def test_rod_contacts_keep_rods_apart(contact_margin, asset_tmp_path, show_viewer):
+    n_steps = 150
     # A rod wound in a helix whose turns press on their neighbours, overlapping them by 0.5 % of the contact distance
     spool_radius, segment_radius = 0.05, 0.005
     spool_angle = 0.01 / spool_radius * np.arange(150)
@@ -678,30 +675,35 @@ def test_rod_contacts_match_reference(contact_margin, asset_tmp_path, show_viewe
             coup_friction=0.1,
         ),
     )
-    rods = []
-    for n_verts, interval, pos, angle, radius, stiffness in (
-        (100, 0.01, (0.5, 0.5, 0.3), 15.0, 0.005, (1e5, 1e4)),
-        (80, 0.01, (0.55, 0.43, 0.4), 0.0, 0.005, (1e5, 1e4)),
-        (3, 0.1, (0.75, 0.435, 0.25), -75.0, 0.02, (1e6, 1e6)),
-        (3, 0.1, (1.05, 0.435, 0.25), -75.0, 0.02, (1e6, 1e6)),
-    ):
-        rods.append(
-            scene.add_entity(
-                morph=gs.morphs.ParameterizedRod(
-                    n_vertices=n_verts,
-                    interval=interval,
-                    pos=pos,
-                    euler=(0.0, 0.0, angle),
-                ),
-                material=gs.materials.Rod.Base(
-                    E=stiffness[0],
-                    G=stiffness[1],
-                    segment_radius=radius,
-                ),
-            )
-        )
-    # The spool far from the hanging rods, which falls and settles on the ground, each of its vertices taking the
-    # corrections of several contacts
+    # A rope clamped at one end, which sags onto a thick fixed bar under it
+    rope = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=100,
+            interval=0.01,
+            pos=(0.5, 0.5, 0.3),
+            euler=(0.0, 0.0, 15.0),
+            fixed=(0, 1),
+        ),
+        material=gs.materials.Rod.Base(
+            E=1e5,
+            G=1e4,
+            segment_radius=segment_radius,
+        ),
+    )
+    bar = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=3,
+            interval=0.1,
+            pos=(0.75, 0.435, 0.25),
+            euler=(0.0, 0.0, -75.0),
+            fixed=True,
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=0.02,
+        ),
+    )
+    # The spool far from the rope, which falls onto the ground, each of its vertices taking the corrections of several
+    # contacts
     spool = scene.add_entity(
         morph=gs.morphs.Rod(
             file=file,
@@ -715,22 +717,58 @@ def test_rod_contacts_match_reference(contact_margin, asset_tmp_path, show_viewe
     )
     # Three identical environments (see test_rod_mpm_coupling)
     scene.build(n_envs=3)
-    for rod, verts_idx in zip(rods, ([0, 1], [78, 79], [0, 1, 2], [0, 1, 2])):
-        rod.set_verts_fixed(True, verts_idx)
-    assert_equal([(rod.v_start, rod.n_verts, rod.e_start, rod.n_edges) for rod in rods], ref["rod_ranges"])
 
-    pos = [torch.cat([rod.get_verts_pos() for rod in rods], dim=1)]
-    spool_states = [torch.cat([spool.get_verts_pos(), spool.get_verts_vel()], dim=-1)]
-    for _ in range(ref["step"][-1] // 10):
-        for _ in range(10):
-            scene.step()
-        pos.append(torch.cat([rod.get_verts_pos() for rod in rods], dim=1))
-        spool_states.append(torch.cat([spool.get_verts_pos(), spool.get_verts_vel()], dim=-1))
-    assert_allclose(torch.stack(pos), ref["pos"], atol=1e-3)
+    # The pairs of edges that may collide: of two rods, or further apart along a rod than the default adjacent gap
+    rods = (rope, bar, spool)
+    edges_rod_idx = torch.cat([torch.full((rod.n_edges,), i_r, device=gs.device) for i_r, rod in enumerate(rods)])
+    edges_idx_local = torch.cat([torch.arange(rod.n_edges, device=gs.device) for rod in rods])
+    edges_radius = torch.cat(
+        [torch.full((rod.n_edges,), rod.material.segment_radius, dtype=gs.tc_float, device=gs.device) for rod in rods]
+    )
+    edges_a_idx, edges_b_idx = torch.triu_indices(len(edges_rod_idx), len(edges_rod_idx), offset=1, device=gs.device)
+    is_pair_valid = (edges_rod_idx[edges_a_idx] != edges_rod_idx[edges_b_idx]) | (
+        edges_idx_local[edges_b_idx] - edges_idx_local[edges_a_idx] > 2
+    )
+    edges_a_idx, edges_b_idx = edges_a_idx[is_pair_valid], edges_b_idx[is_pair_valid]
+    pairs_rod_idx = torch.stack([edges_rod_idx[edges_a_idx], edges_rod_idx[edges_b_idx]], dim=-1)
+
+    gaps, states = [], []
+    for _ in range(n_steps):
+        scene.step()
+        pos = [rod.get_verts_pos() for rod in rods]
+        states.append(torch.cat([torch.cat([p, rod.get_verts_vel()], dim=-1) for p, rod in zip(pos, rods)], dim=1))
+        # The closest points of the capsules of two edges, the one on the first edge following the one on the second
+        # once it is clamped to an end
+        pos_start = torch.cat([p[:, :-1] for p in pos], dim=1)
+        edges = torch.cat([p.diff(dim=1) for p in pos], dim=1)
+        edge_a, edge_b = edges[:, edges_a_idx], edges[:, edges_b_idx]
+        offset = pos_start[:, edges_b_idx] - pos_start[:, edges_a_idx]
+        len_sq_a, len_sq_b = (edge_a * edge_a).sum(dim=-1), (edge_b * edge_b).sum(dim=-1)
+        cross_ab = (edge_a * edge_b).sum(dim=-1)
+        proj_a, proj_b = (edge_a * offset).sum(dim=-1), (edge_b * offset).sum(dim=-1)
+        det = len_sq_a * len_sq_b - cross_ab * cross_ab
+        t = torch.where(det > gs.EPS * len_sq_a * len_sq_b, (proj_a * len_sq_b - proj_b * cross_ab) / det, 0.0)
+        t = t.clamp(0.0, 1.0)
+        u_unclamped = (t * cross_ab - proj_b) / len_sq_b
+        u = u_unclamped.clamp(0.0, 1.0)
+        is_u_clamped = (u_unclamped < 0.0) | (u_unclamped > 1.0)
+        t = torch.where(is_u_clamped, ((u * cross_ab + proj_a) / len_sq_a).clamp(0.0, 1.0), t)
+        dist = torch.linalg.norm(offset + u[..., None] * edge_b - t[..., None] * edge_a, dim=-1)
+        gaps.append(dist - edges_radius[edges_a_idx] - edges_radius[edges_b_idx])
+    gaps = torch.stack(gaps)
+
+    # No two edges overlap by more than the contacts leave once projected
+    assert (gaps > -1e-4).all()
+    # The rope sags onto the bar within 100 steps, then lies on it, the closest of their edges at the sum of their radii
+    is_rope_on_bar = (pairs_rod_idx == torch.tensor([0, 1], device=gs.device)).all(dim=-1)
+    assert_allclose(gaps[100:, :, is_rope_on_bar].min(dim=-1).values, 0.0, atol=1e-6)
+    # The turns of the spool lie on each other once it lies on the ground
+    is_spool_on_spool = (pairs_rod_idx == 2).all(dim=-1)
+    assert_allclose(gaps[-1, :, is_spool_on_spool].min(dim=-1).values, 0.0, atol=5e-5)
     # The contacts sum the corrections of a vertex in an order independent of the threads with deterministic
     # algorithms, so identical environments stay bitwise identical
-    for state in (torch.stack(pos), torch.stack(spool_states)):
-        assert_equal(state, state[:, :1].expand_as(state))
+    states = torch.stack(states)
+    assert_equal(states, states[:, :1].expand_as(states))
 
 
 @pytest.mark.required
@@ -2449,7 +2487,7 @@ def test_gpu_simulation_determinism(asset_tmp_path, show_viewer):
     # state must reproduce a bit-identical trajectory of the rods, the rigid bodies and the MPM particles they push, in
     # each of three identical environments (see test_rod_mpm_coupling)
     n_trials, n_steps, spool_radius, radius = 3, 30, 0.05, 0.005
-    # A rod wound in a helix whose turns press on their neighbours (see test_rod_contacts_match_reference)
+    # A rod wound in a helix whose turns press on their neighbours (see test_rod_contacts_keep_rods_apart)
     spool_angle = 0.01 / spool_radius * np.arange(150)
     spool = np.stack(
         [spool_radius * np.cos(spool_angle), spool_radius * np.sin(spool_angle), 0.995 * radius * spool_angle / np.pi],
