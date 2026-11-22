@@ -573,6 +573,18 @@ def test_vertex_constraints_reset_with_state(show_viewer):
             (3, (0.0, -0.3, 0.3), True),
         )
     ]
+    # A rope lying across the middle of the fixed rod
+    rope = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=3,
+            interval=0.01,
+            axis="y",
+            pos=(0.01, -0.31, 0.31),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=0.005,
+        ),
+    )
     with pytest.raises(gs.GenesisException, match="fixed vertex indices"):
         scene.add_entity(morph=gs.morphs.ParameterizedRod(n_vertices=3, fixed=(3,)), material=gs.materials.Rod.Base())
     scene.build(n_envs=2)
@@ -631,8 +643,28 @@ def test_vertex_constraints_reset_with_state(show_viewer):
     # The marker of the constrained vertices stands at every vertex of the rods, shown at those fixed or constrained in
     # each environment
     (constrained_points,) = scene.sim.render_context.get_markers()
-    assert_allclose(constrained_points.pos, torch.cat([rod.get_verts_pos() for rod in rods], dim=-2), tol=gs.EPS)
-    assert_equal(constrained_points.is_active, torch.cat([rod.get_verts_kinematic() for rod in rods], dim=-1))
+    assert_allclose(
+        constrained_points.pos,
+        torch.cat([*(rod.get_verts_pos() for rod in rods), rope.get_verts_pos()], dim=-2),
+        tol=gs.EPS,
+    )
+    assert_equal(
+        constrained_points.is_active,
+        torch.cat([*(rod.get_verts_kinematic() for rod in rods), rope.get_verts_kinematic()], dim=-1),
+    )
+
+    # The vertices fixed by the morphs, by the setter and while moving, and the constrained one, keep their zero velocity
+    # whatever velocity the rods are given, so that the rope lying on the fixed rod stays where it lies
+    rope_pos = rope.get_verts_pos()
+    for rod in rods:
+        rod.set_velocity((0.5, 0.0, 0.0))
+    rods[1].set_verts_fixed(True, 5)
+    for rod in rods:
+        assert_allclose(rod.get_verts_vel()[rod.get_verts_kinematic()], 0.0, tol=gs.EPS)
+    for _ in range(20):
+        scene.step()
+    assert_allclose(rods[2].get_verts_vel(), 0.0, tol=gs.EPS)
+    assert_allclose(rope.get_verts_pos()[..., 0], rope_pos[..., 0], tol=gs.EPS)
 
 
 @pytest.mark.required

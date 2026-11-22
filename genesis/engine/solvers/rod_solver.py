@@ -189,7 +189,7 @@ class RodVertsState(Data, kind=DataKind.STATE, shape=(ROD_VERTS, ENVS)):
 
     pos: qd.Tensor = field((float, 3), grad=True)
     vel: qd.Tensor = field((float, 3), grad=True)
-    # A fixed vertex keeps its position and velocity, and its inverse mass is zero in every projection
+    # A fixed vertex keeps its position at zero velocity, and its inverse mass is zero in every projection
     is_fixed: qd.Tensor = field(bool)
     # A constrained vertex is placed at its target at the end of every substep with zero velocity. The target is given
     # in the frame of the rigid link 'link_idx', or in the world frame for -1.
@@ -1526,7 +1526,7 @@ def func_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, rod_con
             rod_state.verts.vel[i_v, i_b] = (
                 rod_state.verts.vel[i_v, i_b] + rod_state.verts.dv_friction[i_v, i_b] / n_friction_contacts
             )
-        if rod_state.verts.is_constrained[i_v, i_b]:
+        if not func_is_free(i_v, i_b, rod_state):
             rod_state.verts.vel[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
     for i_e, i_b in qd.ndrange(*rod_state.edges.theta.shape, axes=qd.static(eoa(rod_state.edges.theta))):
@@ -1619,7 +1619,10 @@ def kernel_set_rod_verts_vector(
                 if qd.static(is_pos):
                     rod_state.verts.pos[i_v, i_b][j] = values[i_b_, i_v_, j]
                 else:
-                    rod_state.verts.vel[i_v, i_b][j] = values[i_b_, i_v_, j]
+                    # A vertex that does not move keeps its zero velocity
+                    rod_state.verts.vel[i_v, i_b][j] = qd.select(
+                        func_is_free(i_v, i_b, rod_state), values[i_b_, i_v_, j], 0.0
+                    )
 
 
 @qd.kernel(fastcache=True)
@@ -1687,7 +1690,11 @@ def kernel_set_rod_verts_fixed(
         i_v = verts_idx[i_b_, i_v_]
         # See 'kernel_set_rod_verts_vector'
         if i_v >= 0:
-            rod_state.verts.is_fixed[i_v, envs_idx[i_b_]] = is_fixed[i_b_, i_v_]
+            i_b = envs_idx[i_b_]
+            rod_state.verts.is_fixed[i_v, i_b] = is_fixed[i_b_, i_v_]
+            # A fixed vertex does not move, whatever its velocity was
+            if is_fixed[i_b_, i_v_]:
+                rod_state.verts.vel[i_v, i_b] = qd.Vector.zero(gs.qd_float, 3)
 
 
 @qd.kernel(fastcache=True)
@@ -2160,7 +2167,12 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
     @gs.assert_built
     @mutates(StateChange.DYNAMICS)
     def set_verts_vel(self, vel, verts_idx=None, envs_idx=None):
-        """Set the velocity of some vertices of the rods, in m/s (see 'set_verts_pos' for the arguments)."""
+        """
+        Set the velocity of some vertices of the rods, in m/s (see 'set_verts_pos' for the arguments).
+
+        A fixed or constrained vertex keeps its zero velocity, whatever the value given, so that the rods and the MPM
+        materials it touches see it at rest.
+        """
         vel, verts_idx, envs_idx = self._sanitize_io_variables(
             vel, verts_idx, self.n_verts, "verts_idx", envs_idx, (3,), batched_idx=True
         )
@@ -2219,9 +2231,9 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
     @mutates()
     def set_verts_fixed(self, fixed, verts_idx=None, envs_idx=None):
         """
-        Set whether some vertices of the rods are fixed, keeping their position and velocity.
+        Set whether some vertices of the rods are fixed, keeping their position at zero velocity.
 
-        This is part of the state, which a differentiable rollout may change between two steps, and which
+        Fixing a vertex sets its velocity to zero, and a vertex released starts at rest. This is part of the state, which a differentiable rollout may change between two steps, and which
         `scene.reset()` restores as registered: the vertices the morphs fix (see 'RodMixin.fixed'), unless a state was
         registered since with `scene.reset(state)`. A rod fixed at the same vertices in every rollout takes them from
         its morph.
