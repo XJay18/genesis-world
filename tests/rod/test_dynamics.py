@@ -761,7 +761,7 @@ def test_rod_contacts_keep_rods_apart(contact_margin, asset_tmp_path, show_viewe
     assert (gaps > -1e-4).all()
     # The rope sags onto the bar within 100 steps, then lies on it, the closest of their edges at the sum of their radii
     is_rope_on_bar = (pairs_rod_idx == torch.tensor([0, 1], device=gs.device)).all(dim=-1)
-    assert_allclose(gaps[100:, :, is_rope_on_bar].min(dim=-1).values, 0.0, atol=1e-6)
+    assert_allclose(gaps[100:, :, is_rope_on_bar].min(dim=-1).values, 0.0, atol=5e-7)
     # The turns of the spool lie on each other once it lies on the ground
     is_spool_on_spool = (pairs_rod_idx == 2).all(dim=-1)
     assert_allclose(gaps[-1, :, is_spool_on_spool].min(dim=-1).values, 0.0, atol=5e-5)
