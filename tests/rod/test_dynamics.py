@@ -1051,6 +1051,7 @@ def test_rod_contact_friction_follows_coulomb_law(show_viewer):
 @pytest.mark.required
 @pytest.mark.parametrize("rod_mpm", [True, False])
 def test_rod_mpm_coupling(rod_mpm, show_viewer):
+    radius = 0.005
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1e-3,
@@ -1100,7 +1101,7 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
         material=gs.materials.Rod.Base(
             E=1e5,
             G=1e4,
-            segment_radius=0.005,
+            segment_radius=radius,
         ),
     )
     # Two rods dropped onto the block land without rebounding, restitution being zero, a heavy one and a light one
@@ -1115,7 +1116,7 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
                 E=1e5,
                 G=1e4,
                 segment_mass=segment_mass,
-                segment_radius=0.005,
+                segment_radius=radius,
             ),
         )
         for y, segment_mass in ((0.06, 0.02), (-0.06, 2e-4))
@@ -1128,25 +1129,27 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
     for _ in range(250):
         scene.step()
         block_top = block.get_particles_pos()[..., 2].max(dim=-1).values
-        rod_bottom = rod.get_verts_pos()[..., 2].min(dim=-1).values
+        rod_bottom = rod.get_verts_pos()[..., 2].min(dim=-1).values - radius
         heights_landing.append([rod_landing.get_verts_pos()[..., 2].mean(dim=-1) for rod_landing in rods_landing])
-        # The coupled rod rests on the block, while the uncoupled one falls through it
+        # The coupled rod rests on the block, its surface above the top of the block, while the uncoupled one falls
+        # through it
         if rod_mpm:
             assert (rod_bottom > block_top).all()
     if not rod_mpm:
         assert (rod_bottom < block_top - 0.01).all()
     else:
-        dx = 1.0 / 64.0
         n_steps_settled = 50
         for i_rod in range(len(rods_landing)):
             heights = torch.stack([heights_step[i_rod] for heights_step in heights_landing])
             # A rod lands without rising from where its fall first stops, with restitution zero, and it stays on the
-            # surface, within half a grid spacing of the top of the block plus its radius. It is settled, sinking less
-            # than a rod the material does not hold up
+            # surface, its bottom just above the top of the block. It is settled, sinking less than a rod the material
+            # does not hold up
             i_landing = ((heights[1:] > heights[:-1]).cumsum(dim=0) == 0).sum(dim=0)
             for i_b in range(3):
                 assert (heights[i_landing[i_b] :, i_b] < heights[i_landing[i_b], i_b] + 1e-3).all()
-            assert_allclose(heights[-1], block_top + 0.005, atol=0.5 * dx)
+            rest_height = heights[-1] - radius - block_top
+            assert (rest_height > 0.0).all()
+            assert (rest_height < 5e-3).all()
             sink_rate = (heights[-n_steps_settled] - heights[-1]) / (n_steps_settled * 1e-3)
             assert (sink_rate.abs() < 5e-3).all()
     # The contacts with the grid nodes sum their terms in an order independent of the threads with deterministic
@@ -1207,7 +1210,7 @@ def test_rod_mpm_contact_does_not_overshoot_at_any_mass(show_viewer):
     for rod in rods:
         vel_z = rod.get_verts_vel()[:, 2]
         assert (vel_z < 0.0).all()
-        assert vel_z.max() > -0.99
+        assert vel_z.mean() > -0.9
 
 
 @pytest.mark.required
@@ -1401,10 +1404,11 @@ def test_rod_rests_on_mpm_surface(show_viewer):
     for _ in range(150):
         scene.step()
     for block, rod, pos in zip(blocks, rods, pos_init):
-        # The rod rests on the surface of the material, its axis one radius above the top of the block wherever the
-        # top lies relative to the grid nodes, and the surface pushes it straight up wherever it lies between them
+        # The rod rests on the surface of the material, its bottom just above the top of the block wherever the top lies
+        # relative to the grid nodes, and the surface pushes it straight up wherever it lies between them
         block_top = block.get_particles_pos()[..., 2].max()
-        assert_allclose(rod.get_verts_pos()[..., 2].mean(), block_top + radius, atol=5e-3)
+        rest_height = rod.get_verts_pos()[..., 2].mean() - radius - block_top
+        assert 0.0 < rest_height < 5e-3
         assert_allclose(rod.get_verts_pos()[..., 1].mean(), pos[..., 1].mean(), atol=2e-3)
 
 
@@ -1828,18 +1832,20 @@ def test_rod_rigid_contacts_along_capsules_with_friction(two_pad_gripper, show_v
                 for gripper, rod, held_weight in zip(grippers, rods_grasped, held_weights)
             ]
         )
-        # The capsules rest on the edge of the plate and on the post, the axis of the rods a radius away from them, and
-        # the rod dropped at 1 m/s onto the other post is stopped at its surface
-        for rod, center, clearance, penetration_max in (
-            (rod_on_plate, (0.0, 0.2), radius, 1e-4),
-            (rod_on_post, (0.3, 0.1), radius + post_radius, 1e-4),
-            (rod_dropped, (0.45, 0.1), radius + post_radius, 5e-5),
+        # The capsules rest on the edge of the plate and on the post, the axis of the rods a radius away from them once
+        # they landed, and the rod dropped at 1 m/s onto the other post is stopped at its surface
+        for rod, center, clearance, penetration_max, is_resting in (
+            (rod_on_plate, (0.0, 0.2), radius, 1e-4, True),
+            (rod_on_post, (0.3, 0.1), radius + post_radius, 1e-4, True),
+            (rod_dropped, (0.45, 0.1), radius + post_radius, 5e-5, False),
         ):
             verts_pos = tensor_to_array(rod.get_verts_pos())
             t = np.linspace(0.0, 1.0, 101)[:, None]
             axis_pos = verts_pos[:, :-1, None] + t * (verts_pos[:, 1:, None] - verts_pos[:, :-1, None])
-            axis_pos = axis_pos[..., ::2]
-            assert np.linalg.norm(axis_pos - center, axis=-1).min() > clearance - penetration_max
+            axis_dist = np.linalg.norm(axis_pos[..., ::2] - center, axis=-1).min(axis=(1, 2))
+            assert (axis_dist > clearance - penetration_max).all()
+            if is_resting and i_step >= n_close_steps:
+                assert (axis_dist < clearance + 5e-6).all()
         # The penetration of the edges of the held vertex of the drooping rope into the lower pad
         verts_pos = tensor_to_array(rod_drooping.get_verts_pos())[:, 4:7]
         axis_pos = verts_pos[:, :-1, None] + t * (verts_pos[:, 1:, None] - verts_pos[:, :-1, None])
@@ -2206,16 +2212,20 @@ def test_rod_rigid_pad_rims_turn_rod_into_grip(two_pad_gripper, show_viewer):
     gripper.set_dofs_kv([40.0, 40.0, 150.0], [*pads_dof, *lift_dof])
     gripper.set_dofs_force_range([-max_force, -max_force], [max_force, max_force], pads_dof)
     pads = [gripper.get_link(name) for name in ("left_pad", "right_pad")]
-    held_offset = []
+    held_offset, held_yaw = [], []
     for i_step in range(n_close_steps + n_hold_steps):
         gripper.control_dofs_position([0.015, 0.015, 0.0], [*pads_dof, *lift_dof])
         scene.step()
         if i_step >= n_close_steps:
+            verts_pos = tensor_to_array(rod.get_verts_pos())
             pads_center = 0.5 * (tensor_to_array(pads[0].get_pos()) + tensor_to_array(pads[1].get_pos()))
-            held_offset.append(tensor_to_array(rod.get_verts_pos())[:, 3] - pads_center)
+            held_offset.append(verts_pos[:, 3] - pads_center)
+            held_dir = verts_pos[:, 4] - verts_pos[:, 2]
+            held_yaw.append(np.arctan2(held_dir[:, 1], held_dir[:, 0]))
     # The rims turn the rod through the free vertices next to the middle vertex, which the pads squeeze, until both faces
     # press the middle vertex: the pads close to less than the diameter of the rod. The scene is symmetric about the
     # vertical axis through the middle vertex, which the grip keeps at the centre of the pads
+    assert (yaw - np.array(held_yaw)).min() > 5e-2
     assert (0.03 - gripper.get_dofs_position(pads_dof).sum(dim=-1) < 2.0 * radius).all()
     assert np.linalg.norm(np.array(held_offset), axis=-1).max() < 2e-10
 
@@ -2436,11 +2446,15 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
     # The pads press the vertex onto the box with the force of their carriage, and their friction holds it there. The
     # box, held by the ground, stops the vertex at its surface, however light it is: the contact sees it through the
     # ground holding it
-    assert np.max(depth) < 5e-4
+    depth = np.array(depth).reshape((n_steps, len(pressed), -1))
+    assert depth.max() < 5e-4
+    # Once the pads pressed it down, the vertex stays on the box
+    assert depth[n_settle_steps:].min() > -1e-4
     assert np.linalg.norm(held_slip, axis=-1).max() < 1e-6
     # The squeezed vertex leaves the point of the edge to the free vertex, whose contact with the ball, its sphere, pushes
-    # the point out too: the ball stops near the surface of the rod
+    # the point out too: the ball stops at the surface of the rod, touching it
     assert np.max(edge_depth) < 5e-4
+    assert np.min(edge_depth) > 0.0
     # The response the contacts read equals the one over every row to the rounding of the sums
     assert response_err
     assert np.max(response_err) < 5e-15

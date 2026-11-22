@@ -15,15 +15,17 @@ with lazy_imports():
 
     import genesis as gs
     from genesis.grad.bridge import LaunchRecorder
-    from genesis.utils.misc import qd_to_torch
+    from genesis.utils.misc import qd_from_torch, qd_to_torch, qd_zerocopy_view
 
 
 @pytest.fixture(autouse=True)
 def step_overwrites(backend, monkeypatch):
-    # Check that the backward pass of a recorded rollout saves every overwrite it needs (see LaunchRecorder): before
-    # each entry of a recorder, copy the arrays its launches use that an earlier entry used, and report those the entry
-    # changed without the recorder saving them. The arrays a kernel writes follow from its source alone, the same on
-    # every backend, so it runs on CPU alone.
+    # Check that the backward pass of a recorded rollout reverses every entry at the values it left (see LaunchRecorder),
+    # without the source analysis the recorder saves by: each reversal runs twice from the same arrays and adjoints,
+    # first restoring after each entry every array it uses that an earlier entry used, then as the recorder does, and
+    # the gradients of both must agree to their rounding. The first run needs no analysis: its restores hold upstream's
+    # saves, those of the arrays an entry writes, and also undo what the reversal of an entry writes. It runs on CPU
+    # alone, where the arrays the kernels write are the same as on any backend.
     if isinstance(backend, str):
         backend = getattr(gs.constants.backend, backend)
     if backend != gs.cpu:
@@ -32,17 +34,22 @@ def step_overwrites(backend, monkeypatch):
 
     insert, entry, reverse, exit_ = operator.attrgetter("insert", "entry", "reverse", "__exit__")(LaunchRecorder)
     # Per recorder, released with it since a later one may take its identity: the arrays its closed entries used, the
-    # values before its open entry, and the launches of that entry
-    arrays_used, values_before, launches_open = (weakref.WeakKeyDictionary() for _ in range(3))
-    overwrites = set()
+    # values before its open entry, the launches of that entry, and the restores of the reference by entry, with whether
+    # the entry changed each array
+    arrays_used, values_before, launches_open, entries_restores = (weakref.WeakKeyDictionary() for _ in range(4))
+    mismatches = set()
     # The copies of the checker are kernel launches of their own without zero-copy views, which it does not record
     is_copying = False
 
-    def iter_arrays_used(kernel, args):
+    def iter_arrays(kernel, args, is_used):
+        # The arrays of the struct arguments of a launch, those its compiled form uses alone with `is_used`, and the
+        # arrays it takes directly otherwise
         key = kernel.ensure_compiled(*args)
-        flat_names_used = kernel.used_py_dataclass_parameters_by_key_enforcing.get(key)
+        flat_names_used = kernel.used_py_dataclass_parameters_by_key_enforcing.get(key) if is_used else None
         for arg_meta, arg in zip(kernel.arg_metas, args):
-            if dataclasses.is_dataclass(arg):
+            if isinstance(arg, (qd.Tensor, qd.Field, qd.Ndarray)) and not is_used:
+                yield (arg_meta.name,), arg
+            elif dataclasses.is_dataclass(arg):
                 stack = [((arg_meta.name,), arg)]
                 while stack:
                     path, struct = stack.pop()
@@ -55,29 +62,53 @@ def step_overwrites(backend, monkeypatch):
                         elif dataclasses.is_dataclass(value):
                             stack.append(((*path, field.name), value))
 
+    def own_view(array):
+        # The checker writes the arrays through zero-copy views of its own, None for an array without any, since a
+        # write through the view an array caches bumps the version of the tensors the getters handed out, which autograd
+        # may have saved
+        if qd_zerocopy_view(array) is None:
+            return None
+        return (array._unwrap() if isinstance(array, qd.Tensor) else array).to_torch(copy=False)
+
+    def write(array, value):
+        view = own_view(array)
+        if view is None:
+            qd_from_torch(array, value)
+        else:
+            view.copy_(value)
+
+    def is_equal(value, value_ref):
+        # Entries the solver leaves at NaN compare equal to themselves
+        if value.is_floating_point():
+            return torch.allclose(value, value_ref, rtol=0.0, atol=0.0, equal_nan=True)
+        return torch.equal(value, value_ref)
+
+    def is_rounding_close(grad, grad_ref):
+        # A reversal summing through atomics on several threads repeats to its rounding alone, while an overwrite the
+        # recorder leaves unsaved shifts a gradient by a share of its own size: a thousand units in the last place of
+        # the largest entry of the gradient separate the two
+        if grad.numel() == 0:
+            return True
+        scale = torch.maximum(grad.abs().nan_to_num().max(), grad_ref.abs().nan_to_num().max())
+        tol = 1e3 * torch.finfo(grad.dtype).eps * float(scale)
+        return torch.allclose(grad, grad_ref, rtol=0.0, atol=tol, equal_nan=True)
+
     def close_entry(recorder):
         nonlocal is_copying
         values = values_before.pop(recorder, {})
         launches = launches_open.pop(recorder, [])
         if not launches:
             return
-        arrays_saved = {id(array) for array, *_ in recorder.entries[-1].arrays_saved}
         is_copying = True
-        for key, (path, array, value) in values.items():
-            # The recorder saves an array an entry read since its last write alone, as the entry opened
-            if key not in arrays_saved and key in recorder._arrays_read:
-                value_after = qd_to_torch(array, copy=True)
-                # Entries the solver leaves at NaN compare equal to themselves
-                if value.is_floating_point():
-                    is_unchanged = torch.allclose(value_after, value, rtol=0.0, atol=0.0, equal_nan=True)
-                else:
-                    is_unchanged = torch.equal(value_after, value)
-                if not is_unchanged:
-                    overwrites.add(f"{launches[0][0].func.__name__} overwrites {path}")
+        restores = [
+            (path, array, value, not is_equal(qd_to_torch(array, copy=True), value))
+            for path, array, value in values.values()
+        ]
         is_copying = False
+        entries_restores.setdefault(recorder, {})[len(recorder.entries) - 1] = restores
         recorder_arrays_used = arrays_used.setdefault(recorder, set())
         for kernel, args in launches:
-            recorder_arrays_used.update(id(array) for _, array in iter_arrays_used(kernel, args))
+            recorder_arrays_used.update(id(array) for _, array in iter_arrays(kernel, args, is_used=True))
 
     def checked_insert(recorder, kernel, args):
         nonlocal is_copying
@@ -88,7 +119,7 @@ def step_overwrites(backend, monkeypatch):
         recorder_arrays_used = arrays_used.get(recorder, set())
         values = values_before.setdefault(recorder, {})
         is_copying = True
-        for path, array in iter_arrays_used(kernel, args):
+        for path, array in iter_arrays(kernel, args, is_used=True):
             if id(array) in recorder_arrays_used and id(array) not in values:
                 values[id(array)] = (".".join(path), array, qd_to_torch(array, copy=True))
         is_copying = False
@@ -99,9 +130,65 @@ def step_overwrites(backend, monkeypatch):
         close_entry(recorder)
         return entry(recorder, *args, **kwargs)
 
-    def checked_reverse(recorder, *args, **kwargs):
+    def checked_reverse(recorder, start=0, stop=None):
+        nonlocal is_copying
         close_entry(recorder)
-        return reverse(recorder, *args, **kwargs)
+        entries_idx = range(len(recorder.entries))[start:stop]
+        entries = recorder.entries[start:stop]
+        # Every array the launches reach, whose values and adjoints both reversals start from
+        arrays = {}
+        for entry_ in entries:
+            for kernel, args in entry_.launches:
+                for path, array in iter_arrays(kernel, args, is_used=False):
+                    arrays.setdefault(id(array), (f"{kernel.func.__name__}:{'.'.join(path)}", array))
+        is_copying = True
+        values_start = {
+            key: (qd_to_torch(array, copy=True), qd_to_torch(array.grad, copy=True) if array.has_grad() else None)
+            for key, (_, array) in arrays.items()
+        }
+        is_copying = False
+
+        restores = entries_restores.get(recorder, {})
+        arrays_saved = [list(entry_.arrays_saved) for entry_ in entries]
+        for i_e, entry_ in zip(entries_idx, entries):
+            entry_.arrays_saved[:] = [(array, own_view(array), value) for _, array, value, _ in restores.get(i_e, ())]
+        try:
+            tensors_grad_ref = reverse(recorder, start, stop)
+        finally:
+            for entry_, saved in zip(entries, arrays_saved):
+                entry_.arrays_saved[:] = saved
+        is_copying = True
+        grads_ref = {key: qd_to_torch(array.grad, copy=True) for key, (_, array) in arrays.items() if array.has_grad()}
+        for key, (_, array) in arrays.items():
+            value, grad = values_start[key]
+            write(array, value)
+            if grad is not None:
+                write(array.grad, grad)
+        is_copying = False
+
+        tensors_grad = reverse(recorder, start, stop)
+        is_copying = True
+        arrays_mismatch = [
+            arrays[key][0]
+            for key, grad in grads_ref.items()
+            if not is_rounding_close(qd_to_torch(arrays[key][1].grad), grad)
+        ]
+        is_copying = False
+        arrays_mismatch += [
+            "torch input"
+            for key, grad in tensors_grad_ref.items()
+            if key not in tensors_grad or not is_rounding_close(tensors_grad[key], grad)
+        ]
+        if arrays_mismatch:
+            # The overwrites the recorder left unsaved, where its gradients depart from the reference
+            overwrites = [
+                f"{recorder.entries[i_e].launches[0][0].func.__name__} overwrites {path}"
+                for i_e in entries_idx
+                for path, array, _, is_changed in restores.get(i_e, ())
+                if is_changed and all([array is not saved for saved, *_ in recorder.entries[i_e].arrays_saved])
+            ]
+            mismatches.add(f"adjoints {sorted(set(arrays_mismatch))} after unsaved {sorted(set(overwrites))}")
+        return tensors_grad
 
     # A recorder of the calls between two steps is exited after each call, before the step runs unrecorded
     def checked_exit(recorder, *args):
@@ -113,7 +200,9 @@ def step_overwrites(backend, monkeypatch):
     monkeypatch.setattr(LaunchRecorder, "reverse", checked_reverse)
     monkeypatch.setattr(LaunchRecorder, "__exit__", checked_exit)
     yield
-    assert not overwrites, f"Overwrites the backward pass does not save: {sorted(overwrites)}"
+    assert not mismatches, (
+        f"Gradients of the backward pass depart from restoring every array used: {sorted(mismatches)}"
+    )
 
 
 def _add_hinge_arm(parent, body_name, pos, axis="0 1 0", joint_pos=None, **joint_kwargs):

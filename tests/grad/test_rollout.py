@@ -395,20 +395,25 @@ def test_backward_restores_the_overwrites_a_reversal_reads(mode, tol):
         z: qd.Tensor = field(float, grad=True)
         s: qd.Tensor = field(int, shape=())
 
-    # The first launch writes 'a' and reads it back, a custom backward reads the scale 's', a launch without gradient
-    # overwrites 's', then a launch overwrites 'a' and the last one reads both. Each reversal runs at the values its
-    # launch left only if the backward pass restores both overwrites first. In performance mode, the scale is a scalar
-    # field, which has no zero-copy view, and the backward pass restores it all the same.
+    # The first launch writes 'a' and reads it back through a func it calls through 'qd.static', which the source
+    # analysis of the recorder cannot follow, a custom backward reads the scale 's', a launch without gradient overwrites
+    # 's', then a launch overwrites 'a' and the last one reads both. Each reversal runs at the values its launch left only
+    # if the backward pass restores both overwrites first. In performance mode, the scale is a scalar field, which has
+    # no zero-copy view, and the backward pass restores it all the same.
     @qd.kernel
     def kernel_set_scale(state: ChainState, scale: int):
         state.s[None] = scale
+
+    @qd.func
+    def func_sine(i: int, state: ChainState):
+        state.y[i] = qd.sin(state.a[i])
 
     @qd.kernel
     def kernel_square_sine(state: ChainState):
         for i in range(state.x.shape[0]):
             state.a[i] = state.x[i] * state.x[i]
         for i in range(state.y.shape[0]):
-            state.y[i] = qd.sin(state.a[i])
+            qd.static(func_sine)(i, state)
 
     @qd.kernel
     def kernel_scale_grad(state: ChainState):
