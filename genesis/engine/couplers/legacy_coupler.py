@@ -368,6 +368,12 @@ class LegacyCouplerInfo(Data, kind=DataKind.CONSTANT):
     # substep. A move of the whole penetration out of one geom can push the rod into another one across it, which
     # pushes it back by as much at the next substep, an oscillation that a fraction lets decay
     rod_rigid_overlap_relaxation: qd.Tensor = field(float, shape=())
+    # The inverse mass, relative to the one of the vertex, through which a vertex of the rods sees the links of its
+    # contacts that do not move where their normals are dependent (see 'kernel_project_rod_rigid_normal'). The vertex
+    # resolves the contacts through it as through links that heavy: a larger value leaves part of the penetration of
+    # parallel contacts to the next substep, a smaller one raises the impulses squeezing a vertex between opposed ones,
+    # whose difference moves the vertex and loses its digits in single precision
+    rod_rigid_immovable_inv_mass: qd.Tensor = field(float, shape=())
     # The largest rate of change of the signed distance of a rigid geom along a line: the gradient of the trilinear
     # interpolation of a signed distance grid reaches sqrt(3) at a corner of the geom
     rod_sdf_max_slope: qd.Tensor = field(float, shape=())
@@ -649,6 +655,7 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
                 rod_rigid_held_friction_share=0.8,
                 rod_rigid_anchor_recovery=0.1,
                 rod_rigid_overlap_relaxation=0.5,
+                rod_rigid_immovable_inv_mass=1e-2,
                 rod_sdf_max_slope=math.sqrt(3.0),
             )
         )
@@ -3832,6 +3839,11 @@ def func_project_rod_rigid_normal(
     point out by that cosine. Where the normals part, as for a sphere touching the side of a pad beside the rim the
     edge crosses, the scaled share keeps the vertex from pushing the rod along itself by the depth of the rim.
 
+    Links that do not move (fixed, or of zero mass) whose contacts with a vertex have dependent normals leave the solve
+    singular. They are then seen through a small inverse mass ('rod_rigid_immovable_inv_mass'): a vertex on parallel
+    faces, a geom flush with the ground, leaves the deepest one, and a vertex between opposed faces closer than its
+    diameter, the walls of a slot, is centred between them and held there by the friction of their large impulses.
+
     A squeezed vertex is held across the axis of its most opposed pair of contacts by their friction (see
     'kernel_project_rod_rigid_friction'), and moves there with the links of the pair. Each of its other contacts pushes
     its own link and the links of the pair back by its share of the approach and of the penetration, up to
@@ -4189,16 +4201,44 @@ def func_project_rod_rigid_normal(
                 # The share of the approach of the substep, its separation counting against, and a fraction of the
                 # penetration the rod cannot leave alone, are resolved with the links free
                 system = coupling * 1.0
+                # The contacts whose links do not move, fixed or of zero inverse mass
+                is_immovable = qd.Vector.zero(gs.qd_int, N_CONTACTS_MAX)
+                n_immovable = 0
                 for i_c in qd.static(range(N_CONTACTS_MAX)):
                     if i_c < n_contacts:
-                        system[i_c, i_c] = system[i_c, i_c] + func_rod_rigid_contact_link_inverse_mass(
+                        inv_mass_link = func_rod_rigid_contact_link_inverse_mass(
                             i_v, i_c, i_b, rod_state, geoms_info, is_friction=False
                         )
+                        system[i_c, i_c] = system[i_c, i_c] + inv_mass_link
                         target[i_c, 0] = shares[i_c] * (
                             penetrations[i_c] - penetrations_start[i_c]
                         ) + legacy_coupler_info.rod_rigid_overlap_recovery[None] * qd.max(penetration_left[i_c, 0], 0.0)
+                        if inv_mass_link <= 0.0:
+                            is_immovable[i_c] = 1
+                            n_immovable += 1
                     else:
                         system[i_c, i_c] = 1.0
+                # Immovable links whose normals are dependent, opposed like the walls of a slot narrower than the rod
+                # or parallel like a geom flush with the ground, leave the system singular: no impulses resolve the
+                # opposed pair, and any split of them resolves the parallel one. They are seen through a small inverse
+                # mass instead (see 'rod_rigid_immovable_inv_mass'), which sets in as the Gram determinant of their
+                # normals falls below 'normals_independence_min', so that every other system is solved as it is
+                if n_immovable >= 2:
+                    gram = qd.Matrix.identity(gs.qd_float, N_CONTACTS_MAX)
+                    for i_c in qd.static(range(N_CONTACTS_MAX)):
+                        for j_c in qd.static(range(N_CONTACTS_MAX)):
+                            if is_immovable[i_c] == 1 and is_immovable[j_c] == 1:
+                                gram[i_c, j_c] = rod_state.rigid_contacts.normal[i_v, i_c, i_b].dot(
+                                    rod_state.rigid_contacts.normal[i_v, j_c, i_b]
+                                )
+                    dependence = 1.0 - gram.determinant() / legacy_coupler_info.normals_independence_min[None]
+                    if dependence > 0.0:
+                        for i_c in qd.static(range(N_CONTACTS_MAX)):
+                            if is_immovable[i_c] == 1:
+                                system[i_c, i_c] = (
+                                    system[i_c, i_c]
+                                    + dependence * legacy_coupler_info.rod_rigid_immovable_inv_mass[None] * inv_mass
+                                )
                 impulses = func_solve_nonnegative(system, target)
                 # The contacts outside the most opposed pair push a vertex that the friction of the pair holds (see the
                 # docstring)

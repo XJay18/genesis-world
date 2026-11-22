@@ -2199,6 +2199,31 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
             segment_radius=radius,
         ),
     )
+    # Far from the others, a rod between two fixed walls closer than its diameter, which squeeze it from both sides
+    slot_gap = 2.0 * radius - 2e-3
+    for sign in (1.0, -1.0):
+        scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(1.0, sign * (0.5 * slot_gap + 0.05), 0.1),
+                size=(0.2, 0.1, 0.1),
+                fixed=True,
+            ),
+            material=gs.materials.Rigid(
+                needs_coup=True,
+                coup_friction=0.6,
+            ),
+        )
+    rod_slot = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=7,
+            interval=0.02,
+            pos=(0.94, 0.0, 0.1),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.001,
+            segment_radius=radius,
+        ),
+    )
     scene.build(n_envs=2)
     rod_held.set_verts_fixed(True, verts_idx_local=[0, 6])
     pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
@@ -2222,9 +2247,10 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
     rigid_solver = scene.sim.rigid_solver
     constraint_state = rigid_solver.constraint_solver.constraint_state
     rod_state = scene.sim.rod_solver.rod_state
-    depth, held_slip, edge_depth, response_err = [], [], [], []
+    depth, held_slip, edge_depth, response_err, slot_offset = [], [], [], [], []
     for i_step in range(n_steps):
         scene.step()
+        slot_offset.append(tensor_to_array(rod_slot.get_verts_pos())[..., 1])
         for (gripper_pressed, box_pressed, rod_pressed), held_offset_start in zip(pressed, held_offsets_start):
             verts_pos = tensor_to_array(rod_pressed.get_verts_pos())
             box_top = tensor_to_array(box_pressed.get_pos())[:, 2] + 0.5 * box_size[2]
@@ -2274,6 +2300,8 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
     # The response the contacts read equals the one over every row to the rounding of the sums
     assert response_err
     assert np.max(response_err) < 5e-15
+    # The rod between the walls stays centred between them, both pushing it equally
+    assert np.abs(slot_offset).max() < 2e-10
 
 
 @pytest.mark.required
@@ -2314,12 +2342,39 @@ def test_rod_rests_on_supported_rigid_link(show_viewer):
             segment_radius=radius,
         ),
     )
+    # Far from the beam, a fixed box whose top is flush with the ground, and a rod lying across both, its vertices over
+    # the box touching the two at once
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.5, 0.0, -0.05),
+            size=(0.1, 0.1, 0.1),
+            fixed=True,
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+        ),
+    )
+    rod_flush = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=10,
+            interval=0.02,
+            pos=(0.41, 0.0, radius),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.005,
+            segment_radius=radius,
+        ),
+    )
     scene.build()
     for _ in range(n_steps):
         scene.step()
     # The rod rests, the velocity of the vertices zero to the share of the substep its contacts leave to the link
     assert_allclose(rod.get_verts_vel(), 0.0, atol=5e-4)
     assert_allclose(rod.get_verts_pos()[..., 2], beam.get_pos()[..., 2] + 0.005 + radius, atol=1e-5)
+    # The rod across the box rests on the ground, its vertices over the box at the velocity the two contacts leave of
+    # the fall of a substep between them
+    assert_allclose(rod_flush.get_verts_vel(), 0.0, atol=2e-5)
+    assert_allclose(rod_flush.get_verts_pos()[..., 2], radius, atol=5e-9)
 
 
 @pytest.mark.required
