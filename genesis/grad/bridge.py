@@ -309,12 +309,12 @@ class LaunchRecorder:
     then the arrays it overwrote are restored, so that every entry before it is reversed at the values it left too.
     Before each launch, the recorder saves the arrays of the state the launch writes that an earlier entry read since
     their last write. The writes and the reads come from the source of the kernel (see 'get_accessed_paths'), narrowed
-    to the struct members its compiled form uses, a kernel whose source the analysis cannot follow through all its
-    calls reading every array it uses. An entry reads the arrays its kernels read where autodiff reverses it or a
-    backward running the autodiff of its kernel does (see 'register_custom_backward'), every array it uses where another
-    backward does, and none without gradient. An array no entry reads after a write keeps the value of its last write
-    once the entries are reversed. A backward pass follows the convention of autodiff, consuming the adjoint of the
-    values a launch wrote and clearing it.
+    to the struct members its compiled form uses, a launch passing an array to a func the analysis cannot follow reading
+    every array it uses. An entry reads the arrays its kernels read where autodiff reverses it or a backward running the
+    autodiff of its kernel does (see 'register_custom_backward'), every array it uses where another backward does, and
+    none without gradient. An array no entry reads after a write keeps the value of its last write once the entries are
+    reversed. A backward pass follows the convention of autodiff, consuming the adjoint of the values a launch wrote and
+    clearing it.
 
     The arrays with a zero-copy view (see 'qd_zerocopy_view') are saved and restored through it, the launches of a
     kernel and structs sharing the views of their arrays: a save is one copy of the view, and the restore of an entry
@@ -389,21 +389,28 @@ class LaunchRecorder:
             flat_names_used = kernel.used_py_dataclass_parameters_by_key_enforcing.get(key)
             paths_accessed = get_accessed_paths(kernel.func, args[0] if kernel.is_classkernel else None)
             arrays_used, arrays_read, arrays_written = set(), set(), []
+            is_unresolved = False
             for arg_meta, arg in zip(kernel.arg_metas, args):
                 if dataclasses.is_dataclass(arg):
                     for path, array in iter_state_arrays(arg):
                         path = (arg_meta.name, *path)
                         if flat_names_used is None or "__qd_" + "__qd_".join(path) in flat_names_used:
                             arrays_used.add(id(array))
+                            is_unresolved |= any(
+                                [
+                                    path[: len(path_unresolved)] == path_unresolved
+                                    for path_unresolved in paths_accessed.unresolved
+                                ]
+                            )
                             if path in paths_accessed.read:
                                 arrays_read.add(id(array))
                             if path in paths_accessed.written:
                                 view = qd_zerocopy_view(array)
                                 arrays_written.append((array, view))
             arrays_written_ids = {id(array) for array, _ in arrays_written}
-            # A kernel whose source reaches a func through a call the analysis cannot follow may read anything it uses
-            # there, so it reads every array it uses, as upstream's rule takes it
-            if not paths_accessed.is_complete:
+            # A launch passing one of its arrays to a func the source analysis cannot follow may read anything there,
+            # so it reads every array it uses, as upstream's rule takes it
+            if is_unresolved:
                 arrays_read = arrays_used
             launch_arrays = (arrays_used, arrays_read, arrays_written, arrays_written_ids)
             for struct in structs:
