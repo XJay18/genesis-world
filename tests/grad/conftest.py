@@ -38,7 +38,8 @@ def step_overwrites(backend, monkeypatch):
     # the entry changed each array
     arrays_used, values_before, launches_open, entries_restores = (weakref.WeakKeyDictionary() for _ in range(4))
     mismatches = set()
-    # The copies of the checker are kernel launches of their own without zero-copy views, which it does not record
+    # The copies of the checker and the saves of the recorder are kernel launches of their own for an array without a
+    # zero-copy view (an integer or interleaved field), which neither records as an entry
     is_copying = False
 
     def iter_arrays(kernel, args, is_used):
@@ -112,7 +113,7 @@ def step_overwrites(backend, monkeypatch):
 
     def checked_insert(recorder, kernel, args):
         nonlocal is_copying
-        if is_copying:
+        if is_copying or recorder._is_saving:
             return
         if not recorder._is_grouping:
             close_entry(recorder)
