@@ -842,6 +842,50 @@ def test_rod_contact_candidates_overflow_is_reported(asset_tmp_path, show_viewer
 
 
 @pytest.mark.required
+def test_rod_rigid_contacts_overflow_is_reported(show_viewer):
+    radius = 0.005
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=1,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.2, -0.2, 0.25),
+            camera_lookat=(0.0, 0.0, 0.1),
+        ),
+        show_viewer=show_viewer,
+    )
+    # Five fixed boxes of growing sizes around the same center, their tops flush, under a rod sinking into all of them,
+    # one more than the contacts a vertex keeps
+    for size in (0.04, 0.05, 0.06, 0.07, 0.08):
+        scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(0.0, 0.0, 0.05),
+                size=(size, size, 0.1),
+                fixed=True,
+            ),
+            material=gs.materials.Rigid(
+                needs_coup=True,
+            ),
+        )
+    scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=3,
+            interval=0.01,
+            pos=(-0.01, 0.0, 0.1 + radius - 1e-3),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=radius,
+        ),
+    )
+    scene.build()
+    # See test_rod_contact_candidates_overflow_is_reported
+    with pytest.raises(gs.GenesisException, match="rigid geoms that need coupling"):
+        for _ in range(3):
+            scene.step()
+
+
+@pytest.mark.required
 @pytest.mark.parametrize("precision", ["32", "64"])
 def test_rod_contacts_resolve_at_any_precision(precision, show_viewer):
     radius, penetration = 0.005, 2e-3

@@ -54,6 +54,8 @@ class RodErrorCode(ErrorCode):
 
     INVALID_VERTEX_NAN = auto()
     OVERFLOW_ROD_CANDIDATES = auto()
+    # A vertex touching more rigid geoms at once than it keeps contacts with (see RodRigidContacts)
+    OVERFLOW_ROD_RIGID_CONTACTS = auto()
 
 
 # The rods, their vertices and edges, their hinges (the internal vertices joining two consecutive edges of a rod) and
@@ -332,7 +334,8 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     penetration weighted by the weight of the vertex in its point along the edge. A point inside an edge is thus a
     contact of the vertices of the edge whose spheres miss the geom, each resolving its share of it (see
     'func_rod_rigid_contact_share' in legacy_coupler.py), and no vertex owns it. A vertex keeps its first contacts, the
-    geoms in their order.
+    geoms in their order, and touching more geoms at once than it keeps raises OVERFLOW_ROD_RIGID_CONTACTS (see
+    RodErrorCode).
     """
 
     n_contacts: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))
@@ -1858,6 +1861,11 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
                 RodErrorCode.OVERFLOW_ROD_CANDIDATES: lambda: (
                     f"Exceeding max number of candidate pairs of rod edges ({self._n_edge_pair_candidates}). Please "
                     "increase the value of RodOptions' option 'multiplier_contact_candidates'."
+                ),
+                RodErrorCode.OVERFLOW_ROD_RIGID_CONTACTS: lambda: (
+                    f"A vertex of the rods touches more than {ROD_RIGID_CONTACTS_PER_VERT} rigid geoms that need "
+                    "coupling at once, the most contacts a vertex resolves. Please keep fewer coupled geoms overlapping "
+                    "at any point a rod reaches."
                 ),
             },
         )

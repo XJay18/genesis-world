@@ -43,6 +43,7 @@ from genesis.engine.solvers.rigid.data import (
 from genesis.engine.solvers.rod_solver import (
     ROD_EDGES,
     RodData,
+    RodErrorCode,
     RodInfo,
     RodState,
     func_inverse_mass,
@@ -1384,6 +1385,7 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
                 compute_contacts=True,
                 compute_impulses=False,
                 is_step_start=is_step_start,
+                errno=self.rod_solver.data_manager.errno,
             )
             kernel_rod_rigid_links_response(
                 self.rod_solver.rod_state,
@@ -1414,6 +1416,7 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
                 compute_contacts=False,
                 compute_impulses=True,
                 is_step_start=is_step_start,
+                errno=self.rod_solver.data_manager.errno,
             )
             kernel_project_rod_rigid_friction(
                 self.rod_solver.rod_state,
@@ -1443,6 +1446,7 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
                 rigid_solver.collider.collider_config,
                 self.rod_solver.rod_config,
                 is_step_start,
+                self.rod_solver.data_manager.errno,
             )
 
     @property
@@ -3795,6 +3799,7 @@ def func_project_rod_rigid_normal(
     compute_contacts: qd.template(),
     compute_impulses: qd.template(),
     is_step_start: qd.template(),
+    errno: qd.Tensor,
 ):
     """Apply the last correction of the projection of the rods, find their contacts with the rigid geoms that need
     coupling, and compute the normal impulses of the contacts and the normal corrections of the rods.
@@ -3812,7 +3817,8 @@ def func_project_rod_rigid_normal(
 
     The points of the edges and of the sphere of every vertex are searched in every geom near it in parallel (see
     RodRigidSlots), each vertex then keeps its contact with each geom, its first contacts in the order of the geoms, and
-    the contacts kept are evaluated again in parallel, so that the gradient flows through their evaluations alone.
+    the contacts kept are evaluated again in parallel, so that the gradient flows through their evaluations alone. A
+    vertex touching more geoms than it keeps contacts flags OVERFLOW_ROD_RIGID_CONTACTS in `errno` (see RodErrorCode).
 
     Each vertex takes the impulses of its contacts alone, as if their points were at the vertex, and its contacts are
     solved together, each impulse non-negative (see 'func_solve_nonnegative'). A vertex pressed by two geoms from
@@ -3963,6 +3969,7 @@ def func_project_rod_rigid_normal(
 
         for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
             n_contacts = 0
+            is_overflow = False
             contact_geom_idx = -1
             penetration_max = gs.qd_float(0.0)
             for i_gc in range(rod_state.rigid_slots.geoms_idx.shape[0]):
@@ -4004,7 +4011,11 @@ def func_project_rod_rigid_normal(
                         rod_state.rigid_contacts.t[i_v, n_contacts, i_b] = contact_t
                         rod_state.rigid_contacts.t_end[i_v, n_contacts, i_b] = contact_t_end
                         n_contacts += 1
+                    elif is_found:
+                        is_overflow = True
             rod_state.rigid_contacts.n_contacts[i_v, i_b] = n_contacts
+            if is_overflow:
+                errno[i_b] = errno[i_b] | RodErrorCode.OVERFLOW_ROD_RIGID_CONTACTS
             if contact_geom_idx >= 0:
                 rod_state.verts.contact_geom_idx[i_v, i_b] = contact_geom_idx
             elif is_step_start:
@@ -4325,6 +4336,7 @@ def kernel_project_rod_rigid_normal(
     compute_contacts: qd.template(),
     compute_impulses: qd.template(),
     is_step_start: bool,
+    errno: qd.Tensor,
 ):
     """Find the rod-rigid contacts, compute their normal impulses, or both (see func_project_rod_rigid_normal)."""
     func_project_rod_rigid_normal(
@@ -4346,6 +4358,7 @@ def kernel_project_rod_rigid_normal(
         compute_contacts,
         compute_impulses,
         is_step_start,
+        errno,
     )
 
 
@@ -4585,6 +4598,7 @@ def kernel_project_rod_rigid_contacts(
     collider_config: qd.template(),
     rod_config: qd.template(),
     is_step_start: bool,
+    errno: qd.Tensor,
 ):
     """Project the rods out of the rigid geoms that need coupling, with friction, captured as one graph.
 
@@ -4609,6 +4623,7 @@ def kernel_project_rod_rigid_contacts(
         compute_contacts=True,
         compute_impulses=True,
         is_step_start=is_step_start,
+        errno=errno,
     )
     func_project_rod_rigid_friction(
         rod_state, links_state, rod_info, links_info, geoms_info, legacy_coupler_info, rigid_config, rod_config
