@@ -33,10 +33,10 @@ class Base(Material["RodEntity"]):
         twisting. Default is 1e6.
     plastic_yield : float, optional
         Curvature beyond which bending deforms the rest shape permanently, in 1/m: the bend of the rod away from its
-        rest shape, measured at each vertex as the curvature binormal |kb| = 2 tan(phi / 2) of the turning angle phi
-        over the rest length around the vertex (the mean rest length of its two edges). A finite yield lets the rod keep
-        the shape it is bent into, as a wire does, at the cost of a rest shape that drifts with every sharp bend.
-        Infinity keeps the rod elastic. Default is infinity.
+        rest shape, measured at each vertex as the length 2 tan(phi / 2) of the curvature binormal, phi being the
+        turning angle there, over the rest length around the vertex (the mean rest length of its two edges). A finite
+        yield lets the rod keep the shape it is bent into, as a wire does, at the cost of a rest shape that drifts with
+        every sharp bend. Infinity keeps the rod elastic. Default is infinity.
     plastic_creep : float, optional
         How fast the rest shape follows a bend beyond the yield. At each substep, the rest curvature at a vertex bent
         beyond the yield moves toward its curvature by this value times the fraction 1 - (yield / bend)^2 of their
@@ -81,9 +81,9 @@ class Base(Material["RodEntity"]):
         slows down. Where the substep is too long to integrate the twist stably at this inertia, as for the stiff twist
         of short edges at the default 10 ms step, the inertia is raised to the smallest stable value: a shorter substep
         keeps it physical. The raise counts the twisting stiffness alone: the bending adds a twist stiffness only
-        through a rest curvature, which stays stable while |kb| |kappa_rest| < 8 m l / (pi E r^2 dt^2) at every hinge,
-        with kb the curvature binormal (2 tan(phi / 2) for a turning angle phi), kappa_rest the rest curvature, l the
-        edge length and dt the substep. Default is None.
+        through a rest curvature, which stays stable while kb * kappa_rest < 8 m l / (pi E r^2 dt^2) at every vertex,
+        with kb the length of the curvature binormal (2 tan(phi / 2) for a turning angle phi), kappa_rest the length of
+        the rest curvature, m the mass of the edge, l its length and dt the substep. Default is None.
     """
 
     structure: ClassVar[STRUCTURE] = STRUCTURE.DEFORMABLE
