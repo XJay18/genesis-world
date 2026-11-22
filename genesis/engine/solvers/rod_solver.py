@@ -2430,7 +2430,9 @@ class RodScopedRenderContext(ScopedRenderContext[RodSolver]):
     """The tube drawn around each rod, and the marker of its constrained vertices, as the visual options ask.
 
     The tube surrounds each vertex of the centerline with a ring at its radius, perpendicular to the mean tangent of its
-    edges and turned by the first director of their reference frames, so that a texture follows the twist of the rod.
+    edges and turned by the first director of their reference frames, so that a texture turns with the bending of the
+    rod. The twist angle of the material frames leaves it in place: a rod spinning about its axis keeps its texture
+    still.
     Hemispherical caps close the ends of an open rod. The texture coordinates run around the tube and along its
     vertices. The tube is the surface the rod collides with, which the debug views draw too.
     """
