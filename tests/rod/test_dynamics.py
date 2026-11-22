@@ -446,8 +446,12 @@ def test_inextensible_edge_lengths_and_checkpoint(show_viewer):
     pos = rod.get_verts_pos()
     # The rod swings down from its fixed end
     assert (pos[:, -1, 2] < 0.5 - 0.05).all()
-    # FIXME: the bound on the edge length error is measured. Replace with a bound derived from the projection residual.
-    assert max(length_errors) < 5e-4
+    # Each of the k projections of a substep h passes half of the length error of an edge on to its neighbours, which
+    # leaves an edge pulling vertices of mass m with a tension T stretched by 2 h^2 T / (k m l) on average with its
+    # neighbour, and every other edge by twice that for an even k. Swinging down, the rod pulls its clamp with less
+    # than the weight of its free vertices, which bounds the strain by 4 h^2 (n_verts - 2) g / (k l), 7.5e-4 at the
+    # default 10 projections.
+    assert max(length_errors) < 1e-3
     # Every projection is gathered per vertex in a fixed order, so identical environments stay bitwise identical
     assert_equal(pos, pos[:1].expand_as(pos))
 
