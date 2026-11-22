@@ -300,6 +300,39 @@ def test_rod_contact_outside_candidates_grad_matches_fd(backend, show_viewer):
                 (n_verts_a, "y", (0.0, -0.05, -dent + 0.007 + 3e-5), 0.002),
             )
         )
+        # Far from them, a fixed rod overlapping a short free rod by 3 mm pushes it at the first projection into another
+        # short rod, which lies beyond the reach of their bounding spheres until then: that pair comes into contact,
+        # outside of the candidates, from a later projection on
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=3,
+                interval=0.004,
+                axis="x",
+                pos=(0.296, 0.0, 0.0),
+                fixed=True,
+            ),
+            material=gs.materials.Rod.Base(
+                segment_radius=0.005,
+            ),
+        )
+        rod_pushed, rod_hit = (
+            scene.add_entity(
+                morph=gs.morphs.ParameterizedRod(
+                    n_vertices=3,
+                    interval=0.002,
+                    axis=axis,
+                    pos=pos,
+                ),
+                material=gs.materials.Rod.Base(
+                    E=1e5,
+                    G=1e4,
+                    inextensible=True,
+                    segment_mass=0.002,
+                    segment_radius=0.001,
+                ),
+            )
+            for axis, pos in (("y", (0.3, -0.002, 0.003)), ("x", (0.298, 0.0, 0.0075)))
+        )
         scene.build()
 
         vel = torch.zeros((n_verts_b, 3), dtype=gs.tc_float, device=gs.device)
@@ -316,19 +349,27 @@ def test_rod_contact_outside_candidates_grad_matches_fd(backend, show_viewer):
             scene.reset()
             rod_b.set_velocity(vel)
             scene.step()
-        pos_by_config.append(torch.cat([rod_b.get_verts_pos(), rod_a.get_verts_pos()]))
+        pos_by_config.append(
+            torch.cat(
+                [rod_b.get_verts_pos(), rod_a.get_verts_pos(), rod_pushed.get_verts_pos(), rod_hit.get_verts_pos()]
+            )
+        )
     assert_allclose(pos_by_config[1], pos_by_config[0], atol=1e-12)
 
-    # The contact is real and comes from the fallback: the broadphase listed no pair of edges of the two rods, the
-    # environment went past the margin, and the contact moved the rod A up
+    # The contacts are real and come from the fallback: the broadphase listed no pair of edges of the rods B and A nor
+    # of the pushed and the hit rods, the environment went past the margin, and the contacts moved the rod A and the
+    # hit rod up
     solver = scene.rod_solver
     assert solver.has_broadphase
     assert qd_to_numpy(solver.rod_state.broadphase.is_stale)[0]
     n_edges_b = n_verts_b - 1
+    n_edges_hit = rod_hit.n_edges
     edges_idx = qd_to_numpy(solver.rod_state.edge_pairs.edges_idx)[:, 0]
     n_candidates = int(qd_to_numpy(solver.rod_state.broadphase.n_candidates)[0])
     assert not ((edges_idx[:n_candidates, 0] < n_edges_b) & (edges_idx[:n_candidates, 1] >= n_edges_b)).any()
-    assert (pos_by_config[1][n_verts_b:, 2] - rod_a.init_positions[:, 2]).abs().max() > 1e-5
+    assert not (edges_idx[:n_candidates, 1] >= solver.n_edges - n_edges_hit).any()
+    assert (pos_by_config[1][n_verts_b : n_verts_b + n_verts_a, 2] - rod_a.init_positions[:, 2]).abs().max() > 1e-5
+    assert (pos_by_config[1][-rod_hit.n_verts :, 2] - rod_hit.init_positions[:, 2]).max() > 1e-4
 
     rng = np.random.default_rng(0)
     weights = torch.tensor(rng.standard_normal((n_verts_b, 3)), dtype=gs.tc_float, device=gs.device)

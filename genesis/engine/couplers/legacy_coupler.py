@@ -46,9 +46,9 @@ from genesis.engine.solvers.rod_solver import (
     RodErrorCode,
     RodInfo,
     RodState,
+    func_friction_correction,
     func_inverse_mass,
     func_is_free,
-    func_last_projection_correction,
     reversed_with_atomic_sums,
 )
 from genesis.engine.solvers.sph_solver import (
@@ -1355,9 +1355,9 @@ class LegacyCoupler(BuildableMixin, BatchedMixin, ErrnoMixin, CheckpointMixin, R
         """
         Project the rods out of the rigid geoms that need coupling, with friction, and apply the reaction to the geoms.
 
-        The rod solver calls it after its own projections, before it applies the last correction (see
-        'kernel_finalize_rod_positions' in rod_solver.py), so that the contacts with the rigid geoms see the whole motion
-        of the substep and act once on it.
+        The rod solver calls it after its own projections and the friction of the rod-rod contacts, before it applies
+        the last correction (see 'kernel_finalize_rod_positions' in rod_solver.py), so that the contacts with the rigid
+        geoms see the whole motion of the substep and act once on it.
         """
         rigid_solver = self.rigid_solver
         is_step_start = self.sim.cur_substep_global % self.sim.substeps == 0
@@ -3801,8 +3801,8 @@ def func_project_rod_rigid_normal(
     is_step_start: qd.template(),
     errno: qd.Tensor,
 ):
-    """Apply the last correction of the projection of the rods, find their contacts with the rigid geoms that need
-    coupling, and compute the normal impulses of the contacts and the normal corrections of the rods.
+    """Apply the last correction of the rods, find their contacts with the rigid geoms that need coupling, and compute
+    the normal impulses of the contacts and the normal corrections of the rods.
 
     A vertex has at most one contact with each geom (see 'RodRigidContacts'): its sphere where the sphere touches the
     geom, and otherwise, of the deepest points of its two edges (see 'func_rod_rigid_contact_search'), the one pressing
@@ -3882,7 +3882,7 @@ def func_project_rod_rigid_normal(
     IS_EXACT = qd.static(rod_config.is_deterministic)
     if qd.static(compute_contacts):
         for i_v, i_b in qd.ndrange(rod_state.verts.pos.shape[0], rod_state.verts.pos.shape[1]):
-            rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + func_last_projection_correction(
+            rod_state.verts.pos[i_v, i_b] = rod_state.verts.pos[i_v, i_b] + func_friction_correction(
                 i_v, i_b, rod_state, rod_config
             )
             rod_state.rigid_slots.n_near_geoms[i_v, i_b] = 0

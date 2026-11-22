@@ -804,19 +804,20 @@ def test_rod_contacts_keep_rods_apart(contact_margin, asset_tmp_path, show_viewe
 
 
 @pytest.mark.required
-def test_rod_contact_candidates_overflow_is_reported(asset_tmp_path, show_viewer):
-    # A coil holding far more pairs of edges in contact than the capacity of the broadphase set by the multiplier
+@pytest.mark.parametrize("is_stale", [False, True])
+def test_rod_contact_candidates_overflow_is_reported(is_stale, asset_tmp_path, show_viewer):
+    # A coil holding far more pairs of edges in contact than the capacity of the broadphase set by the multiplier, or
+    # a comb of short rods apart by more than the margin, whose first two teeth overlap: their push takes the comb past
+    # the margin, and its pairs outside of the candidates within the reach of their bounding spheres outnumber the
+    # free slots
     radius = 0.005
-    angle = np.linspace(0.0, 6.0 * np.pi, 60)
-    coil = np.stack([0.03 * np.cos(angle), 0.03 * np.sin(angle), 0.9 * radius * angle / np.pi], axis=-1)
-    file = str(asset_tmp_path / "rod_coil.npy")
-    np.save(file, coil)
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1e-3,
             substeps=1,
         ),
         rod_options=gs.options.RodOptions(
+            contact_margin=1e-6 if is_stale else None,
             multiplier_contact_candidates=1,
         ),
         viewer_options=gs.options.ViewerOptions(
@@ -825,15 +826,33 @@ def test_rod_contact_candidates_overflow_is_reported(asset_tmp_path, show_viewer
         ),
         show_viewer=show_viewer,
     )
-    scene.add_entity(
-        morph=gs.morphs.Rod(
-            file=file,
-            pos=(0.0, 0.0, 0.05),
-        ),
-        material=gs.materials.Rod.Base(
-            segment_radius=radius,
-        ),
-    )
+    if is_stale:
+        for i_tooth in range(12):
+            scene.add_entity(
+                morph=gs.morphs.ParameterizedRod(
+                    n_vertices=3,
+                    interval=0.005,
+                    axis="y",
+                    pos=(0.002 * i_tooth - 0.0012 * (i_tooth > 0), 0.0, 0.05),
+                ),
+                material=gs.materials.Rod.Base(
+                    segment_radius=0.0005,
+                ),
+            )
+    else:
+        angle = np.linspace(0.0, 6.0 * np.pi, 60)
+        coil = np.stack([0.03 * np.cos(angle), 0.03 * np.sin(angle), 0.9 * radius * angle / np.pi], axis=-1)
+        file = str(asset_tmp_path / "rod_coil.npy")
+        np.save(file, coil)
+        scene.add_entity(
+            morph=gs.morphs.Rod(
+                file=file,
+                pos=(0.0, 0.0, 0.05),
+            ),
+            material=gs.materials.Rod.Base(
+                segment_radius=radius,
+            ),
+        )
     scene.build()
     # A step raises the errors of the last ones, one call later on the devices not blocking on their flags
     with pytest.raises(gs.GenesisException, match="multiplier_contact_candidates"):
@@ -982,7 +1001,7 @@ def test_rod_contact_at_immovable_vertices_does_not_lever_free_vertex(show_viewe
 
 @pytest.mark.required
 def test_rod_contact_friction_follows_coulomb_law(show_viewer):
-    radius, dt, gravity, static_friction, kinetic_friction = 0.005, 1e-3, 9.81, 0.3, 0.25
+    radius, dt, gravity, static_friction, kinetic_friction, n_steps = 0.005, 1e-3, 9.81, 0.3, 0.25, 10
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=dt,
@@ -1032,20 +1051,35 @@ def test_rod_contact_friction_follows_coulomb_law(show_viewer):
         )
         for x in (0.0, 0.11)
     ]
-    scene.build(n_envs=2)
+    scene.build(n_envs=4)
     # A rope resting on a support sinks into it by the fall of a substep, g dt^2, from which the friction bounds the
     # change of the tangential velocity over the substep: mu_s g dt for a static contact, which a slower slip is within,
     # and mu_k g dt once it slides, the kinetic deceleration mu_k g
     vel_static = 0.5 * static_friction * gravity * dt
     vel_sliding = 3.0 * static_friction * gravity * dt
     for rope in ropes:
-        rope.set_velocity([[vel_static, 0.0, 0.0], [vel_sliding, 0.0, 0.0]])
+        rope.set_velocity([[vel_static, 0.0, 0.0], [vel_sliding, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    # The ropes at rest on the bars tilted along them, below the friction angle, where they stay, and above it, where
+    # they slide down at g (sin(theta) - mu_k cos(theta))
+    angles_tilt = (math.atan(0.9 * static_friction), math.atan(1.1 * static_friction))
+    scene.rod_solver.set_gravity(
+        [[gravity * math.sin(angle), 0.0, -gravity * math.cos(angle)] for angle in angles_tilt], envs_idx=[2, 3]
+    )
+    ropes_pos_init = [tensor_to_array(rope.get_verts_pos()) for rope in ropes]
     scene.step()
     for rope in ropes:
         verts_vel = tensor_to_array(rope.get_verts_vel())
         # The slow rope stops within the substep, and the fast one slides on
         assert_allclose(verts_vel[0, :, :2], 0.0, atol=5e-11)
         assert_allclose(verts_vel[1, :, 0], vel_sliding - kinetic_friction * gravity * dt, atol=1e-5)
+    for _ in range(n_steps - 1):
+        scene.step()
+    vel_slide = gravity * (math.sin(angles_tilt[1]) - kinetic_friction * math.cos(angles_tilt[1])) * n_steps * dt
+    for rope, pos_init in zip(ropes, ropes_pos_init):
+        # Each substep, the tilted gravity moves the rope along the slope before the contacts act, which the static
+        # friction takes back in full: the rope stays where it lies, and creeps by nothing
+        assert_allclose(tensor_to_array(rope.get_verts_pos())[2], pos_init[2], atol=1e-9)
+        assert_allclose(tensor_to_array(rope.get_verts_vel())[3, :, 0], vel_slide, atol=2e-4)
 
 
 @pytest.mark.required
