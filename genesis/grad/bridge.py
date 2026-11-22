@@ -404,8 +404,8 @@ class LaunchRecorder:
             for struct in structs:
                 _LAUNCH_ARRAYS_CACHE.own(struct, launch_key, launch_arrays)
         arrays_used, arrays_read, arrays_written, arrays_written_ids = launch_arrays
-        # FIXME: U1 (DLO-Solver upstream issues) - the saves of the arrays read since their last write, through cached
-        # views, are carried locally until upstream changes the recorder.
+        # FIXME: the saves are narrowed to the arrays read since their last write, through cached views, a local change
+        # to upstream Genesis, whose recorder saves every array an earlier entry used, at one copy per array and launch.
         self._is_saving = True
         # FIXME: DLPack may return old values on Apple Metal if sync is not systematically called manually
         is_sync_pending = gs.backend == gs.metal
