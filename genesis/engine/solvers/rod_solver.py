@@ -1712,10 +1712,10 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
     """
     Solver of the rods: discrete elastic rods with stretching, bending and twisting energies.
 
-    Each substep integrates the velocities from the gradients of the elastic energies (symplectic Euler), integrates
-    the positions, projects them on the inextensibility and rod-rod contact constraints, then out of the rigid geoms
-    where the rods couple with them, updates the velocities from the projected positions and applies the friction of the
-    rod-rod contacts. The backward pass of a step replays each substep from its start (see 'LaunchRecorder').
+    Each substep integrates the velocities from the gradients of the elastic energies (symplectic Euler), exchanges
+    impulses with the MPM materials the rods touch, integrates the positions, projects them on the inextensibility and
+    rod-rod contact constraints, then out of the rigid geoms that need coupling, updates the velocities from the
+    projected positions and applies the friction of the rod-rod contacts.
     """
 
     entity_spec_cls: ClassVar[type[gs.entities.Spec]] = gs.entities.Rod
@@ -2130,7 +2130,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         Parameters
         ----------
         pos : array_like, shape ([M,] [N,] 3)
-            Target position of each vertex.
+            The position of each vertex, in meters.
         verts_idx : None | int | array_like, shape ([M,] N), optional
             Global index of the vertices, once for every environment or one row per environment. If None, all vertices
             will be considered. Defaults to None.
@@ -2148,7 +2148,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
     @gs.assert_built
     @mutates(StateChange.DYNAMICS)
     def set_verts_vel(self, vel, verts_idx=None, envs_idx=None):
-        """Set the velocity of some vertices of the rods (see 'set_verts_pos')."""
+        """Set the velocity of some vertices of the rods, in m/s (see 'set_verts_pos' for the arguments)."""
         vel, verts_idx, envs_idx = self._sanitize_io_variables(
             vel, verts_idx, self.n_verts, "verts_idx", envs_idx, (3,), batched_idx=True
         )
@@ -2165,17 +2165,17 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         kernel_set_rod_edges_theta(edges_idx, envs_idx, theta, self.rod_state)
 
     def get_verts_pos(self, verts_idx=None, envs_idx=None):
-        """Get the position of some vertices of the rods (see 'set_verts_pos')."""
+        """Get the position of some vertices of the rods, in meters (see 'set_verts_pos')."""
         tensor = self._read_data(self.rod_state.verts.pos, envs_idx, verts_idx, copy=True)
         return tensor[0] if self.n_envs == 0 else tensor
 
     def get_verts_vel(self, verts_idx=None, envs_idx=None):
-        """Get the velocity of some vertices of the rods (see 'set_verts_pos')."""
+        """Get the velocity of some vertices of the rods, in m/s (see 'set_verts_pos')."""
         tensor = self._read_data(self.rod_state.verts.vel, envs_idx, verts_idx, copy=True)
         return tensor[0] if self.n_envs == 0 else tensor
 
     def get_edges_theta(self, edges_idx=None, envs_idx=None):
-        """Get the twist angle of the material frame of some edges (see 'set_edges_theta')."""
+        """Get the twist angle of the material frame of some edges, in radians (see 'set_edges_theta')."""
         tensor = self._read_data(self.rod_state.edges.theta, envs_idx, edges_idx, copy=True)
         return tensor[0] if self.n_envs == 0 else tensor
 
@@ -2302,6 +2302,8 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         """
         Get a rigid geom each vertex of the rods penetrated during the last step, -1 for none.
 
+        It raises an exception in a scene where the rods collide with no rigid geom.
+
         A vertex penetrates a geom where its sphere overlaps it, or the capsule of one of its edges does at a point
         closer to it than to the other vertex of the edge. Each substep of the step in which a vertex penetrates some
         geom records the geom it penetrates deepest, so that the geom of the latest such substep is reported, also when
@@ -2357,22 +2359,27 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @property
     def is_active(self):
+        """Whether the scene holds any rod."""
         return self.n_verts > 0
 
     @property
     def n_rods(self):
+        """The number of rods of the scene."""
         return len(self._entities)
 
     @property
     def n_verts(self):
+        """The number of vertices of all the rods."""
         return sum(entity.n_verts for entity in self._entities)
 
     @property
     def n_edges(self):
+        """The number of edges of all the rods."""
         return sum(entity.n_edges for entity in self._entities)
 
     @property
     def n_hinges(self):
+        """The number of hinges of all the rods, the vertices joining two edges."""
         return sum(entity.n_hinges for entity in self._entities)
 
     @property
@@ -2403,7 +2410,7 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
 
     @property
     def contact_margin(self):
-        """How far a vertex may move over the projections of a substep before a contact may be missed, in meters."""
+        """The margin of the search for rod-rod contacts, in meters (see 'RodOptions.contact_margin')."""
         return self._contact_margin
 
 
@@ -2424,7 +2431,9 @@ class RodScopedRenderContext(ScopedRenderContext[RodSolver]):
     """The tube drawn around each rod, and the marker of its constrained vertices, as the visual options ask.
 
     The tube surrounds each vertex of the centerline with a ring at its radius, perpendicular to the mean tangent of its
-    edges and turned by the first director of their reference frames, so that a texture follows the twist of the rod.
+    edges and turned by the first director of their reference frames, so that a texture turns with the bending of the
+    rod. The twist angle of the material frames leaves it in place: a rod spinning about its axis keeps its texture
+    still.
     Hemispherical caps close the ends of an open rod. The texture coordinates run around the tube and along its
     vertices. The tube is the surface the rod collides with, which the debug views draw too.
     """
