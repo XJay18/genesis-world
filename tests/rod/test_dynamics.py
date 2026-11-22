@@ -573,6 +573,18 @@ def test_vertex_constraints_reset_with_state(show_viewer):
             (3, (0.0, -0.3, 0.3), True),
         )
     ]
+    # A rope lying across the middle of the fixed rod
+    rope = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=3,
+            interval=0.01,
+            axis="y",
+            pos=(0.01, -0.31, 0.31),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=0.005,
+        ),
+    )
     with pytest.raises(gs.GenesisException, match="fixed vertex indices"):
         scene.add_entity(morph=gs.morphs.ParameterizedRod(n_vertices=3, fixed=(3,)), material=gs.materials.Rod.Base())
     scene.build(n_envs=2)
@@ -631,8 +643,28 @@ def test_vertex_constraints_reset_with_state(show_viewer):
     # The marker of the constrained vertices stands at every vertex of the rods, shown at those fixed or constrained in
     # each environment
     (constrained_points,) = scene.sim.render_context.get_markers()
-    assert_allclose(constrained_points.pos, torch.cat([rod.get_verts_pos() for rod in rods], dim=-2), tol=gs.EPS)
-    assert_equal(constrained_points.is_active, torch.cat([rod.get_verts_kinematic() for rod in rods], dim=-1))
+    assert_allclose(
+        constrained_points.pos,
+        torch.cat([*(rod.get_verts_pos() for rod in rods), rope.get_verts_pos()], dim=-2),
+        tol=gs.EPS,
+    )
+    assert_equal(
+        constrained_points.is_active,
+        torch.cat([*(rod.get_verts_kinematic() for rod in rods), rope.get_verts_kinematic()], dim=-1),
+    )
+
+    # The vertices fixed by the morphs, by the setter and while moving, and the constrained one, keep their zero
+    # velocity whatever velocity the rods are given, so that the rope lying on the fixed rod stays where it lies
+    rope_pos = rope.get_verts_pos()
+    for rod in rods:
+        rod.set_velocity((0.5, 0.0, 0.0))
+    rods[1].set_verts_fixed(True, 5)
+    for rod in rods:
+        assert_allclose(rod.get_verts_vel()[rod.get_verts_kinematic()], 0.0, tol=gs.EPS)
+    for _ in range(20):
+        scene.step()
+    assert_allclose(rods[2].get_verts_vel(), 0.0, tol=gs.EPS)
+    assert_allclose(rope.get_verts_pos()[..., 0], rope_pos[..., 0], tol=gs.EPS)
 
 
 @pytest.mark.required
@@ -810,6 +842,50 @@ def test_rod_contact_candidates_overflow_is_reported(asset_tmp_path, show_viewer
 
 
 @pytest.mark.required
+def test_rod_rigid_contacts_overflow_is_reported(show_viewer):
+    radius = 0.005
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=1,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.2, -0.2, 0.25),
+            camera_lookat=(0.0, 0.0, 0.1),
+        ),
+        show_viewer=show_viewer,
+    )
+    # Five fixed boxes of growing sizes around the same center, their tops flush, under a rod sinking into all of them,
+    # one more than the contacts a vertex keeps
+    for size in (0.04, 0.05, 0.06, 0.07, 0.08):
+        scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(0.0, 0.0, 0.05),
+                size=(size, size, 0.1),
+                fixed=True,
+            ),
+            material=gs.materials.Rigid(
+                needs_coup=True,
+            ),
+        )
+    scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=3,
+            interval=0.01,
+            pos=(-0.01, 0.0, 0.1 + radius - 1e-3),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=radius,
+        ),
+    )
+    scene.build()
+    # See test_rod_contact_candidates_overflow_is_reported
+    with pytest.raises(gs.GenesisException, match="rigid geoms that need coupling"):
+        for _ in range(3):
+            scene.step()
+
+
+@pytest.mark.required
 @pytest.mark.parametrize("precision", ["32", "64"])
 def test_rod_contacts_resolve_at_any_precision(precision, show_viewer):
     radius, penetration = 0.005, 2e-3
@@ -902,6 +978,74 @@ def test_rod_contact_at_immovable_vertices_does_not_lever_free_vertex(show_viewe
     # The overlap is at immovable points of both rods: removing it would turn the free edge about its fixed vertex,
     # moving its free vertex by the penetration over its weight in the point (20 mm), so it stays
     assert_allclose(rod.get_verts_pos(), pos_init, atol=1e-9)
+
+
+@pytest.mark.required
+def test_rod_contact_friction_follows_coulomb_law(show_viewer):
+    radius, dt, gravity, static_friction, kinetic_friction = 0.005, 1e-3, 9.81, 0.3, 0.25
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=dt,
+            substeps=1,
+            gravity=(0.0, 0.0, -gravity),
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.05, -0.25, 0.15),
+            camera_lookat=(0.05, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    material = gs.materials.Rod.Base(
+        segment_radius=radius,
+        static_friction=static_friction,
+        kinetic_friction=kinetic_friction,
+    )
+    # Two fixed bars along x, and two short ropes lying across them, without bending stiffness. The first crosses the
+    # bars at their vertices, where each of its edges touches two edges of a bar, the second between them, where its
+    # middle vertex takes the contacts of both bars
+    for y in (-0.01, 0.01):
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=21,
+                interval=0.02,
+                axis="x",
+                pos=(-0.2, y, 0.0),
+                fixed=True,
+            ),
+            material=material,
+        )
+    ropes = [
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=3,
+                interval=0.02,
+                axis="y",
+                pos=(x, -0.02, 2.0 * radius),
+            ),
+            material=gs.materials.Rod.Base(
+                E=0.0,
+                G=0.0,
+                segment_radius=radius,
+                static_friction=static_friction,
+                kinetic_friction=kinetic_friction,
+            ),
+        )
+        for x in (0.0, 0.11)
+    ]
+    scene.build(n_envs=2)
+    # A rope resting on a support sinks into it by the fall of a substep, g dt^2, from which the friction bounds the
+    # change of the tangential velocity over the substep: mu_s g dt for a static contact, which a slower slip is within,
+    # and mu_k g dt once it slides, the kinetic deceleration mu_k g
+    vel_static = 0.5 * static_friction * gravity * dt
+    vel_sliding = 3.0 * static_friction * gravity * dt
+    for rope in ropes:
+        rope.set_velocity([[vel_static, 0.0, 0.0], [vel_sliding, 0.0, 0.0]])
+    scene.step()
+    for rope in ropes:
+        verts_vel = tensor_to_array(rope.get_verts_vel())
+        # The slow rope stops within the substep, and the fast one slides on
+        assert_allclose(verts_vel[0, :, :2], 0.0, atol=5e-11)
+        assert_allclose(verts_vel[1, :, 0], vel_sliding - kinetic_friction * gravity * dt, atol=1e-5)
 
 
 @pytest.mark.required
@@ -2199,6 +2343,31 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
             segment_radius=radius,
         ),
     )
+    # Far from the others, a rod between two fixed walls closer than its diameter, which squeeze it from both sides
+    slot_gap = 2.0 * radius - 2e-3
+    for sign in (1.0, -1.0):
+        scene.add_entity(
+            morph=gs.morphs.Box(
+                pos=(1.0, sign * (0.5 * slot_gap + 0.05), 0.1),
+                size=(0.2, 0.1, 0.1),
+                fixed=True,
+            ),
+            material=gs.materials.Rigid(
+                needs_coup=True,
+                coup_friction=0.6,
+            ),
+        )
+    rod_slot = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=7,
+            interval=0.02,
+            pos=(0.94, 0.0, 0.1),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.001,
+            segment_radius=radius,
+        ),
+    )
     scene.build(n_envs=2)
     rod_held.set_verts_fixed(True, verts_idx_local=[0, 6])
     pads_dof = [gripper.get_joint(name).dofs_idx_local[0] for name in ("left_close", "right_close")]
@@ -2222,9 +2391,10 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
     rigid_solver = scene.sim.rigid_solver
     constraint_state = rigid_solver.constraint_solver.constraint_state
     rod_state = scene.sim.rod_solver.rod_state
-    depth, held_slip, edge_depth, response_err = [], [], [], []
+    depth, held_slip, edge_depth, response_err, slot_offset = [], [], [], [], []
     for i_step in range(n_steps):
         scene.step()
+        slot_offset.append(tensor_to_array(rod_slot.get_verts_pos())[..., 1])
         for (gripper_pressed, box_pressed, rod_pressed), held_offset_start in zip(pressed, held_offsets_start):
             verts_pos = tensor_to_array(rod_pressed.get_verts_pos())
             box_top = tensor_to_array(box_pressed.get_pos())[:, 2] + 0.5 * box_size[2]
@@ -2274,6 +2444,55 @@ def test_rod_rigid_squeezed_rod_stays_out_of_pressed_links(two_pad_gripper, ball
     # The response the contacts read equals the one over every row to the rounding of the sums
     assert response_err
     assert np.max(response_err) < 5e-15
+    # The rod between the walls stays centred between them, both pushing it equally
+    assert np.abs(slot_offset).max() < 2e-10
+
+
+@pytest.mark.required
+def test_rod_rigid_friction_sticks_where_rod_is_placed(show_viewer):
+    radius, shift, n_steps = 0.005, 0.05, 2
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=1e-3,
+            substeps=5,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.1, -0.3, 0.2),
+            camera_lookat=(0.05, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    scene.add_entity(
+        morph=gs.morphs.Plane(),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+            coup_friction=1.0,
+        ),
+    )
+    rope = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=11,
+            interval=0.02,
+            pos=(-0.1, 0.0, radius),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_radius=radius,
+        ),
+    )
+    scene.build(n_envs=2)
+    # The rope of the second environment is moved along the ground before it lands, the one of the first once it sticks
+    # to the ground, which leaves the two at the same place
+    verts_pos = rope.get_verts_pos()
+    verts_pos[:, :, 0] += shift
+    rope.set_verts_pos(verts_pos[1:], envs_idx=[1])
+    for _ in range(n_steps):
+        scene.step()
+    verts_pos = rope.get_verts_pos()
+    verts_pos[:, :, 0] += shift
+    rope.set_position(verts_pos[:1], envs_idx=[0])
+    scene.step()
+    # The moved rope sticks where it was placed, as the other one does
+    assert_allclose(rope.get_verts_pos()[0], rope.get_verts_pos()[1], tol=gs.EPS)
 
 
 @pytest.mark.required
@@ -2314,12 +2533,39 @@ def test_rod_rests_on_supported_rigid_link(show_viewer):
             segment_radius=radius,
         ),
     )
+    # Far from the beam, a fixed box whose top is flush with the ground, and a rod lying across both, its vertices over
+    # the box touching the two at once
+    scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0.5, 0.0, -0.05),
+            size=(0.1, 0.1, 0.1),
+            fixed=True,
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=True,
+        ),
+    )
+    rod_flush = scene.add_entity(
+        morph=gs.morphs.ParameterizedRod(
+            n_vertices=10,
+            interval=0.02,
+            pos=(0.41, 0.0, radius),
+        ),
+        material=gs.materials.Rod.Base(
+            segment_mass=0.005,
+            segment_radius=radius,
+        ),
+    )
     scene.build()
     for _ in range(n_steps):
         scene.step()
     # The rod rests, the velocity of the vertices zero to the share of the substep its contacts leave to the link
     assert_allclose(rod.get_verts_vel(), 0.0, atol=5e-4)
     assert_allclose(rod.get_verts_pos()[..., 2], beam.get_pos()[..., 2] + 0.005 + radius, atol=1e-5)
+    # The rod across the box rests on the ground, its vertices over the box at the velocity the two contacts leave of
+    # the fall of a substep between them
+    assert_allclose(rod_flush.get_verts_vel(), 0.0, atol=2e-5)
+    assert_allclose(rod_flush.get_verts_pos()[..., 2], radius, atol=5e-9)
 
 
 @pytest.mark.required

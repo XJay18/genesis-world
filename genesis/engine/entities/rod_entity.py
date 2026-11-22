@@ -138,7 +138,8 @@ class RodEntity(Entity):
         Set the velocity of every vertex of the rod, or one velocity shared by all of them.
 
         The shape of the value is read as in 'set_position': shape ([M,] n_verts, 3) sets every vertex, shape (3,),
-        (M, 3) or (M, 1, 3) is shared by the vertices.
+        (M, 3) or (M, 1, 3) is shared by the vertices. A fixed or constrained vertex keeps its zero velocity (see
+        'RodSolver.set_verts_vel').
 
         Parameters
         ----------
@@ -178,7 +179,11 @@ class RodEntity(Entity):
 
     @gs.assert_built
     def set_verts_vel(self, vels, verts_idx_local=None, envs_idx=None):
-        """Set the velocity of some vertices, in m/s (see 'set_verts_pos' for the arguments)."""
+        """
+        Set the velocity of some vertices, in m/s (see 'set_verts_pos' for the arguments).
+
+        A fixed or constrained vertex keeps its zero velocity (see 'RodSolver.set_verts_vel').
+        """
         verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True, batched_idx=True)
         self._solver.set_verts_vel(vels, verts_idx, envs_idx)
 
@@ -295,9 +300,9 @@ class RodEntity(Entity):
     @gs.assert_built
     def set_verts_fixed(self, fixed, verts_idx_local=None, envs_idx=None):
         """
-        Set whether some vertices are fixed, keeping their position and velocity.
+        Set whether some vertices are fixed, keeping their position at zero velocity.
 
-        This is part of the state (see 'RodSolver.set_verts_fixed').
+        Fixing a vertex sets its velocity to zero. This is part of the state (see 'RodSolver.set_verts_fixed').
 
         Parameters
         ----------
