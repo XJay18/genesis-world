@@ -53,6 +53,20 @@ def test_tube_mesh_around_centerline(shape, show_viewer):
     # The rings of the tube lie on the surface of the rod, at its radius from the vertex they surround
     rings = mesh.vertices[: n_verts * ROD_TUBE_N_RADIAL].reshape((n_verts, ROD_TUBE_N_RADIAL, 3))
     assert_allclose(np.linalg.norm(rings - verts[:, None], axis=-1), radius, tol=1e-12)
+    # The rings lie across the rod, perpendicular to its tangent at their vertex, the bisector of the directions of the
+    # edges on either side of it, or the direction of the next edge where the rod folds back onto itself
+    edges = np.roll(verts, -1, axis=0) - verts if shape == "loop" else np.diff(verts, axis=0)
+    edges_dir = edges / np.linalg.norm(edges, axis=-1, keepdims=True)
+    if shape == "loop":
+        edges_dir_prev, edges_dir_next = np.roll(edges_dir, 1, axis=0), edges_dir
+    else:
+        edges_dir_prev, edges_dir_next = edges_dir[[0, *range(n_verts - 1)]], edges_dir[[*range(n_verts - 1), -1]]
+    verts_tangent = edges_dir_prev + edges_dir_next
+    is_folded = np.linalg.norm(verts_tangent, axis=-1) < 1.0
+    verts_tangent[is_folded] = edges_dir_next[is_folded]
+    verts_tangent /= np.linalg.norm(verts_tangent, axis=-1, keepdims=True)
+    rings_dir = (rings - verts[:, None]) / radius
+    assert_allclose((rings_dir * verts_tangent[:, None]).sum(axis=-1), 0.0, atol=2e-15)
 
 
 @pytest.mark.required
