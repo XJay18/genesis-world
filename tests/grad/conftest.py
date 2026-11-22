@@ -23,9 +23,9 @@ def step_overwrites(backend, monkeypatch):
     # Check that the backward pass of a recorded rollout reverses every entry at the values it left (see LaunchRecorder),
     # without the source analysis the recorder saves by: each reversal runs twice from the same arrays and adjoints,
     # first restoring after each entry every array it uses that an earlier entry used, then as the recorder does, and
-    # the gradients of both must be bitwise equal. The first run needs no analysis: its restores hold upstream's saves,
-    # those of the arrays an entry writes, and also undo what the reversal of an entry writes. The reversals of a backend
-    # repeat bit for bit on CPU alone, where it runs.
+    # the gradients of both must agree to their rounding. The first run needs no analysis: its restores hold upstream's
+    # saves, those of the arrays an entry writes, and also undo what the reversal of an entry writes. It runs on CPU
+    # alone, where the arrays the kernels write are the same as on any backend.
     if isinstance(backend, str):
         backend = getattr(gs.constants.backend, backend)
     if backend != gs.cpu:
@@ -82,6 +82,16 @@ def step_overwrites(backend, monkeypatch):
         if value.is_floating_point():
             return torch.allclose(value, value_ref, rtol=0.0, atol=0.0, equal_nan=True)
         return torch.equal(value, value_ref)
+
+    def is_rounding_close(grad, grad_ref):
+        # A reversal summing through atomics on several threads repeats to its rounding alone, while an overwrite the
+        # recorder leaves unsaved shifts a gradient by a share of its own size: a thousand units in the last place of
+        # the largest entry of the gradient separate the two
+        if grad.numel() == 0:
+            return True
+        scale = torch.maximum(grad.abs().nan_to_num().max(), grad_ref.abs().nan_to_num().max())
+        tol = 1e3 * torch.finfo(grad.dtype).eps * float(scale)
+        return torch.allclose(grad, grad_ref, rtol=0.0, atol=tol, equal_nan=True)
 
     def close_entry(recorder):
         nonlocal is_copying
@@ -159,13 +169,15 @@ def step_overwrites(backend, monkeypatch):
         tensors_grad = reverse(recorder, start, stop)
         is_copying = True
         arrays_mismatch = [
-            arrays[key][0] for key, grad in grads_ref.items() if not is_equal(qd_to_torch(arrays[key][1].grad), grad)
+            arrays[key][0]
+            for key, grad in grads_ref.items()
+            if not is_rounding_close(qd_to_torch(arrays[key][1].grad), grad)
         ]
         is_copying = False
         arrays_mismatch += [
             "torch input"
             for key, grad in tensors_grad_ref.items()
-            if key not in tensors_grad or not is_equal(tensors_grad[key], grad)
+            if key not in tensors_grad or not is_rounding_close(tensors_grad[key], grad)
         ]
         if arrays_mismatch:
             # The overwrites the recorder left unsaved, where its gradients depart from the reference
@@ -189,7 +201,7 @@ def step_overwrites(backend, monkeypatch):
     monkeypatch.setattr(LaunchRecorder, "__exit__", checked_exit)
     yield
     assert not mismatches, (
-        f"Gradients of the backward pass differ from restoring every array used: {sorted(mismatches)}"
+        f"Gradients of the backward pass depart from restoring every array used: {sorted(mismatches)}"
     )
 
 
