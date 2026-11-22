@@ -2066,16 +2066,20 @@ def test_rod_rigid_pad_rims_turn_rod_into_grip(two_pad_gripper, show_viewer):
     gripper.set_dofs_kv([40.0, 40.0, 150.0], [*pads_dof, *lift_dof])
     gripper.set_dofs_force_range([-max_force, -max_force], [max_force, max_force], pads_dof)
     pads = [gripper.get_link(name) for name in ("left_pad", "right_pad")]
-    held_offset = []
+    held_offset, held_yaw = [], []
     for i_step in range(n_close_steps + n_hold_steps):
         gripper.control_dofs_position([0.015, 0.015, 0.0], [*pads_dof, *lift_dof])
         scene.step()
         if i_step >= n_close_steps:
+            verts_pos = tensor_to_array(rod.get_verts_pos())
             pads_center = 0.5 * (tensor_to_array(pads[0].get_pos()) + tensor_to_array(pads[1].get_pos()))
-            held_offset.append(tensor_to_array(rod.get_verts_pos())[:, 3] - pads_center)
+            held_offset.append(verts_pos[:, 3] - pads_center)
+            held_dir = verts_pos[:, 4] - verts_pos[:, 2]
+            held_yaw.append(np.arctan2(held_dir[:, 1], held_dir[:, 0]))
     # The rims turn the rod through the free vertices next to the middle vertex, which the pads squeeze, until both faces
     # press the middle vertex: the pads close to less than the diameter of the rod. The scene is symmetric about the
     # vertical axis through the middle vertex, which the grip keeps at the centre of the pads
+    assert (yaw - np.array(held_yaw)).min() > 5e-2
     assert (0.03 - gripper.get_dofs_position(pads_dof).sum(dim=-1) < 2.0 * radius).all()
     assert np.linalg.norm(np.array(held_offset), axis=-1).max() < 2e-10
 
