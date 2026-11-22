@@ -309,11 +309,12 @@ class LaunchRecorder:
     then the arrays it overwrote are restored, so that every entry before it is reversed at the values it left too.
     Before each launch, the recorder saves the arrays of the state the launch writes that an earlier entry read since
     their last write. The writes and the reads come from the source of the kernel (see 'get_accessed_paths'), narrowed
-    to the struct members its compiled form uses. An entry reads the arrays its kernels read where autodiff reverses it
-    or a backward running the autodiff of its kernel does (see 'register_custom_backward'), every array it uses where
-    another backward does, and none without gradient. An array no entry reads after a write keeps the value of its last
-    write once the entries are reversed. A backward pass follows the convention of autodiff, consuming the adjoint of
-    the values a launch wrote and clearing it.
+    to the struct members its compiled form uses, a kernel whose source the analysis cannot follow through all its
+    calls reading every array it uses. An entry reads the arrays its kernels read where autodiff reverses it or a
+    backward running the autodiff of its kernel does (see 'register_custom_backward'), every array it uses where another
+    backward does, and none without gradient. An array no entry reads after a write keeps the value of its last write
+    once the entries are reversed. A backward pass follows the convention of autodiff, consuming the adjoint of the
+    values a launch wrote and clearing it.
 
     The arrays with a zero-copy view (see 'qd_zerocopy_view') are saved and restored through it, the launches of a
     kernel and structs sharing the views of their arrays: a save is one copy of the view, and the restore of an entry
@@ -400,6 +401,10 @@ class LaunchRecorder:
                                 view = qd_zerocopy_view(array)
                                 arrays_written.append((array, view))
             arrays_written_ids = {id(array) for array, _ in arrays_written}
+            # A kernel whose source reaches a func through a call the analysis cannot follow may read anything it uses
+            # there, so it reads every array it uses, as upstream's rule takes it
+            if not paths_accessed.is_complete:
+                arrays_read = arrays_used
             launch_arrays = (arrays_used, arrays_read, arrays_written, arrays_written_ids)
             for struct in structs:
                 _LAUNCH_ARRAYS_CACHE.own(struct, launch_key, launch_arrays)

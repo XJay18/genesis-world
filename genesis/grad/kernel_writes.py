@@ -9,12 +9,15 @@ costs a copy, never a gradient.
 """
 
 import ast
+import builtins
 import inspect
 import textwrap
 from collections.abc import Callable
 from typing import NamedTuple
 
 from quadrants.lang._quadrants_callable import QuadrantsCallable
+from quadrants.lang.expr import Expr
+from quadrants.lang.matrix import Matrix
 
 from genesis.utils.cache import OwnedCache
 
@@ -32,6 +35,8 @@ class AccessedPaths(NamedTuple):
 
     written: frozenset[tuple[str, ...]]
     read: frozenset[tuple[str, ...]]
+    is_complete: bool
+    """Whether every call passing arrays to a func resolves, so that the paths cover the accesses of every func called."""
 
 
 # The paths each kernel or func may write and read, by function and bound object, each entry living as long as the bound
@@ -40,6 +45,11 @@ _ACCESSED_PATHS_CACHE = OwnedCache()
 
 # The atomic operations whose adjoint takes no value of the array they add to, which they write without reading it
 _ATOMIC_LINEAR = ("atomic_add", "atomic_sub")
+
+# The methods of the vectors, the matrices and the expressions of Quadrants, which name no func
+_VALUE_METHODS = frozenset(
+    [name for value_type in (Matrix, Expr) for name, value in vars(value_type).items() if callable(value)]
+)
 
 
 # FIXME: quadrants#1001 - Quadrants exposes no write or read set of a kernel, so they are derived from the source here,
@@ -53,7 +63,9 @@ def get_accessed_paths(fn: Callable, owner: object | None = None) -> AccessedPat
     of an atomic operation or a `fill`, in the function itself or in a func it calls with the array as argument. A read
     is the load of an element, the target of an augmented assignment or the first argument of an atomic operation other
     than an addition or a subtraction, whose adjoint takes no value of the array. `owner` is the object the first
-    parameter of a method is bound to, through which it reaches the funcs of other objects.
+    parameter of a method is bound to, through which it reaches the funcs of other objects. The paths are incomplete where
+    a call passes arrays to a func the source does not name, held by a parameter or an element of an array or returned
+    by a call, such as `materials[i].update(state, i)` or `qd.static(f)(state, i)`.
     """
     cache_key = (fn, id(owner))
     paths_cached = _ACCESSED_PATHS_CACHE.find(cache_key)
@@ -92,6 +104,7 @@ def get_accessed_paths(fn: Callable, owner: object | None = None) -> AccessedPat
                 funcs[target.id] = callee
 
     paths_written, paths_read = set(), set()
+    is_complete = True
     # The element loads that are the first argument of a linear atomic operation, which writes them alone
     loads_atomic = set()
     for node in ast.walk(func_def):
@@ -124,6 +137,7 @@ def get_accessed_paths(fn: Callable, owner: object | None = None) -> AccessedPat
             else:
                 callee = _find_callee(node.func, fn, funcs, owner_name, owner)
                 if callee is None:
+                    is_complete &= not _may_hide_reads(node, fn, aliases, owner_name, owner)
                     continue
                 # The arrays the func writes through its parameters, bound to the arguments of the call and, for a
                 # method, to the object it is bound to
@@ -138,6 +152,7 @@ def get_accessed_paths(fn: Callable, owner: object | None = None) -> AccessedPat
                     if keyword.arg is not None
                 ]
                 callee_paths = get_accessed_paths(callee.fn, callee.owner)
+                is_complete &= callee_paths.is_complete
                 for callee_param, arg_paths in bindings:
                     for callee_paths_accessed, paths_accessed in (
                         (callee_paths.written, paths_written),
@@ -149,6 +164,7 @@ def get_accessed_paths(fn: Callable, owner: object | None = None) -> AccessedPat
     params_paths = AccessedPaths(
         written=frozenset([path for path in paths_written if path[0] in params]),
         read=frozenset([path for path in paths_read if path[0] in params]),
+        is_complete=is_complete,
     )
     return _ACCESSED_PATHS_CACHE.own(fn if owner is None else owner, cache_key, params_paths)
 
@@ -215,3 +231,45 @@ def _find_callee(
     if not isinstance(value, QuadrantsCallable) or value.fn is fn:
         return None
     return Callee(value.fn, callee_owner, owner_path)
+
+
+def _may_hide_reads(
+    call: ast.Call, fn: Callable, aliases: dict[str, set[tuple[str, ...]]], owner_name: str | None, owner: object | None
+) -> bool:
+    """
+    Return whether a call that '_find_callee' does not resolve may reach a func reading arrays of the parameters of `fn`.
+
+    Such a func reaches the arrays through an array or a struct the call passes it, or through the object of the owner
+    it is bound to, an element passed being a value whose load the caller counts already. Its callee may be a parameter
+    of `fn` or a local bound to one (a template argument, a material), an element of an array, the result of a call, a
+    local called directly or an attribute the owner lacks. A method of a vector, a matrix or an expression is no func,
+    nor is a method of a local value, nor a value of the scope of `fn` (a builtin, a type, a Python function).
+    """
+    node = call.func
+    if isinstance(node, ast.Attribute) and node.attr in _VALUE_METHODS:
+        return False
+    names = []
+    while isinstance(node, ast.Attribute):
+        names.append(node.attr)
+        node = node.value
+    is_bound_to_owner = isinstance(node, ast.Name) and node.id == owner_name
+    args = (*call.args, *[keyword.value for keyword in call.keywords])
+    if not is_bound_to_owner and not any(
+        [isinstance(arg, (ast.Name, ast.Attribute)) and _resolve(arg, aliases) for arg in args]
+    ):
+        return False
+    if not isinstance(node, ast.Name):
+        return True
+    closure = zip(fn.__code__.co_freevars, [cell.cell_contents for cell in fn.__closure__ or ()])
+    scope = {**vars(builtins), **fn.__globals__, **dict(closure)}
+    if is_bound_to_owner:
+        value = owner
+    elif node.id in aliases:
+        return True
+    elif node.id in scope:
+        value = scope[node.id]
+    else:
+        return not names
+    for name in reversed(names):
+        value = getattr(value, name, None)
+    return value is None
