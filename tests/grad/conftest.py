@@ -22,9 +22,10 @@ with lazy_imports():
 def step_overwrites(backend, monkeypatch):
     # Check that the backward pass of a recorded rollout reverses every entry at the values it left (see LaunchRecorder),
     # without the source analysis the recorder saves by: each reversal runs twice from the same arrays and adjoints,
-    # first restoring after each entry every array it changed that an earlier entry used (upstream's rule, over the
-    # writes the forward pass showed), then as the recorder does, and the gradients of both must be bitwise equal. The
-    # reversals of a backend repeat bit for bit on CPU alone, where it runs.
+    # first restoring after each entry every array it uses that an earlier entry used, then as the recorder does, and
+    # the gradients of both must be bitwise equal. The first run needs no analysis: its restores hold upstream's saves,
+    # those of the arrays an entry writes, and also undo what the reversal of an entry writes. The reversals of a backend
+    # repeat bit for bit on CPU alone, where it runs.
     if isinstance(backend, str):
         backend = getattr(gs.constants.backend, backend)
     if backend != gs.cpu:
@@ -33,7 +34,8 @@ def step_overwrites(backend, monkeypatch):
 
     insert, entry, reverse, exit_ = operator.attrgetter("insert", "entry", "reverse", "__exit__")(LaunchRecorder)
     # Per recorder, released with it since a later one may take its identity: the arrays its closed entries used, the
-    # values before its open entry, the launches of that entry, and the restores of upstream's rule by entry
+    # values before its open entry, the launches of that entry, and the restores of the reference by entry, with whether
+    # the entry changed each array
     arrays_used, values_before, launches_open, entries_restores = (weakref.WeakKeyDictionary() for _ in range(4))
     mismatches = set()
     # The copies of the checker are kernel launches of their own without zero-copy views, which it does not record
@@ -89,9 +91,8 @@ def step_overwrites(backend, monkeypatch):
             return
         is_copying = True
         restores = [
-            (path, array, value)
+            (path, array, value, not is_equal(qd_to_torch(array, copy=True), value))
             for path, array, value in values.values()
-            if not is_equal(qd_to_torch(array, copy=True), value)
         ]
         is_copying = False
         entries_restores.setdefault(recorder, {})[len(recorder.entries) - 1] = restores
@@ -140,7 +141,7 @@ def step_overwrites(backend, monkeypatch):
         restores = entries_restores.get(recorder, {})
         arrays_saved = [list(entry_.arrays_saved) for entry_ in entries]
         for i_e, entry_ in zip(entries_idx, entries):
-            entry_.arrays_saved[:] = [(array, own_view(array), value) for _, array, value in restores.get(i_e, ())]
+            entry_.arrays_saved[:] = [(array, own_view(array), value) for _, array, value, _ in restores.get(i_e, ())]
         try:
             tensors_grad_ref = reverse(recorder, start, stop)
         finally:
@@ -167,12 +168,12 @@ def step_overwrites(backend, monkeypatch):
             if key not in tensors_grad or not is_equal(tensors_grad[key], grad)
         ]
         if arrays_mismatch:
-            # The overwrites the recorder left unsaved, where its gradients depart from upstream's rule
+            # The overwrites the recorder left unsaved, where its gradients depart from the reference
             overwrites = [
                 f"{recorder.entries[i_e].launches[0][0].func.__name__} overwrites {path}"
                 for i_e in entries_idx
-                for path, array, _ in restores.get(i_e, ())
-                if all([array is not saved for saved, *_ in recorder.entries[i_e].arrays_saved])
+                for path, array, _, is_changed in restores.get(i_e, ())
+                if is_changed and all([array is not saved for saved, *_ in recorder.entries[i_e].arrays_saved])
             ]
             mismatches.add(f"adjoints {sorted(set(arrays_mismatch))} after unsaved {sorted(set(overwrites))}")
         return tensors_grad
@@ -187,7 +188,9 @@ def step_overwrites(backend, monkeypatch):
     monkeypatch.setattr(LaunchRecorder, "reverse", checked_reverse)
     monkeypatch.setattr(LaunchRecorder, "__exit__", checked_exit)
     yield
-    assert not mismatches, f"Gradients of the backward pass differ under upstream's rule: {sorted(mismatches)}"
+    assert not mismatches, (
+        f"Gradients of the backward pass differ from restoring every array used: {sorted(mismatches)}"
+    )
 
 
 def _add_hinge_arm(parent, body_name, pos, axis="0 1 0", joint_pos=None, **joint_kwargs):
