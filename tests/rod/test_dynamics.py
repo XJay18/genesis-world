@@ -907,6 +907,7 @@ def test_rod_contact_at_immovable_vertices_does_not_lever_free_vertex(show_viewe
 @pytest.mark.required
 @pytest.mark.parametrize("rod_mpm", [True, False])
 def test_rod_mpm_coupling(rod_mpm, show_viewer):
+    radius = 0.005
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
             dt=1e-3,
@@ -956,7 +957,7 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
         material=gs.materials.Rod.Base(
             E=1e5,
             G=1e4,
-            segment_radius=0.005,
+            segment_radius=radius,
         ),
     )
     # Two rods dropped onto the block land without rebounding, restitution being zero, a heavy one and a light one
@@ -971,7 +972,7 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
                 E=1e5,
                 G=1e4,
                 segment_mass=segment_mass,
-                segment_radius=0.005,
+                segment_radius=radius,
             ),
         )
         for y, segment_mass in ((0.06, 0.02), (-0.06, 2e-4))
@@ -984,25 +985,27 @@ def test_rod_mpm_coupling(rod_mpm, show_viewer):
     for _ in range(250):
         scene.step()
         block_top = block.get_particles_pos()[..., 2].max(dim=-1).values
-        rod_bottom = rod.get_verts_pos()[..., 2].min(dim=-1).values
+        rod_bottom = rod.get_verts_pos()[..., 2].min(dim=-1).values - radius
         heights_landing.append([rod_landing.get_verts_pos()[..., 2].mean(dim=-1) for rod_landing in rods_landing])
-        # The coupled rod rests on the block, while the uncoupled one falls through it
+        # The coupled rod rests on the block, its surface above the top of the block, while the uncoupled one falls
+        # through it
         if rod_mpm:
             assert (rod_bottom > block_top).all()
     if not rod_mpm:
         assert (rod_bottom < block_top - 0.01).all()
     else:
-        dx = 1.0 / 64.0
         n_steps_settled = 50
         for i_rod in range(len(rods_landing)):
             heights = torch.stack([heights_step[i_rod] for heights_step in heights_landing])
             # A rod lands without rising from where its fall first stops, with restitution zero, and it stays on the
-            # surface, within half a grid spacing of the top of the block plus its radius. It is settled, sinking less
-            # than a rod the material does not hold up
+            # surface, its bottom just above the top of the block. It is settled, sinking less than a rod the material
+            # does not hold up
             i_landing = ((heights[1:] > heights[:-1]).cumsum(dim=0) == 0).sum(dim=0)
             for i_b in range(3):
                 assert (heights[i_landing[i_b] :, i_b] < heights[i_landing[i_b], i_b] + 1e-3).all()
-            assert_allclose(heights[-1], block_top + 0.005, atol=0.5 * dx)
+            rest_height = heights[-1] - radius - block_top
+            assert (rest_height > 0.0).all()
+            assert (rest_height < 5e-3).all()
             sink_rate = (heights[-n_steps_settled] - heights[-1]) / (n_steps_settled * 1e-3)
             assert (sink_rate.abs() < 5e-3).all()
     # The contacts with the grid nodes sum their terms in an order independent of the threads with deterministic
@@ -1257,10 +1260,11 @@ def test_rod_rests_on_mpm_surface(show_viewer):
     for _ in range(150):
         scene.step()
     for block, rod, pos in zip(blocks, rods, pos_init):
-        # The rod rests on the surface of the material, its axis one radius above the top of the block wherever the
-        # top lies relative to the grid nodes, and the surface pushes it straight up wherever it lies between them
+        # The rod rests on the surface of the material, its bottom just above the top of the block wherever the top lies
+        # relative to the grid nodes, and the surface pushes it straight up wherever it lies between them
         block_top = block.get_particles_pos()[..., 2].max()
-        assert_allclose(rod.get_verts_pos()[..., 2].mean(), block_top + radius, atol=5e-3)
+        rest_height = rod.get_verts_pos()[..., 2].mean() - radius - block_top
+        assert 0.0 < rest_height < 5e-3
         assert_allclose(rod.get_verts_pos()[..., 1].mean(), pos[..., 1].mean(), atol=2e-3)
 
 
