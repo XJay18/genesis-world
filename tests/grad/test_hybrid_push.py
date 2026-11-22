@@ -341,7 +341,7 @@ def test_coupling_wrench_grad_matches_fd(geoms_share_cells, use_implicit_solver,
 
     if geoms_share_cells:
         tol = 5e-11 if precision == "64" else 2e-5
-        fem_tol = 5e-10 if precision == "64" else (5e-5 if use_implicit_solver else 1e-4)
+        fem_tol = 2e-10 if precision == "64" else (5e-5 if use_implicit_solver else 1e-4)
     else:
         tol = 2e-10 if precision == "64" else 1e-4
         # In single precision, the implicit solve rounds the displacement of each substep against the positions, which
