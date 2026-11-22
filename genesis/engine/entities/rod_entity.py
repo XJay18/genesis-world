@@ -179,8 +179,11 @@ class RodEntity(Entity):
 
     @gs.assert_built
     def set_verts_vel(self, vels, verts_idx_local=None, envs_idx=None):
-        """Set the velocity of some vertices, in m/s, a fixed or constrained one keeping its zero velocity (see
-        'RodSolver.set_verts_vel' and 'set_verts_pos' for the arguments)."""
+        """
+        Set the velocity of some vertices, in m/s (see 'set_verts_pos' for the arguments).
+
+        A fixed or constrained vertex keeps its zero velocity (see 'RodSolver.set_verts_vel').
+        """
         verts_idx = self._get_global_idx(verts_idx_local, self.n_verts, self._v_start, unsafe=True, batched_idx=True)
         self._solver.set_verts_vel(vels, verts_idx, envs_idx)
 

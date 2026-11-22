@@ -371,7 +371,7 @@ class LegacyCouplerInfo(Data, kind=DataKind.CONSTANT):
     rod_rigid_overlap_relaxation: qd.Tensor = field(float, shape=())
     # The inverse mass, relative to the one of the vertex, through which a vertex of the rods sees the links of its
     # contacts that do not move where their normals are dependent (see 'kernel_project_rod_rigid_normal'). The vertex
-    # resolves the contacts through it as through links that heavy: a larger value leaves part of the penetration of
+    # resolves those contacts as against links of that inverse mass: a larger value leaves part of the penetration of
     # parallel contacts to the next substep, a smaller one raises the impulses squeezing a vertex between opposed ones,
     # whose difference moves the vertex and loses its digits in single precision
     rod_rigid_immovable_inv_mass: qd.Tensor = field(float, shape=())

@@ -334,8 +334,7 @@ class RodRigidContacts(Data, kind=DataKind.SCRATCH, shape=(ROD_VERTS, ROD_RIGID_
     penetration weighted by the weight of the vertex in its point along the edge. A point inside an edge is thus a
     contact of the vertices of the edge whose spheres miss the geom, each resolving its share of it (see
     'func_rod_rigid_contact_share' in legacy_coupler.py), and no vertex owns it. A vertex keeps its first contacts, the
-    geoms in their order, and touching more geoms at once than it keeps raises OVERFLOW_ROD_RIGID_CONTACTS (see
-    RodErrorCode).
+    geoms in their order. One touching more geoms at once raises OVERFLOW_ROD_RIGID_CONTACTS (see RodErrorCode).
     """
 
     n_contacts: qd.Tensor = field(int, shape=(ROD_VERTS, ENVS))
@@ -1518,8 +1517,11 @@ def kernel_finalize_rod_positions(
 
 @qd.func
 def func_finalize_rod_velocities(rod_state: RodState, rod_info: RodInfo, rod_config: qd.template()):
-    """Apply the friction of the rod-rod contacts, averaged over the contacts of each vertex, and the constraints of the
-    vertices to the velocities, then commit the reference frames and the rest curvatures the substep computed."""
+    """Apply the friction of the rod-rod contacts and the constraints of the vertices to the velocities, then commit the
+    reference frames and the rest curvatures the substep computed.
+
+    The friction of a vertex is averaged over its contacts (see kernel_finalize_rod_positions).
+    """
     for i_v, i_b in qd.ndrange(*rod_state.verts.pos.shape, axes=qd.static(eoa(rod_state.verts.pos))):
         if qd.static(rod_config.has_edge_pairs):
             # The friction left in carry-free sums (see kernel_finalize_rod_positions)
@@ -1868,8 +1870,8 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
                 ),
                 RodErrorCode.OVERFLOW_ROD_RIGID_CONTACTS: lambda: (
                     f"A vertex of the rods touches more than {ROD_RIGID_CONTACTS_PER_VERT} rigid geoms that need "
-                    "coupling at once, the most contacts a vertex resolves. Please keep fewer coupled geoms overlapping "
-                    "at any point a rod reaches."
+                    "coupling at once, the most contacts a vertex resolves. Please keep fewer coupled geoms "
+                    "overlapping at any point a rod reaches."
                 ),
             },
         )
@@ -2246,10 +2248,10 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
         """
         Set whether some vertices of the rods are fixed, keeping their position at zero velocity.
 
-        Fixing a vertex sets its velocity to zero, and a vertex released starts at rest. This is part of the state, which a differentiable rollout may change between two steps, and which
-        `scene.reset()` restores as registered: the vertices the morphs fix (see 'RodMixin.fixed'), unless a state was
-        registered since with `scene.reset(state)`. A rod fixed at the same vertices in every rollout takes them from
-        its morph.
+        Fixing a vertex sets its velocity to zero, and a vertex released starts at rest. This is part of the state,
+        which a differentiable rollout may change between two steps, and which `scene.reset()` restores as registered:
+        the vertices the morphs fix (see 'RodMixin.fixed'), unless a state was registered since with
+        `scene.reset(state)`. A rod fixed at the same vertices in every rollout takes them from its morph.
         """
         fixed, verts_idx, envs_idx = self._sanitize_io_variables(
             fixed, verts_idx, self.n_verts, "verts_idx", envs_idx, dtype=gs.tc_bool, batched_idx=True

@@ -653,8 +653,8 @@ def test_vertex_constraints_reset_with_state(show_viewer):
         torch.cat([*(rod.get_verts_kinematic() for rod in rods), rope.get_verts_kinematic()], dim=-1),
     )
 
-    # The vertices fixed by the morphs, by the setter and while moving, and the constrained one, keep their zero velocity
-    # whatever velocity the rods are given, so that the rope lying on the fixed rod stays where it lies
+    # The vertices fixed by the morphs, by the setter and while moving, and the constrained one, keep their zero
+    # velocity whatever velocity the rods are given, so that the rope lying on the fixed rod stays where it lies
     rope_pos = rope.get_verts_pos()
     for rod in rods:
         rod.set_velocity((0.5, 0.0, 0.0))
