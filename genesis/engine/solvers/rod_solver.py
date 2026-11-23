@@ -742,13 +742,32 @@ def func_signed_angle(axis: qd.types.vector(3), v_from: qd.types.vector(3), v_to
 
 
 @qd.func
+def func_clamp_edge_parameter(x: float):
+    """Return a parameter along a segment clamped to [0, 1], and whether it is held at an end of the segment.
+
+    A parameter held at an end has a zero derivative. One exactly at 0 lies on the interior side and one exactly at 1
+    is held, so that the closest points of the two edges of a rod meeting at a vertex (the end of one, the start of the
+    next) take the derivative of the same side of the vertex.
+    """
+    is_below = x < 0.0
+    is_held = is_below or x >= 1.0
+    return qd.select(is_held, qd.select(is_below, 0.0, 1.0), x), is_held
+
+
+@qd.func
 def func_closest_points_of_edges(
     p_a1: qd.types.vector(3), p_a2: qd.types.vector(3), p_b1: qd.types.vector(3), p_b2: qd.types.vector(3), eps: float
 ):
-    """Return the parameters along the segments (p_a1, p_a2) and (p_b1, p_b2) of their closest points, in [0, 1].
+    """Return the parameters along the segments (p_a1, p_a2) and (p_b1, p_b2) of their closest points, in [0, 1], with
+    whether each is held at an end of its segment.
 
     The degeneracy thresholds are relative to the lengths of the segments, 'eps' being the relative precision of the
-    simulation, so that short edges resolve their closest points at any precision.
+    simulation, so that short edges resolve their closest points at any precision. The parameter of a degenerate
+    configuration (parallel segments, a second segment of zero length) counts as held.
+
+    A parameter held at an end has a zero derivative. One exactly at 0 lies on its interior side and one exactly at 1 is
+    held (see func_clamp_edge_parameter): where rods cross exactly at a vertex, as rods laid on a grid do, every pair of
+    edges sharing the vertex takes the derivative of the same side of it.
     """
     e_a, e_b = p_a2 - p_a1, p_b2 - p_b1
     e_ab = p_b1 - p_a1
@@ -759,21 +778,18 @@ def func_closest_points_of_edges(
 
     len_sq_sum = len_sq_a + len_sq_b
 
-    t = gs.qd_float(0.0)
+    t, is_t_held = gs.qd_float(0.0), True
     # The squared sine of the angle between the segments compares to the precision, which tells parallel segments
     if det > eps * len_sq_a * len_sq_b:
-        t = (proj_a * len_sq_b - proj_b * cross_ab) / det
-    t = qd.math.clamp(t, 0.0, 1.0)
-    u_unclamped = gs.qd_float(0.0)
+        t, is_t_held = func_clamp_edge_parameter((proj_a * len_sq_b - proj_b * cross_ab) / det)
+    u, is_u_held = gs.qd_float(0.0), True
     if len_sq_b > eps * len_sq_sum:
-        u_unclamped = (t * cross_ab - proj_b) / len_sq_b
-    u = qd.math.clamp(u_unclamped, 0.0, 1.0)
-    # The closest point of the first segment moves once the one of the second is clamped to an end
-    if qd.abs(u - u_unclamped) > eps:
+        u, is_u_held = func_clamp_edge_parameter((t * cross_ab - proj_b) / len_sq_b)
+    # The closest point of the first segment moves once the one of the second is held at an end
+    if is_u_held:
         if len_sq_a > eps * len_sq_sum:
-            t = (u * cross_ab + proj_a) / len_sq_a
-        t = qd.math.clamp(t, 0.0, 1.0)
-    return t, u
+            t, is_t_held = func_clamp_edge_parameter((u * cross_ab + proj_a) / len_sq_a)
+    return t, u, is_t_held, is_u_held
 
 
 @qd.func
@@ -1269,8 +1285,9 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
 def func_rod_edge_pair_penetration(i_e_a: int, i_e_b: int, i_b: int, rod_state: RodState, rod_info: RodInfo):
     """Return the closest points of the axes of two edges, the penetration of their capsules and the contact normal.
 
-    The closest points are given by their parameters along the first and the second edge, and the normal points from
-    the second edge to the first. Capsules whose bounding spheres are apart get a penetration of -1.
+    The closest points are given by their parameters along the first and the second edge, with whether each is held at
+    an end of its edge (see func_closest_points_of_edges), and the normal points from the second edge to the first.
+    Capsules whose bounding spheres are apart get a penetration of -1.
     """
     i_v_a1, i_v_a2 = rod_info.edges.verts_idx[i_e_a]
     i_v_b1, i_v_b2 = rod_info.edges.verts_idx[i_e_b]
@@ -1279,18 +1296,19 @@ def func_rod_edge_pair_penetration(i_e_a: int, i_e_b: int, i_b: int, rod_state: 
     radius_a = 0.5 * (rod_info.verts.radius[i_v_a1] + rod_info.verts.radius[i_v_a2])
     radius_b = 0.5 * (rod_info.verts.radius[i_v_b1] + rod_info.verts.radius[i_v_b2])
     t, u = gs.qd_float(0.0), gs.qd_float(0.0)
+    is_t_held, is_u_held = True, True
     penetration = gs.qd_float(-1.0)
     normal = qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float)
     # The capsules overlap only if the spheres bounding them do, which spares the closest points of most pairs
     reach = 0.5 * ((p_a2 - p_a1).norm() + (p_b2 - p_b1).norm()) + radius_a + radius_b
     if (0.5 * (p_a1 + p_a2 - p_b1 - p_b2)).norm() < reach:
-        t, u = func_closest_points_of_edges(p_a1, p_a2, p_b1, p_b2, rod_info.EPS[None])
+        t, u, is_t_held, is_u_held = func_closest_points_of_edges(p_a1, p_a2, p_b1, p_b2, rod_info.EPS[None])
         dist_vec = (p_a1 + t * (p_a2 - p_a1)) - (p_b1 + u * (p_b2 - p_b1))
         dist = dist_vec.norm()
         penetration = radius_a + radius_b - dist
         if dist > rod_info.EPS[None]:
             normal = dist_vec / dist
-    return t, u, penetration, normal
+    return t, u, penetration, normal, is_t_held, is_u_held
 
 
 @qd.func
@@ -1316,7 +1334,9 @@ def func_project_rod_edge_pair(
     """
     i_v_a1, i_v_a2 = rod_info.edges.verts_idx[i_e_a]
     i_v_b1, i_v_b2 = rod_info.edges.verts_idx[i_e_b]
-    t, u, penetration, normal = func_rod_edge_pair_penetration(i_e_a, i_e_b, i_b, rod_state, rod_info)
+    t, u, penetration, normal, is_t_held, is_u_held = func_rod_edge_pair_penetration(
+        i_e_a, i_e_b, i_b, rod_state, rod_info
+    )
     # A contact is resolved through the vertices owning its points, the nearer vertex of each edge: where both are
     # immovable (fixed or attached), only the far vertices could move, by the penetration over their weight in the
     # points, levering a free vertex next to a fixed one out of all proportion
@@ -1350,9 +1370,14 @@ def func_project_rod_edge_pair(
                 qd.atomic_sub(rod_state.verts.dp_contact[i_v_b1, i_b], inv_masses[2] * weights[2] * impulse)
                 qd.atomic_sub(rod_state.verts.dp_contact[i_v_b2, i_b], inv_masses[3] * weights[3] * impulse)
             # Each vertex averages the corrections of its contacts (see 'func_last_projection_correction'), so that the
-            # contacts sharing it do not push it further than each asks
+            # contacts sharing it do not push it further than each asks. A vertex of zero weight at a parameter on the
+            # interior side of its end counts the contact too: its weight grows on the side whose derivative the closest
+            # points take (see func_closest_points_of_edges)
             for i_c_v in qd.static(range(4)):
-                if inv_masses[i_c_v] * weights[i_c_v] > 0.0:
+                is_end_held = is_t_held
+                if qd.static(i_c_v >= 2):
+                    is_end_held = is_u_held
+                if inv_masses[i_c_v] > 0.0 and (weights[i_c_v] > 0.0 or not is_end_held):
                     i_v_c = verts_idx[i_c_v]
                     qd.atomic_add(rod_state.verts.n_contacts[i_v_c, i_b], 1)
     # The slot is the only one to write its sum, once per projection
@@ -1511,7 +1536,7 @@ def func_project_rod_friction(rod_state: RodState, rod_info: RodInfo, rod_config
                 i_v_b1, i_v_b2 = rod_info.edges.verts_idx[i_e_b]
                 p_a1, p_a2 = rod_state.verts.pos[i_v_a1, i_b], rod_state.verts.pos[i_v_a2, i_b]
                 p_b1, p_b2 = rod_state.verts.pos[i_v_b1, i_b], rod_state.verts.pos[i_v_b2, i_b]
-                t, u = func_closest_points_of_edges(p_a1, p_a2, p_b1, p_b2, rod_info.EPS[None])
+                t, u, is_t_held, is_u_held = func_closest_points_of_edges(p_a1, p_a2, p_b1, p_b2, rod_info.EPS[None])
                 # The displacement of the closest points over the substep, each point keeping its place along its edge
                 disp_a = (1.0 - t) * (p_a1 - rod_state.verts.pos_prev[i_v_a1, i_b]) + t * (
                     p_a2 - rod_state.verts.pos_prev[i_v_a2, i_b]
@@ -1571,8 +1596,12 @@ def func_project_rod_friction(rod_state: RodState, rod_info: RodInfo, rod_config
                         qd.atomic_add(rod_state.verts.dp_friction[i_v_a2, i_b], inv_masses[1] * weights[1] * impulse)
                         qd.atomic_sub(rod_state.verts.dp_friction[i_v_b1, i_b], inv_masses[2] * weights[2] * impulse)
                         qd.atomic_sub(rod_state.verts.dp_friction[i_v_b2, i_b], inv_masses[3] * weights[3] * impulse)
+                    # The vertices count the contacts as in the projection (see func_project_rod_edge_pair)
                     for i_c_v in qd.static(range(4)):
-                        if inv_masses[i_c_v] * weights[i_c_v] > 0.0:
+                        is_end_held = is_t_held
+                        if qd.static(i_c_v >= 2):
+                            is_end_held = is_u_held
+                        if inv_masses[i_c_v] > 0.0 and (weights[i_c_v] > 0.0 or not is_end_held):
                             i_v_c = verts_idx[i_c_v]
                             qd.atomic_add(rod_state.verts.n_friction_contacts[i_v_c, i_b], 1)
 

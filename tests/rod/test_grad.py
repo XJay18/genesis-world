@@ -322,7 +322,41 @@ def test_rod_contact_outside_candidates_grad_matches_fd(backend, show_viewer):
             )
             for i_tooth in range(16)
         ]
-        # Far from them, a fixed rod overlapping a short free rod by 3 mm pushes it at the first projection into another
+        # Past the comb, two short free rods cross two fixed rods exactly at a vertex: the first lies across the vertex
+        # shared by two fixed edges, the second has its middle vertex over the inside of a fixed edge. The positions are
+        # binary fractions, which keep the crossings exact through rounding
+        for x_fixed in (0.625 - 2**-8, 0.75 - 2**-9):
+            scene.add_entity(
+                morph=gs.morphs.ParameterizedRod(
+                    n_vertices=3,
+                    interval=2**-8,
+                    axis="x",
+                    pos=(x_fixed, 0.0, 0.0),
+                    fixed=True,
+                ),
+                material=gs.materials.Rod.Base(
+                    segment_radius=0.005,
+                ),
+            )
+        rods_crossing = tuple(
+            scene.add_entity(
+                morph=gs.morphs.ParameterizedRod(
+                    n_vertices=3,
+                    interval=2**-9,
+                    axis="y",
+                    pos=pos,
+                ),
+                material=gs.materials.Rod.Base(
+                    E=1e5,
+                    G=1e4,
+                    inextensible=True,
+                    segment_mass=0.002,
+                    segment_radius=0.001,
+                ),
+            )
+            for pos in ((0.625, -(2**-10), 0.005), (0.75, -(2**-9), 0.005))
+        )
+        # Further, a fixed rod overlapping a short free rod by 3 mm pushes it at the first projection into another
         # short rod, which lies beyond the reach of their bounding spheres until then: that pair comes into contact,
         # outside of the candidates, from a later projection on. The rods cross inside their edges, where the contacts
         # are differentiable
@@ -361,13 +395,17 @@ def test_rod_contact_outside_candidates_grad_matches_fd(backend, show_viewer):
         vel = torch.zeros((n_verts_b, 3), dtype=gs.tc_float, device=gs.device)
         vel[n_verts_b // 2 - 1 : n_verts_b // 2 + 2, 2] = -dent / 1e-3
 
-        def rollout(vel, vel_pushed):
+        def rollout(vel, vel_pushed, vel_crossing):
             scene.reset()
             rod_b.set_velocity(vel)
             rod_pushed.set_velocity(vel_pushed)
+            for rod, vel_rod in zip(rods_crossing, vel_crossing):
+                rod.set_velocity(vel_rod)
             for _ in range(n_steps):
                 scene.step()
-            return (rod_b.get_verts_pos() * weights).sum() + (rod_hit.get_verts_pos() * weights_hit).sum()
+            loss = (rod_b.get_verts_pos() * weights).sum() + (rod_hit.get_verts_pos() * weights_hit).sum()
+            pos_crossing = torch.stack([rod.get_verts_pos() - rod.init_positions for rod in rods_crossing])
+            return loss, (pos_crossing * weights_crossing).sum()
 
         with torch.no_grad():
             scene.reset()
@@ -413,27 +451,42 @@ def test_rod_contact_outside_candidates_grad_matches_fd(backend, show_viewer):
     direction = torch.tensor(rng.standard_normal((n_verts_b, 3)), dtype=gs.tc_float, device=gs.device)
     weights_hit = torch.tensor(rng.standard_normal((rod_hit.n_verts, 3)), dtype=gs.tc_float, device=gs.device)
     direction_pushed = torch.tensor(rng.standard_normal((rod_pushed.n_verts, 3)), dtype=gs.tc_float, device=gs.device)
+    weights_crossing = torch.tensor(rng.standard_normal((2, 3, 3)), dtype=gs.tc_float, device=gs.device)
     vel_pushed = torch.zeros((rod_pushed.n_verts, 3), dtype=gs.tc_float, device=gs.device)
-    vel_ad, vel_pushed_ad = vel.clone().requires_grad_(), vel_pushed.clone().requires_grad_()
-    rollout(vel_ad, vel_pushed_ad).backward()
+    vel_crossing = torch.zeros((2, 3, 3), dtype=gs.tc_float, device=gs.device)
+    vel_ad, vel_pushed_ad, vel_crossing_ad = (v.clone().requires_grad_() for v in (vel, vel_pushed, vel_crossing))
+    sum(rollout(vel_ad, vel_pushed_ad, vel_crossing_ad)).backward()
     step = 1e-5
     for grad, inputs_plus, inputs_minus, tol in (
         (
             (vel_ad.grad * direction).sum(),
-            (vel + step * direction, vel_pushed),
-            (vel - step * direction, vel_pushed),
+            (vel + step * direction, vel_pushed, vel_crossing),
+            (vel - step * direction, vel_pushed, vel_crossing),
             1e-5,
         ),
         (
             (vel_pushed_ad.grad * direction_pushed).sum(),
-            (vel, vel_pushed + step * direction_pushed),
-            (vel, vel_pushed - step * direction_pushed),
+            (vel, vel_pushed + step * direction_pushed, vel_crossing),
+            (vel, vel_pushed - step * direction_pushed, vel_crossing),
             1e-8,
         ),
     ):
         with torch.no_grad():
-            grad_fd = (rollout(*inputs_plus) - rollout(*inputs_minus)) / (2.0 * step)
+            grad_fd = (rollout(*inputs_plus)[0] - rollout(*inputs_minus)[0]) / (2.0 * step)
         assert abs(grad - grad_fd) <= tol * abs(grad_fd)
+
+    # The rods crossing at a vertex hold their crossings exactly, by symmetry. A move of the free rods to +x past the
+    # shared vertex and to -y past their middle vertex brings the crossings inside the edges that start there, the side
+    # whose derivative the closest points take at an exact crossing (see func_closest_points_of_edges)
+    direction_crossing = torch.zeros((2, 3, 3), dtype=gs.tc_float, device=gs.device)
+    direction_crossing[0, :, 0] = 1.0
+    direction_crossing[1, :, 1] = -1.0
+    step_crossing = 1e-6
+    with torch.no_grad():
+        loss_crossing = rollout(vel, vel_pushed, vel_crossing)[1]
+        loss_crossing_plus = rollout(vel, vel_pushed, vel_crossing + step_crossing * direction_crossing)[1]
+    grad_fd = (loss_crossing_plus - loss_crossing) / step_crossing
+    assert abs((vel_crossing_ad.grad * direction_crossing).sum() - grad_fd) <= 2e-5 * abs(grad_fd)
 
 
 @pytest.mark.required
