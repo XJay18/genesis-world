@@ -22,6 +22,7 @@ pytestmark = [pytest.mark.precision("64")]
         "contact",
         "contact_broadphase",
         "contact_stale",
+        "contact_rest",
         "plane",
         "box",
         "free_box",
@@ -61,8 +62,9 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
         segment_radius=0.005,
     )
     length = (n_verts - 1) * 0.01
-    if case in ("contact", "contact_broadphase", "contact_stale"):
-        # A free rod dropped across a fixed one, starting just above it
+    if case in ("contact", "contact_broadphase", "contact_stale", "contact_rest"):
+        # A free rod dropped across a fixed one, starting just above it, or lying on it at rest, where the friction of
+        # their contact sticks without any slip
         scene.add_entity(
             morph=gs.morphs.ParameterizedRod(
                 n_vertices=n_verts,
@@ -144,6 +146,7 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
         "contact": (-0.5 * length, 0.0, 0.3105),
         "contact_broadphase": (-0.5 * length, 0.0, 0.3105),
         "contact_stale": (-0.5 * length, 0.0, 0.3105),
+        "contact_rest": (-0.5 * length, 0.0, 0.31),
         "plane": (-0.5 * length, 0.0, 0.005),
         "box": (-0.5 * length, 0.0, 0.215),
         "free_box": (-0.5 * length, 0.0, 0.215),
@@ -173,6 +176,8 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
     )
     if case in ("contact", "contact_broadphase", "contact_stale"):
         inputs["vel"][:, 2] -= 0.5
+    if case == "contact_rest":
+        inputs["vel"] = torch.zeros_like(inputs["vel"])
     if case in ("box", "free_box", "pressed_box"):
         inputs["vel"][:, 0] += 0.3
     if case in ("free_box", "pressed_box"):
@@ -221,7 +226,7 @@ def test_initial_state_and_stiffness_grad_matches_fd(case, backend, two_pad_grip
     # its response to the contacts holding it on the ground, which carries no gradient (see
     # 'func_rod_rigid_links_response' in legacy_coupler.py): the velocity takes a bias that no step removes, which its
     # tolerance bounds.
-    is_rod_contact = case in ("contact", "contact_broadphase", "contact_stale")
+    is_rod_contact = case in ("contact", "contact_broadphase", "contact_stale", "contact_rest")
     steps_and_tols = {
         "pos": (1e-8 if is_rod_contact else 1e-7, 5e-5),
         "vel": (
@@ -300,48 +305,112 @@ def test_rod_contact_outside_candidates_grad_matches_fd(backend, show_viewer):
                 (n_verts_a, "y", (0.0, -0.05, -dent + 0.007 + 3e-5), 0.002),
             )
         )
+        # Far from them, a fixed rod overlapping a short free rod by 3 mm pushes it at the first projection into another
+        # short rod, which lies beyond the reach of their bounding spheres until then: that pair comes into contact,
+        # outside of the candidates, from a later projection on. The rods cross inside their edges, where the contacts
+        # are differentiable
+        scene.add_entity(
+            morph=gs.morphs.ParameterizedRod(
+                n_vertices=3,
+                interval=0.004,
+                axis="x",
+                pos=(0.296, 0.001, 0.0),
+                fixed=True,
+            ),
+            material=gs.materials.Rod.Base(
+                segment_radius=0.005,
+            ),
+        )
+        rod_pushed, rod_hit = (
+            scene.add_entity(
+                morph=gs.morphs.ParameterizedRod(
+                    n_vertices=3,
+                    interval=0.002,
+                    axis=axis,
+                    pos=pos,
+                ),
+                material=gs.materials.Rod.Base(
+                    E=1e5,
+                    G=1e4,
+                    inextensible=True,
+                    segment_mass=0.002,
+                    segment_radius=0.001,
+                ),
+            )
+            for axis, pos in (("y", (0.302, -0.002, 0.003)), ("x", (0.299, 0.001, 0.0075)))
+        )
         scene.build()
 
         vel = torch.zeros((n_verts_b, 3), dtype=gs.tc_float, device=gs.device)
         vel[n_verts_b // 2 - 1 : n_verts_b // 2 + 2, 2] = -dent / 1e-3
 
-        def rollout(vel):
+        def rollout(vel, vel_pushed):
             scene.reset()
             rod_b.set_velocity(vel)
+            rod_pushed.set_velocity(vel_pushed)
             for _ in range(n_steps):
                 scene.step()
-            return rod_b.get_verts_pos()
+            return (rod_b.get_verts_pos() * weights).sum() + (rod_hit.get_verts_pos() * weights_hit).sum()
 
         with torch.no_grad():
             scene.reset()
             rod_b.set_velocity(vel)
             scene.step()
-        pos_by_config.append(torch.cat([rod_b.get_verts_pos(), rod_a.get_verts_pos()]))
+        pos_by_config.append(
+            torch.cat(
+                [rod_b.get_verts_pos(), rod_a.get_verts_pos(), rod_pushed.get_verts_pos(), rod_hit.get_verts_pos()]
+            )
+        )
     assert_allclose(pos_by_config[1], pos_by_config[0], atol=1e-12)
 
-    # The contact is real and comes from the fallback: the broadphase listed no pair of edges of the two rods, the
-    # environment went past the margin, and the contact moved the rod A up
+    # The contacts are real and come from the fallback: the broadphase listed no pair of edges of the rods B and A nor
+    # of the pushed and the hit rods, the environment went past the margin, and the contacts moved the rod A and the
+    # hit rod up
     solver = scene.rod_solver
     assert solver.has_broadphase
     assert qd_to_numpy(solver.rod_state.broadphase.is_stale)[0]
     n_edges_b = n_verts_b - 1
+    n_edges_hit = rod_hit.n_edges
     edges_idx = qd_to_numpy(solver.rod_state.edge_pairs.edges_idx)[:, 0]
     n_candidates = int(qd_to_numpy(solver.rod_state.broadphase.n_candidates)[0])
     assert not ((edges_idx[:n_candidates, 0] < n_edges_b) & (edges_idx[:n_candidates, 1] >= n_edges_b)).any()
-    assert (pos_by_config[1][n_verts_b:, 2] - rod_a.init_positions[:, 2]).abs().max() > 1e-5
+    assert not (edges_idx[:n_candidates, 1] >= solver.n_edges - n_edges_hit).any()
+    assert (pos_by_config[1][n_verts_b : n_verts_b + n_verts_a, 2] - rod_a.init_positions[:, 2]).abs().max() > 1e-5
+    assert (pos_by_config[1][-rod_hit.n_verts :, 2] - rod_hit.init_positions[:, 2]).max() > 1e-4
+    # The pushed and the hit rods claimed their slots after the first projection
+    n_edges = solver.n_edges
+    iters_claimed = qd_to_numpy(solver.rod_state.edge_pairs.iter_claimed)[:, 0]
+    is_late_pair = (edges_idx[:, 0] >= n_edges - 2 * n_edges_hit) & (edges_idx[:, 1] >= n_edges - n_edges_hit)
+    assert is_late_pair.any() and (iters_claimed[is_late_pair] >= 1).all()
 
+    # The derivatives along the velocities of the rod B and of the pushed rod, the latter through the contacts of the
+    # pair claimed late, with the hit rod in the loss
     rng = np.random.default_rng(0)
     weights = torch.tensor(rng.standard_normal((n_verts_b, 3)), dtype=gs.tc_float, device=gs.device)
     direction = torch.tensor(rng.standard_normal((n_verts_b, 3)), dtype=gs.tc_float, device=gs.device)
-    vel_ad = vel.clone().requires_grad_()
-    (rollout(vel_ad) * weights).sum().backward()
-    grad_ad = (vel_ad.grad * direction).sum()
+    weights_hit = torch.tensor(rng.standard_normal((rod_hit.n_verts, 3)), dtype=gs.tc_float, device=gs.device)
+    direction_pushed = torch.tensor(rng.standard_normal((rod_pushed.n_verts, 3)), dtype=gs.tc_float, device=gs.device)
+    vel_pushed = torch.zeros((rod_pushed.n_verts, 3), dtype=gs.tc_float, device=gs.device)
+    vel_ad, vel_pushed_ad = vel.clone().requires_grad_(), vel_pushed.clone().requires_grad_()
+    rollout(vel_ad, vel_pushed_ad).backward()
     step = 1e-5
-    with torch.no_grad():
-        loss_plus = (rollout(vel + step * direction) * weights).sum()
-        loss_minus = (rollout(vel - step * direction) * weights).sum()
-    grad_fd = (loss_plus - loss_minus) / (2.0 * step)
-    assert abs(grad_ad - grad_fd) <= 1e-5 * abs(grad_fd)
+    for grad, inputs_plus, inputs_minus, tol in (
+        (
+            (vel_ad.grad * direction).sum(),
+            (vel + step * direction, vel_pushed),
+            (vel - step * direction, vel_pushed),
+            1e-5,
+        ),
+        (
+            (vel_pushed_ad.grad * direction_pushed).sum(),
+            (vel, vel_pushed + step * direction_pushed),
+            (vel, vel_pushed - step * direction_pushed),
+            1e-8,
+        ),
+    ):
+        with torch.no_grad():
+            grad_fd = (rollout(*inputs_plus) - rollout(*inputs_minus)) / (2.0 * step)
+        assert abs(grad - grad_fd) <= tol * abs(grad_fd)
 
 
 @pytest.mark.required

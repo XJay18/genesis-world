@@ -1142,9 +1142,10 @@ class RodOptions(GravityMixin, TimeBasedMixin):
         The margin of the search for rod-rod contacts, in meters, where the rods have more pairs of edges than
         'multiplier_contact_candidates' lets them test at every substep. The pairs of edges further apart than the
         margin when a substep starts are skipped, unless a vertex moves by more than half of it during the projections
-        of the substep, in which case its environment tests all its pairs of edges. A larger margin tests more pairs at
-        every substep, a smaller one tests all pairs more often. If None, the largest radius of the rods is used.
-        Defaults to None.
+        of the substep, in which case its environment searches all its pairs of edges, and those coming close count
+        toward the capacity set by 'multiplier_contact_candidates' for the rest of the substep. A larger margin tests
+        more pairs at every substep, a smaller one searches all pairs more often and fills the capacity faster. If None,
+        the largest radius of the rods is used. Defaults to None.
     multiplier_contact_candidates : int, optional
         The capacity of the pairs of edges tested for rod-rod contact, as a multiple of the number of edges. Exceeding
         it raises an error. Rods short enough for all their pairs of edges to fit it test them all at every substep,
