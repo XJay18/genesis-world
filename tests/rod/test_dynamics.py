@@ -807,9 +807,9 @@ def test_rod_contacts_keep_rods_apart(contact_margin, asset_tmp_path, show_viewe
 @pytest.mark.parametrize("is_stale", [False, True])
 def test_rod_contact_candidates_overflow_is_reported(is_stale, asset_tmp_path, show_viewer):
     # A coil holding far more pairs of edges in contact than the capacity of the broadphase set by the multiplier, or
-    # a comb of short rods apart by more than the margin, whose first two teeth overlap: their push takes the comb past
-    # the margin, and its pairs outside of the candidates within the reach of their bounding spheres outnumber the
-    # free slots
+    # a rod over a row of short rods, apart from them by more than the margin, which a fixed rod overlapping it presses
+    # into them: the push takes the environment past the margin, and the pairs of edges coming into contact outside of
+    # the candidates outnumber the free slots
     radius = 0.005
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
@@ -827,13 +827,27 @@ def test_rod_contact_candidates_overflow_is_reported(is_stale, asset_tmp_path, s
         show_viewer=show_viewer,
     )
     if is_stale:
+        # Each short rod crosses the rod at a vertex, where two edges of each rod come into contact
         for i_tooth in range(12):
             scene.add_entity(
                 morph=gs.morphs.ParameterizedRod(
                     n_vertices=3,
-                    interval=0.005,
+                    interval=0.002,
                     axis="y",
-                    pos=(0.002 * i_tooth - 0.0012 * (i_tooth > 0), 0.0, 0.05),
+                    pos=(0.003 * i_tooth, -0.002, 0.05),
+                ),
+                material=gs.materials.Rod.Base(
+                    segment_radius=0.0005,
+                ),
+            )
+        for n_vertices, interval, z, is_fixed in ((14, 0.003, 0.0511, False), (3, 0.0195, 0.0518, True)):
+            scene.add_entity(
+                morph=gs.morphs.ParameterizedRod(
+                    n_vertices=n_vertices,
+                    interval=interval,
+                    axis="x",
+                    pos=(-0.003, 0.0, z),
+                    fixed=is_fixed,
                 ),
                 material=gs.materials.Rod.Base(
                     segment_radius=0.0005,
@@ -854,9 +868,12 @@ def test_rod_contact_candidates_overflow_is_reported(is_stale, asset_tmp_path, s
             ),
         )
     scene.build()
-    # A step raises the errors of the last ones, one call later on the devices not blocking on their flags
+    # The step exceeding the capacity flags the error, which a later step raises, one call later on the devices not
+    # blocking on their flags
+    scene.step()
+    assert scene.get_error_envs_mask().all()
     with pytest.raises(gs.GenesisException, match="multiplier_contact_candidates"):
-        for _ in range(3):
+        for _ in range(2):
             scene.step()
 
 

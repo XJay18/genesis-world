@@ -305,6 +305,23 @@ def test_rod_contact_outside_candidates_grad_matches_fd(backend, show_viewer):
                 (n_verts_a, "y", (0.0, -0.05, -dent + 0.007 + 3e-5), 0.002),
             )
         )
+        # Far from them, a comb of short rods whose bounding spheres overlap while their capsules stay apart by more
+        # than the margin, more pairs of edges than the free slots of the candidates hold. Only pairs in contact take a
+        # slot, so that none of them does once the environment goes past the margin
+        teeth = [
+            scene.add_entity(
+                morph=gs.morphs.ParameterizedRod(
+                    n_vertices=3,
+                    interval=0.01,
+                    axis="y",
+                    pos=(0.5 + 0.0011 * i_tooth, 0.0, 0.0),
+                ),
+                material=gs.materials.Rod.Base(
+                    segment_radius=0.0005,
+                ),
+            )
+            for i_tooth in range(16)
+        ]
         # Far from them, a fixed rod overlapping a short free rod by 3 mm pushes it at the first projection into another
         # short rod, which lies beyond the reach of their bounding spheres until then: that pair comes into contact,
         # outside of the candidates, from a later projection on. The rods cross inside their edges, where the contacts
@@ -358,7 +375,13 @@ def test_rod_contact_outside_candidates_grad_matches_fd(backend, show_viewer):
             scene.step()
         pos_by_config.append(
             torch.cat(
-                [rod_b.get_verts_pos(), rod_a.get_verts_pos(), rod_pushed.get_verts_pos(), rod_hit.get_verts_pos()]
+                [
+                    rod_b.get_verts_pos(),
+                    rod_a.get_verts_pos(),
+                    *[tooth.get_verts_pos() for tooth in teeth],
+                    rod_pushed.get_verts_pos(),
+                    rod_hit.get_verts_pos(),
+                ]
             )
         )
     assert_allclose(pos_by_config[1], pos_by_config[0], atol=1e-12)
