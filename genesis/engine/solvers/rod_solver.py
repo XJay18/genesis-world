@@ -1019,7 +1019,9 @@ def kernel_integrate_rod_positions(rod_state: RodState, rod_info: RodInfo):
 # corrections the previous one computed before computing its own from the positions this leaves. Within a kernel, the
 # positions are written once, linearly, before any loop reads them, so that autodiff reverses every loop at the values
 # it read. The chain of a substep is: 'kernel_integrate_rod_positions', then for each projection the contacts and the
-# inextensibility of the next one, then 'kernel_finalize_rod_positions'.
+# inextensibility of the next one, then the friction of the rod-rod contacts ('kernel_project_rod_friction'), the
+# contacts with the rigid geoms where the rods couple with them ('LegacyCoupler.project_rod_rigid_contacts'), and
+# 'kernel_finalize_rod_positions'.
 @qd.func
 def func_project_rod_inextensibility(
     rod_state: RodState, rod_info: RodInfo, rod_config: qd.template(), project_inextensibility: qd.template()
@@ -1550,9 +1552,12 @@ def func_project_rod_friction(rod_state: RodState, rod_info: RodInfo, rod_config
                         + rod_info.verts.mu_k[i_v_b2]
                     )
                     impulse = -disp_tangent / inv_mass_eff
-                    impulse_norm = impulse.norm()
-                    # A kinetic coefficient above the static one never pushes the pair past the stop of its slip
-                    if impulse_norm > mu_s * impulse_normal:
+                    impulse_static_max = mu_s * impulse_normal
+                    # The norm is taken only where the pair slides: its adjoint is not finite at a zero tangential
+                    # displacement, which a pair sticking without any slip has. A kinetic coefficient above the static
+                    # one never pushes the pair past the stop of its slip
+                    if impulse.norm_sqr() > impulse_static_max * impulse_static_max:
+                        impulse_norm = impulse.norm()
                         impulse = qd.min(mu_k * impulse_normal, impulse_norm) / impulse_norm * impulse
                     if qd.static(IS_EXACT):
                         func_add_edge_pair_sums(
@@ -1978,8 +1983,9 @@ class RodSolver(GravityMixin, TimeBasedMixin, Solver):
                     "NaN detected in rod states. Try reducing the time step size or adjusting simulation parameters."
                 ),
                 RodErrorCode.OVERFLOW_ROD_CANDIDATES: lambda: (
-                    f"Exceeding max number of candidate pairs of rod edges ({self._n_edge_pair_candidates}). Please "
-                    "increase the value of RodOptions' option 'multiplier_contact_candidates'."
+                    f"Exceeding max number of candidate pairs of rod edges ({self._n_edge_pair_candidates}), counting "
+                    "the pairs found near each other at the start of a substep and those coming into contact during "
+                    "it. Please increase the value of RodOptions' option 'multiplier_contact_candidates'."
                 ),
                 RodErrorCode.OVERFLOW_ROD_RIGID_CONTACTS: lambda: (
                     f"A vertex of the rods touches more than {ROD_RIGID_CONTACTS_PER_VERT} rigid geoms that need "
