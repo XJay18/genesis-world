@@ -1266,16 +1266,31 @@ def kernel_update_rod_contact_candidates(rod_state: RodState, rod_info: RodInfo,
 
 
 @qd.func
-def func_is_rod_edge_pair_near(i_e_a: int, i_e_b: int, i_b: int, rod_state: RodState, rod_info: RodInfo) -> bool:
-    """Return whether the spheres bounding the capsules of two edges overlap, which their capsules need to."""
+def func_rod_edge_pair_penetration(i_e_a: int, i_e_b: int, i_b: int, rod_state: RodState, rod_info: RodInfo):
+    """Return the closest points of the axes of two edges, the penetration of their capsules and the contact normal.
+
+    The closest points are given by their parameters along the first and the second edge, and the normal points from
+    the second edge to the first. Capsules whose bounding spheres are apart get a penetration of -1.
+    """
     i_v_a1, i_v_a2 = rod_info.edges.verts_idx[i_e_a]
     i_v_b1, i_v_b2 = rod_info.edges.verts_idx[i_e_b]
     p_a1, p_a2 = rod_state.verts.pos[i_v_a1, i_b], rod_state.verts.pos[i_v_a2, i_b]
     p_b1, p_b2 = rod_state.verts.pos[i_v_b1, i_b], rod_state.verts.pos[i_v_b2, i_b]
     radius_a = 0.5 * (rod_info.verts.radius[i_v_a1] + rod_info.verts.radius[i_v_a2])
     radius_b = 0.5 * (rod_info.verts.radius[i_v_b1] + rod_info.verts.radius[i_v_b2])
+    t, u = gs.qd_float(0.0), gs.qd_float(0.0)
+    penetration = gs.qd_float(-1.0)
+    normal = qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float)
+    # The capsules overlap only if the spheres bounding them do, which spares the closest points of most pairs
     reach = 0.5 * ((p_a2 - p_a1).norm() + (p_b2 - p_b1).norm()) + radius_a + radius_b
-    return (0.5 * (p_a1 + p_a2 - p_b1 - p_b2)).norm() < reach
+    if (0.5 * (p_a1 + p_a2 - p_b1 - p_b2)).norm() < reach:
+        t, u = func_closest_points_of_edges(p_a1, p_a2, p_b1, p_b2, rod_info.EPS[None])
+        dist_vec = (p_a1 + t * (p_a2 - p_a1)) - (p_b1 + u * (p_b2 - p_b1))
+        dist = dist_vec.norm()
+        penetration = radius_a + radius_b - dist
+        if dist > rod_info.EPS[None]:
+            normal = dist_vec / dist
+    return t, u, penetration, normal
 
 
 @qd.func
@@ -1301,21 +1316,7 @@ def func_project_rod_edge_pair(
     """
     i_v_a1, i_v_a2 = rod_info.edges.verts_idx[i_e_a]
     i_v_b1, i_v_b2 = rod_info.edges.verts_idx[i_e_b]
-    p_a1, p_a2 = rod_state.verts.pos[i_v_a1, i_b], rod_state.verts.pos[i_v_a2, i_b]
-    p_b1, p_b2 = rod_state.verts.pos[i_v_b1, i_b], rod_state.verts.pos[i_v_b2, i_b]
-    radius_a = 0.5 * (rod_info.verts.radius[i_v_a1] + rod_info.verts.radius[i_v_a2])
-    radius_b = 0.5 * (rod_info.verts.radius[i_v_b1] + rod_info.verts.radius[i_v_b2])
-    t, u = gs.qd_float(0.0), gs.qd_float(0.0)
-    penetration = gs.qd_float(-1.0)
-    normal = qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float)
-    # The capsules overlap only if the spheres bounding them do, which spares the closest points of most pairs
-    if func_is_rod_edge_pair_near(i_e_a, i_e_b, i_b, rod_state, rod_info):
-        t, u = func_closest_points_of_edges(p_a1, p_a2, p_b1, p_b2, rod_info.EPS[None])
-        dist_vec = (p_a1 + t * (p_a2 - p_a1)) - (p_b1 + u * (p_b2 - p_b1))
-        dist = dist_vec.norm()
-        penetration = radius_a + radius_b - dist
-        if dist > rod_info.EPS[None]:
-            normal = dist_vec / dist
+    t, u, penetration, normal = func_rod_edge_pair_penetration(i_e_a, i_e_b, i_b, rod_state, rod_info)
     # A contact is resolved through the vertices owning its points, the nearer vertex of each edge: where both are
     # immovable (fixed or attached), only the far vertices could move, by the penetration over their weight in the
     # points, levering a free vertex next to a fixed one out of all proportion
@@ -1372,8 +1373,8 @@ def func_project_rod_contacts(
 
     With a broadphase, the contacts are searched among its candidate pairs, and a vertex moved further than half of the
     margin from its position in the broadphase may bring a pair of edges outside of them into contact: in its
-    environment, every such pair whose bounding spheres overlap claims a free slot past the candidates, and the slot
-    takes part in this projection and the next ones as a candidate does. No free slot found raises
+    environment, every such pair claims a free slot past the candidates at the first projection where its capsules
+    overlap, and takes part in this projection and the next ones as a candidate does. No free slot found raises
     OVERFLOW_ROD_CANDIDATES (see RodErrorCode). Without a broadphase, every pair of edges that can collide is tested.
 
     The pairs sharing a vertex add their corrections up through atomics, whose order varies across threads. With
@@ -1400,11 +1401,12 @@ def func_project_rod_contacts(
                 rod_state.broadphase.n_envs_fallback[None] = rod_state.verts.pos.shape[1]
 
     # Two leaf boxes that overlap at the broadphase make the pair a candidate. A pair outside of them claims its slot at
-    # the first projection where it may touch, whose penetration it could not have before, so that its normal impulse
-    # sums the same projections as it would as a candidate. The slot is found by open addressing over the free slots,
-    # keyed by the pair, a thread owning each pair: a pair finds the slot it claimed at an earlier projection before any
-    # free one, every slot it probes before that having been claimed already. The loop runs over no environment until
-    # one goes stale, and claims before the contacts below test the slots.
+    # the first projection where it penetrates, tested at the positions the contacts below project it at, so that its
+    # normal impulse sums the same projections as it would as a candidate. Pairs that only come near take no slot, their
+    # number growing with the length of the edges over their spacing. The slot is found by open addressing over the free
+    # slots, keyed by the pair, a thread owning each pair: a pair finds the slot it claimed at an earlier projection
+    # before any free one, every slot it probes before that having been claimed already. The loop runs over no
+    # environment until one goes stale, and claims before the contacts below test the slots.
     if qd.static(rod_config.has_broadphase):
         for i_b, i_e_a, i_e_b in qd.ndrange(
             rod_state.broadphase.n_envs_fallback[None], rod_state.edges.theta.shape[0], rod_state.edges.theta.shape[0]
@@ -1412,7 +1414,8 @@ def func_project_rod_contacts(
             if rod_state.broadphase.is_stale[i_b] and i_e_a < i_e_b:
                 if func_is_rod_edge_pair_valid(i_e_a, i_e_b, rod_info):
                     if not func_is_rod_broadphase_overlap(i_e_a, i_e_b, i_b, rod_state, rod_info):
-                        if func_is_rod_edge_pair_near(i_e_a, i_e_b, i_b, rod_state, rod_info):
+                        penetration = func_rod_edge_pair_penetration(i_e_a, i_e_b, i_b, rod_state, rod_info)[2]
+                        if penetration > 0.0:
                             n_candidates = rod_state.broadphase.n_candidates[i_b]
                             n_slots_free = rod_state.edge_pairs.iter_claimed.shape[0] - n_candidates
                             is_claimed = False
